@@ -580,6 +580,63 @@ fn read_ipv6_headers(nbl: &NetBufferList) -> Option<([u8; IPV6_INSPECT_LEN], usi
     None
 }
 
+/// Offset of the TCP flags byte from the start of the TCP header.
+const TCP_FLAGS_OFFSET: usize = 13;
+const TCP_RST_FLAG: u8 = 0x04;
+
+/// Returns true when an IP packet in this NBL carries a TCP reset.
+///
+/// Packet-layer indications start at the IP header after the caller has applied
+/// any required inbound retreat. The transport offset cannot be assumed: IPv4
+/// options and IPv6 extension headers both move the TCP header.
+///
+/// A short or malformed packet returns false. In particular, every indexed byte
+/// is obtained through `get`, because a panic in this callout would hang the
+/// machine rather than merely reject the packet.
+pub fn is_tcp_reset_from_nbl(nbl: &NetBufferList, ipv6: bool) -> bool {
+    if ipv6 {
+        let Some((packet, len)) = read_ipv6_headers(nbl) else {
+            return false;
+        };
+        let packet = &packet[..len];
+        let headers = walk_ipv6_headers(packet);
+        if !headers.resolved || headers.protocol != IpProtocol::Tcp {
+            return false;
+        }
+
+        return packet
+            .get(headers.transport_offset + TCP_FLAGS_OFFSET)
+            .map(|flags| flags & TCP_RST_FLAG != 0)
+            .unwrap_or(false);
+    }
+
+    // Read through the flags byte even when the IPv4 header has its maximum
+    // 40 bytes of options.
+    let mut packet = [0u8; IPV4_MAX_HEADER_LEN + TCP_FLAGS_OFFSET + 1];
+    let Some(len) = read_leading_bytes(
+        nbl,
+        &mut packet,
+        IPV4_HEADER_LEN + TCP_FLAGS_OFFSET + 1,
+    ) else {
+        return false;
+    };
+    let packet = &packet[..len];
+    let ip_packet = Ipv4Packet::new_unchecked(packet);
+    if ip_packet.next_header() != IpProtocol::Tcp {
+        return false;
+    }
+
+    let transport_offset = ip_packet.header_len() as usize;
+    if !(IPV4_HEADER_LEN..=IPV4_MAX_HEADER_LEN).contains(&transport_offset) {
+        return false;
+    }
+
+    packet
+        .get(transport_offset + TCP_FLAGS_OFFSET)
+        .map(|flags| flags & TCP_RST_FLAG != 0)
+        .unwrap_or(false)
+}
+
 pub fn get_key_from_nbl_v4(nbl: &NetBufferList, direction: Direction) -> Result<Key, String> {
     // Read enough for the largest possible IPv4 header plus the two port fields.
     // A fixed IPV4_HEADER_LEN + 4 read is only correct when IHL is 5: with IP

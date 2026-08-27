@@ -14,7 +14,7 @@ use crate::connection_map::Key;
 use crate::device::{Device, Packet};
 use crate::packet_util::{
     get_icmp_echo_from_nbl, get_key_from_nbl_v4, get_key_from_nbl_v6, is_fragment_v4,
-    is_fragment_v6, recalc_header_checksums, Redirect,
+    is_fragment_v6, is_tcp_reset_from_nbl, recalc_header_checksums, Redirect,
 };
 
 // IP packet layers
@@ -255,6 +255,21 @@ fn ip_packet_layer(
         };
 
         if fast_track_pm_packets(&key, direction) {
+            data.action_permit();
+            return;
+        }
+
+        // A TCP reset emitted by the local stack in response to a packet for
+        // which no socket is listening has no user-space connection behind it.
+        // There is no ALE record or process to attribute, so do not manufacture
+        // a PID-0 connection and do not send a request that cannot be meaningfully
+        // decided. Existing cached connections are deliberately handled below so
+        // their configured policy still applies.
+        if matches!(direction, Direction::Outbound)
+            && key.protocol == smoltcp::wire::IpProtocol::Tcp
+            && is_tcp_reset_from_nbl(&nbl, ipv6)
+            && get_connection_info(&mut device.connection_cache, &key, ipv6).is_none()
+        {
             data.action_permit();
             return;
         }
