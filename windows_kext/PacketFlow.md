@@ -1,90 +1,74 @@
-# There and back again, a packets tale.
+# There and back again: a packet's path
 
-An explanation on the complete path of the packet from entering to the exit of the kernel extension.
+This document describes how packets move through the Windows kernel extension and where Portmaster decisions are applied.
 
-## Entry
+## Entry layers
 
-The packet entry point depends on the packet and the internal windows filter state:   
+The first callout depends on packet direction and protocol:
 
-- First packet of outbound connection -> AleAuthConnect Layer
-- First packet of inbound connection -> InboundIppacket Layer
+- Outbound TCP enters `ALE_AUTH_CONNECT` before it reaches the outbound IP packet layer.
+- Outbound UDP is registered at `ALE_AUTH_CONNECT` to capture its PID, but is authorized at the outbound IP packet layer so an ALE pend cannot corrupt the application's send result.
+- Inbound traffic first reaches the inbound IP packet layer.
+  - A new TCP or UDP tuple is permitted upward to `ALE_AUTH_RECV_ACCEPT`.
+  - A tuple already known as an inbound connection bypasses packet-level classification in both directions because its policy is owned by ALE.
+  - A received packet belonging to an outbound connection remains on the packet path; this is required for temporary verdicts and reverse redirect rewriting.
+- ICMP and other protocols are handled at the IP packet layer.
 
-## ALE layer
+## ALE authorization
 
-Each defined ALE layer has a filter linked to it. This filter has a state.  
-When a decision is made to block or permit a connection it will be saved to the filter state.
-The only way to update the decision in a filter is to clear the whole state and apply the decision for the next packet of each connection.
+Two pairs of terminating, resettable callouts implement connection-level authorization:
 
-### First packet
+- `ALE_AUTH_CONNECT_V4/V6` for outbound connections.
+- `ALE_AUTH_RECV_ACCEPT_V4/V6` for inbound TCP accepts and the first inbound UDP packet from a unique remote tuple.
 
-For outgoing connections this logic fallows:
-  - Packet enters in one of the ALE layer
-  - Packet is TCP or UDP
-    1. Save and absorb packet.
-    2. Send an event to Portmaster. 
-    2. Create a cache entry.
-  - If Packet is not TCP/UDP forward to packet layer
+Both paths build the same connection key from WFP's fixed fields and use the process ID supplied in ALE metadata. This means an inbound connection is created with its owning PID instead of the PID 0 that the IP packet layer had to use.
 
-For incoming connection this logic fallow:
-  - Packet enter in one of the Packet layer:
-    1. Save packet and absorb.
-    2. Send an event to Portmaster. 
-    2. Create a cache entry if the protocol is TCP or UDP.
-    3. Wait for Portmasters decision.
+### New connection
 
+For a new TCP/UDP connection:
 
-If more packets arrive before Portmaster returns a decision, packet will be absorbed and another event will be sent.
-For Outgoing connection this will happen in ALE layer.
-For Incoming connection this will happen in Packet layer. 
+1. Build the connection key from ALE fields.
+2. Save the classify operation and, when packet data exists, clone it.
+   - At inbound receive/accept the NBL data offset is at the transport payload. The driver retreats by WFP's IP-header size plus transport-header size before cloning, so the clone starts at the IP header as required by transport receive injection.
+   - The event sent to Portmaster exposes the clone from the transport header and reports payload layer 4.
+3. Pend an initial ALE operation with `FwpsPendOperation0`. A reauthorization cannot be pended, so that path blocks the current indication and later resets the resettable filters.
+4. Add an `Undecided` cache entry before publishing the request to Portmaster.
+5. Block and absorb the current indication while Portmaster decides.
 
-### Pormtaster returns a verdict for the connection
+If another indication arrives while the cache entry is still `Undecided`, it is saved under a separate packet ID and another event is queued.
 
-Connection cache will be updated and the packet will be injected.
-The next steps depend of the direction of the packet and the verdict
+### Applying a verdict
 
-* Permanent Verdict / Outgoing connection
-  - Allow / Block / Drop directly in the ALE layer. For Block and Drop packet layer will not see the rest of the packet in the connection.
-* Temporary Verdict / Outgoing connection
-  - Always Allow - this connections are solely handled by the packet layer. (This is true only for outgoing connections) 
+- `Accept` and `PermanentAccept` complete the ALE operation and reinject a saved packet when one exists.
+- For inbound receive/accept, the same NBL is supplied to `FwpsCompleteOperation0` before `FwpsInjectTransportReceiveAsync0` is called. The transport injection handle is checked when the clone is indicated again, and self-injected packets are permitted without another request.
+- Block/drop/failed verdicts complete an ALE pend without injecting the clone.
+- Permanent cached verdicts are applied directly on later ALE classifications.
+- Updating a cached verdict resets the resettable ALE filters so existing ALE-authorized flows are reauthorized against the new value.
 
-* Permanent or Temporary Verdict / Incoming connection
-  - Allow / Block / Drop. Handled by the Packet layer
+`ALE_AUTH_RECV_ACCEPT` is a connection/remote-tuple authorization layer, not a per-packet layer. Consequently, inbound TCP/UDP verdicts apply to the ALE connection or UDP remote tuple. Per-packet temporary verdict processing remains only for flows owned by the outbound packet path.
 
-> There is no defined ALE layers for inbound connection. Inbound packets are handed compactly by the packet layer 
+## IP packet layer
 
-Fallowing specifics apply to the ALE layer:  
-1. Connections with flag `reauthorize == false` are special. When the flag is `false` that means that a applications is calling a function `connect()` or `accept()` for a connection. This is a special case because we control the result of the function, telling the application that it's allowed or not allowed to continue with the connection. Since we are making request to Portmaster we need to take longer time. This is done with pending the packet. This allows the kernel extension to pause the event and continue when it has the verdict. See `ale_callouts.rs -> save_packet()` function.
-2. If packet payload is present it is from the transport layer.
+The packet callouts still see every network-layer indication, but they no longer create or decide inbound TCP/UDP connections.
 
+### TCP and UDP
 
-## Packet layer
+- A new inbound tuple is permitted to `ALE_AUTH_RECV_ACCEPT`.
+- Packets whose cached connection direction is inbound are permitted without a second packet-level decision.
+- Packets whose cached connection direction is outbound retain the existing packet behavior:
+  - permanent accept/block/drop is applied immediately;
+  - temporary verdicts create a Portmaster request;
+  - redirect verdicts clone, rewrite, recalculate checksums, inject the replacement, and absorb the original.
+- An outbound tuple unexpectedly missing from the cache uses the defensive packet-level fallback.
 
-The logic for the packet is split in two:
+### Other protocols
 
-### TCP or UDP protocols
+ICMP, IGMP, and protocols without TCP/UDP connection state are treated as temporary packet decisions. Each packet is cloned, sent to Portmaster, and reinjected only when allowed. ICMP echo requests use a short-lived identifier cache to associate replies with the sending process.
 
-The packet layer will not process packets that miss a cache entry:  
-- Incoming packet: it will forward it to the ALE layer.
-- Outgoing packet: this is treated as invalid state since ALE should be the entry for the packets. If it happens the packet layer will create a request to Portmaster for it.
+### Fragments and injected packets
 
-For packets with a cache entry:
-- Permanent Verdict: apply the verdict.
-- Redirect Verdict: copy the packet, modify and inject. Drop the original packet.
-- Temporary verdict: send request to Portmaster.
+Individual IP fragments are permitted until WFP presents the reassembled datagram, which has a complete transport header and can be keyed safely. Network- and transport-injected packets are detected with the corresponding injection handle and permitted to prevent reinjection loops.
 
-After portmaster returns the verdict for the packet. If its allowed it will be modified (if needed) and injected everything else will be dropped.
-The packet layer will permit all injected packets.
+## Connection cache
 
-### Not TCP or UDP protocols -> ICMP, IGMP ...
-
-Does packets are treated as with temporary verdict. There will be no cache entry for them.
-Every packet will be send to Portmaster for a decision and re-injected if allowed.
-
-## Connection Cache
-
-It holds information for all TCP and UDP connections. Local and destination ip addresses and ports, verdict, protocol, process id
-It also holds last active time and end time.  
-
-Cache entry is removed automatically 1 minute after an end state has been set or after 10 minutes of inactivity.  
-
-End stat is set by Endpoint layers or Resource release layers.
+The cache stores TCP and UDP keys, direction, process ID, verdict, redirect state, and activity timestamps. Endpoint-closure and resource-release callouts mark connections as ended. Cleanup removes ended entries after one minute and inactive entries after ten minutes.

@@ -29,17 +29,30 @@ impl ClassifyDefer {
     pub fn complete(
         self,
         filter_engine: &mut FilterEngine,
+        inject_packet: bool,
     ) -> Result<Option<TransportPacketList>, String> {
         unsafe {
             match self {
                 ClassifyDefer::Initial(context, packet_list) => {
-                    FwpsCompleteOperation0(context, core::ptr::null_mut());
+                    // An inbound packet that will be injected from
+                    // ALE_AUTH_RECV_ACCEPT must also be supplied to
+                    // FwpsCompleteOperation. A denied packet is completed with a
+                    // null NBL and the owned clone is discarded by the caller.
+                    let nbl = if inject_packet {
+                        packet_list
+                            .as_ref()
+                            .map(|packet| packet.net_buffer_list.nbl as *mut c_void)
+                            .unwrap_or(core::ptr::null_mut())
+                    } else {
+                        core::ptr::null_mut()
+                    };
+                    FwpsCompleteOperation0(context, nbl);
                     return Ok(packet_list);
                 }
                 ClassifyDefer::Reauthorization(_callout_id, packet_list) => {
                     // There is no way to reset single filter. If another request for filter reset is trigger at the same time it will fail.
                     //
-                    // Resetting all filters forces WFP to re-evaluate (reauthorize) all existing connections 
+                    // Resetting all filters forces WFP to re-evaluate (reauthorize) all existing connections
                     // using the updated verdict cache.
                     // If STATUS_FWP_TXN_IN_PROGRESS is returned, another reset_all_filters() call is
                     // already running concurrently, which will trigger the same WFP reauthorization.
@@ -157,6 +170,16 @@ impl<'a> CalloutData<'a> {
         unsafe { (*self.metadata).get_ip_header_size() }
     }
 
+    /// Size of the transport header for this indication, if WFP provided it.
+    pub fn get_transport_header_size(&self) -> Option<u32> {
+        unsafe { (*self.metadata).get_transport_header_size() }
+    }
+
+    /// Routing compartment for this indication, if WFP provided it.
+    pub fn get_compartment_id(&self) -> Option<u32> {
+        unsafe { (*self.metadata).get_compartment_id() }
+    }
+
     pub fn pend_operation(
         &mut self,
         packet_list: Option<TransportPacketList>,
@@ -192,14 +215,14 @@ impl<'a> CalloutData<'a> {
         }
     }
 
-    // Block action and clear the write flag. 
+    // Block action and clear the write flag.
     // This will block the packet and prevent next filter in the chain to change the action.
     pub fn action_block_hard(&mut self) {
         unsafe {
             (*self.classify_out).action_block();
             (*self.classify_out).clear_absorb_flag();
             // Next filter in the chain will not change the action.
-            (*self.classify_out).clear_write_flag(); 
+            (*self.classify_out).clear_write_flag();
         }
     }
 

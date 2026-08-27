@@ -75,7 +75,7 @@ fn get_payload(packet: &Packet) -> Option<&[u8]> {
                 wdk::filter_engine::callout_data::ClassifyDefer::Reauthorization(_, p) => p,
             };
             if let Some(tpl) = p {
-                tpl.net_buffer_list.get_data()
+                tpl.get_event_data()
             } else {
                 None
             }

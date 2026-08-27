@@ -6,7 +6,7 @@ use core::{ffi::c_void, mem::MaybeUninit};
 use windows_sys::Win32::{
     Foundation::{HANDLE, INVALID_HANDLE_VALUE},
     Networking::WinSock::{AF_INET, AF_INET6, AF_UNSPEC, SCOPE_ID},
-    System::Kernel::UNSPECIFIED_COMPARTMENT_ID,
+    System::Kernel::{COMPARTMENT_ID, UNSPECIFIED_COMPARTMENT_ID},
 };
 
 use crate::{
@@ -25,6 +25,7 @@ use super::{callout_data::CalloutData, net_buffer::NetBufferList};
 pub struct TransportPacketList {
     ipv6: bool,
     pub net_buffer_list: NetBufferList,
+    event_data_offset: usize,
     remote_ip: [u8; 16],
     endpoint_handle: u64,
     remote_scope_id: SCOPE_ID,
@@ -32,6 +33,7 @@ pub struct TransportPacketList {
     // valid during the ALE classify callback; the bytes are copied here so they outlive it.
     control_data: Option<Box<[u8]>>,
     inbound: bool,
+    compartment_id: COMPARTMENT_ID,
     interface_index: u32,
     sub_interface_index: u32,
     // send_params and remote_ip must outlive inject_packet_list_transport
@@ -48,6 +50,16 @@ pub struct InjectInfo {
     pub loopback: bool,
     pub interface_index: u32,
     pub sub_interface_index: u32,
+}
+
+impl TransportPacketList {
+    /// Packet bytes exposed to user space. Inbound ALE clones start at the IP
+    /// header for reinjection, but connection events are transport-layer records.
+    pub fn get_event_data(&self) -> Option<&[u8]> {
+        self.net_buffer_list
+            .get_data()?
+            .get(self.event_data_offset..)
+    }
 }
 
 pub struct Injector {
@@ -102,6 +114,7 @@ impl Injector {
         ipv6: bool,
         callout_data: &CalloutData,
         net_buffer_list: NetBufferList,
+        event_data_offset: usize,
         remote_ip_slice: &[u8],
         inbound: bool,
         interface_index: u32,
@@ -122,6 +135,7 @@ impl Injector {
         TransportPacketList {
             ipv6,
             net_buffer_list,
+            event_data_offset,
             remote_ip,
             endpoint_handle: callout_data.get_transport_endpoint_handle().unwrap_or(0),
             remote_scope_id: callout_data
@@ -129,6 +143,10 @@ impl Injector {
                 .unwrap_or(unsafe { MaybeUninit::zeroed().assume_init() }),
             control_data,
             inbound,
+            compartment_id: callout_data
+                .get_compartment_id()
+                .map(|id| id as COMPARTMENT_ID)
+                .unwrap_or(UNSPECIFIED_COMPARTMENT_ID),
             interface_index,
             sub_interface_index,
             // Populated with valid pointers in inject_packet_list_transport after boxing.
@@ -181,7 +199,7 @@ impl Injector {
                     core::ptr::null_mut(),
                     0,
                     address_family,
-                    UNSPECIFIED_COMPARTMENT_ID,
+                    (*raw_ptr).compartment_id,
                     (*raw_ptr).interface_index,
                     (*raw_ptr).sub_interface_index,
                     raw_nbl,
@@ -196,7 +214,7 @@ impl Injector {
                     0,
                     &mut (*raw_ptr).send_params,
                     address_family,
-                    UNSPECIFIED_COMPARTMENT_ID,
+                    (*raw_ptr).compartment_id,
                     raw_nbl,
                     free_transport_packet,
                     raw_ptr as _,
@@ -300,7 +318,14 @@ impl Injector {
         }
     }
 
-    pub fn was_network_packet_injected_by_self_ale(&self, nbl: *const NET_BUFFER_LIST) -> bool {
+    pub fn was_transport_packet_injected_by_self(&self, nbl: *const NET_BUFFER_LIST) -> bool {
+        if self.transport_inject_handle == INVALID_HANDLE_VALUE
+            || self.transport_inject_handle.is_null()
+            || nbl.is_null()
+        {
+            return false;
+        }
+
         unsafe {
             let state = FwpsQueryPacketInjectionState0(
                 self.transport_inject_handle,

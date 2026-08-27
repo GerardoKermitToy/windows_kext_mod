@@ -194,7 +194,7 @@ impl NetBufferList {
             }
         }
     }
-	
+
     /// Sums the data length of every net buffer in the list, excluding
     /// `header_len` leading bytes of each one.
     ///
@@ -224,19 +224,25 @@ impl NetBufferList {
         }
     }
 
-
-
-    /// Retreats the mnl of the buffer. Does not auto advance multiple retreats.
-    pub fn retreat(&mut self, size: u32, auto_advance: bool) {
+    /// Retreats the start of the first net buffer.
+    ///
+    /// When `auto_advance` is true, the original offset is restored when this
+    /// wrapper is dropped.
+    pub fn retreat(&mut self, size: u32, auto_advance: bool) -> Result<(), String> {
         unsafe {
-            if let Some(nbl) = self.nbl.as_mut() {
-                if let Some(nb) = nbl.Header.first_net_buffer.as_mut() {
-                    NdisRetreatNetBufferDataStart(nb as _, size, 0, core::ptr::null_mut());
-                    if auto_advance {
-                        self.advance_on_drop = Some(size);
-                    }
-                }
+            let Some(nbl) = self.nbl.as_mut() else {
+                return Err("net buffer list is null".to_string());
+            };
+            let Some(nb) = nbl.Header.first_net_buffer.as_mut() else {
+                return Err("net buffer is null".to_string());
+            };
+
+            let status = NdisRetreatNetBufferDataStart(nb as _, size, 0, core::ptr::null_mut());
+            check_ntstatus(status)?;
+            if auto_advance {
+                self.advance_on_drop = Some(size);
             }
+            Ok(())
         }
     }
 

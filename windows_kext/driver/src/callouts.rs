@@ -29,6 +29,24 @@ pub fn get_callout_vec() -> Vec<Callout> {
             FilterType::Resettable,
             ale_callouts::ale_layer_connect_v6,
         ),
+        Callout::new(
+            "Portmaster ALE Inbound IPv4",
+            "Portmaster uses this layer to block/permit incoming ipv4 connections",
+            0x17d4a8f2_6c31_4b95_ae07_53f9c2d8614e,
+            Layer::AleAuthRecvAcceptV4,
+            consts::FWP_ACTION_CALLOUT_TERMINATING,
+            FilterType::Resettable,
+            ale_callouts::ale_layer_recv_accept_v4,
+        ),
+        Callout::new(
+            "Portmaster ALE Inbound IPv6",
+            "Portmaster uses this layer to block/permit incoming ipv6 connections",
+            0x9b62e1f4_38ad_47c0_8e15_d7a4935fb206,
+            Layer::AleAuthRecvAcceptV6,
+            consts::FWP_ACTION_CALLOUT_TERMINATING,
+            FilterType::Resettable,
+            ale_callouts::ale_layer_recv_accept_v6,
+        ),
         // -----------------------------------------
         // ALE connection end layers
         Callout::new(

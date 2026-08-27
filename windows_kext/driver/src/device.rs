@@ -148,8 +148,6 @@ impl Device {
         };
         buffer = &buffer[1..];
 
-        let mut _classify_defer = None;
-
         match command {
             CommandType::Shutdown => {
                 wdk::dbg!("Shutdown command");
@@ -190,17 +188,30 @@ impl Device {
                                     if let Err(err) = self.inject_packet(packet, false) {
                                         err!("failed to inject packet: {}", err);
                                     }
+                                } else {
+                                    // The connection disappeared before its verdict was
+                                    // applied. Complete an ALE pend, if this is one, but
+                                    // do not inject a packet with no redirect state.
+                                    if let Err(err) = self.inject_packet(packet, true) {
+                                        err!("failed to complete packet: {}", err);
+                                    }
                                 }
                             }
                             _ => {
-                                // Inject only ALE layer. This will trigger proper block/drop.
-                                // Packet layer just drop the packet.
+                                // Complete ALE operations without injecting their
+                                // packet clone. Packet-layer clones are discarded.
                                 if let Err(err) = self.inject_packet(packet, true) {
                                     err!("failed to inject packet: {}", err);
                                 }
                             }
                         }
-                    };
+                    } else {
+                        let invalid_verdict = verdict.verdict;
+                        err!("invalid verdict value: {}", invalid_verdict);
+                        if let Err(err) = self.inject_packet(packet, true) {
+                            err!("failed to complete packet: {}", err);
+                        }
+                    }
                 } else {
                     // Id was not in the packet cache.
                     let id = verdict.id;
@@ -213,7 +224,7 @@ impl Device {
                 if let Some(verdict) = FromPrimitive::from_u8(update.verdict) {
                     // Update with new action.
                     dbg!("Verdict update received {:?}: {}", update, verdict);
-                    _classify_defer = self.connection_cache.update_connection(
+                    _ = self.connection_cache.update_connection(
                         Key {
                             protocol: IpProtocol::from(update.protocol),
                             local_address: IpAddress::Ipv4(Ipv4Address::from_bytes(
@@ -227,6 +238,11 @@ impl Device {
                         },
                         verdict,
                     );
+                    // Packet-layer lookups observe cache updates on the next packet.
+                    // ALE-authorized flows need an explicit policy reauthorization.
+                    if let Err(err) = self.filter_engine.reset_all_filters() {
+                        err!("failed to reauthorize connections: {}", err);
+                    }
                 } else {
                     err!("invalid verdict value: {}", update.verdict);
                 }
@@ -237,7 +253,7 @@ impl Device {
                 if let Some(verdict) = FromPrimitive::from_u8(update.verdict) {
                     // Update with new action.
                     dbg!("Verdict update received {:?}: {}", update, verdict);
-                    _classify_defer = self.connection_cache.update_connection(
+                    _ = self.connection_cache.update_connection(
                         Key {
                             protocol: IpProtocol::from(update.protocol),
                             local_address: IpAddress::Ipv6(Ipv6Address::from_bytes(
@@ -251,6 +267,11 @@ impl Device {
                         },
                         verdict,
                     );
+                    // Packet-layer lookups observe cache updates on the next packet.
+                    // ALE-authorized flows need an explicit policy reauthorization.
+                    if let Err(err) = self.filter_engine.reset_all_filters() {
+                        err!("failed to reauthorize connections: {}", err);
+                    }
                 } else {
                     err!("invalid verdict value: {}", update.verdict);
                 }
@@ -326,7 +347,7 @@ impl Device {
         // End blocking operations from the queue. This will end pending read requests.
         self.event_queue.rundown();
 
-		// Resolve all pending packets. This is important for proper driver unload.
+        // Resolve all pending packets. This is important for proper driver unload.
         let pending_packets = self.packet_cache.pop_all();
         for el in pending_packets {
             let key = el.value.0;
@@ -335,7 +356,7 @@ impl Device {
             _ = self
                 .connection_cache
                 .update_connection(key, crate::connection::Verdict::PermanentBlock);
-            _ = self.inject_packet(packet, true); // Blocked must be set, so it only handles the ALE layer.
+            _ = self.inject_packet(packet, true); // Complete ALE pends and discard all packet clones.
         }
     }
 
@@ -350,9 +371,11 @@ impl Device {
                 Ok(())
             }
             Packet::AleLayer(defer) => {
-                let packet_list = defer.complete(&mut self.filter_engine)?;
-                if let Some(packet_list) = packet_list {
-                    self.injector.inject_packet_list_transport(packet_list)?;
+                let packet_list = defer.complete(&mut self.filter_engine, !blocked)?;
+                if !blocked {
+                    if let Some(packet_list) = packet_list {
+                        self.injector.inject_packet_list_transport(packet_list)?;
+                    }
                 }
 
                 Ok(())

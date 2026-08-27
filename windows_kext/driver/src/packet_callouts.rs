@@ -79,11 +79,10 @@ pub fn ip_packet_layer_inbound_v6(data: CalloutData) {
 
 /// Largest retreat accepted from WFP metadata.
 ///
-/// `NdisRetreatNetBufferDataStart` can fail, and its return value is discarded in
-/// `NetBufferList::retreat`, so an oversized request would silently not happen and
-/// leave the buffer positioned wrongly in the other direction. IPv4 headers cap at
-/// 60 bytes (IHL is 4 bits of 32-bit words); IPv6 base plus a realistic extension
-/// header chain is bounded well below this.
+/// `NdisRetreatNetBufferDataStart` can fail, so the amount accepted from WFP
+/// metadata is bounded and the retreat result is propagated to the caller. IPv4
+/// headers cap at 60 bytes (IHL is 4 bits of 32-bit words); IPv6 base plus a
+/// realistic extension header chain is bounded well below this.
 const MAX_IP_HEADER_RETREAT: u32 = 128;
 
 /// Retreats an inbound net buffer to the start of the IP header.
@@ -102,8 +101,12 @@ fn retreat_to_ip_header(
     nbl: &mut NetBufferList,
     ipv6: bool,
     wfp_ip_header_size: Option<u32>,
-) {
-    let base = if ipv6 { IPV6_HEADER_LEN } else { IPV4_HEADER_LEN } as u32;
+) -> Result<(), String> {
+    let base = if ipv6 {
+        IPV6_HEADER_LEN
+    } else {
+        IPV4_HEADER_LEN
+    } as u32;
 
     // A value below the base header size cannot be right; treat it as missing.
     let size = match wfp_ip_header_size {
@@ -111,7 +114,7 @@ fn retreat_to_ip_header(
         _ => base,
     };
 
-    nbl.retreat(size, true);
+    nbl.retreat(size, true)
 }
 
 /// Returns true if the packet described by this indication is an individual IP
@@ -134,7 +137,10 @@ fn is_ip_fragment(
     };
 
     if let Direction::Inbound = direction {
-        retreat_to_ip_header(&mut nbl, ipv6, wfp_ip_header_size);
+        if let Err(err) = retreat_to_ip_header(&mut nbl, ipv6, wfp_ip_header_size) {
+            crate::err!("failed to retreat packet to IP header: {}", err);
+            return false;
+        }
     }
 
     if ipv6 {
@@ -147,6 +153,7 @@ fn is_ip_fragment(
 struct ConnectionInfo {
     verdict: Verdict,
     process_id: u64,
+    direction: Direction,
     redirect_info: Option<RedirectInfo>,
 }
 
@@ -155,13 +162,17 @@ impl ConnectionInfo {
         ConnectionInfo {
             verdict: conn.get_verdict(),
             process_id: conn.get_process_id(),
+            direction: conn.get_direction(),
             redirect_info: conn.redirect_info(),
         }
     }
 }
 
 fn fast_track_pm_packets(key: &Key, _: Direction) -> bool {
-    if key.local_port == PM_DNS_PORT || key.local_port == PM_SPN_PORT || key.local_port == PM_SPLIT_TUN_PORT {
+    if key.local_port == PM_DNS_PORT
+        || key.local_port == PM_SPN_PORT
+        || key.local_port == PM_SPLIT_TUN_PORT
+    {
         return key.local_address == key.remote_address;
     }
 
@@ -179,7 +190,7 @@ fn ip_packet_layer(
     // Make the default path as drop.
     data.block_and_absorb();
 
-	// How far back an inbound buffer has to be moved to reach the IP header.
+    // How far back an inbound buffer has to be moved to reach the IP header.
     // Read once here: it is needed both by the fragment check below and by every
     // retreat in the loop.
     let wfp_ip_header_size = data.get_ip_header_size();
@@ -224,7 +235,10 @@ fn ip_packet_layer(
         if let Direction::Inbound = direction {
             // The header is not part of the NBL for incoming packets. Move the beginning of the buffer back so we get access to it.
             // The NBL will auto advance after it loses scope.
-            retreat_to_ip_header(&mut nbl, ipv6, wfp_ip_header_size);
+            if let Err(err) = retreat_to_ip_header(&mut nbl, ipv6, wfp_ip_header_size) {
+                crate::err!("failed to retreat packet to IP header: {}", err);
+                return;
+            }
         }
 
         // Get key from packet.
@@ -353,6 +367,18 @@ fn ip_packet_layer(
             if let Some(mut conn_info) =
                 get_connection_info(&mut device.connection_cache, &key, ipv6)
             {
+                // A connection authorized by ALE_AUTH_RECV_ACCEPT is enforced at
+                // that layer for its lifetime. Do not classify either direction of
+                // the same connection a second time at the packet layer.
+                //
+                // Connections authorized by ALE_AUTH_CONNECT are intentionally not
+                // bypassed here. Their packet path still handles temporary verdicts
+                // and reverse redirect rewriting on received packets.
+                if matches!(conn_info.direction, Direction::Inbound) {
+                    data.action_permit();
+                    return;
+                }
+
                 process_id = conn_info.process_id;
                 // Check if there is action for this connection.
                 match conn_info.verdict {
@@ -369,7 +395,9 @@ fn ip_packet_layer(
                         send_request_to_portmaster = false;
                         data.block_and_absorb();
                     }
-                    Verdict::RedirectNameServer | Verdict::RedirectTunnel | Verdict::RedirectSplitTunnel => {
+                    Verdict::RedirectNameServer
+                    | Verdict::RedirectTunnel
+                    | Verdict::RedirectSplitTunnel => {
                         if let Some(redirect_info) = conn_info.redirect_info.take() {
                             match clone_packet(
                                 device,
@@ -381,7 +409,9 @@ fn ip_packet_layer(
                                 sub_interface_index,
                             ) {
                                 Ok(mut packet) => {
-                                    let _ = packet.redirect(redirect_info);
+                                    if let Err(err) = packet.redirect(redirect_info) {
+                                        crate::err!("failed to redirect packet: {}", err);
+                                    }
                                     if let Err(err) = device.inject_packet(packet, false) {
                                         crate::err!("failed to inject packet: {}", err);
                                     }
@@ -395,12 +425,16 @@ fn ip_packet_layer(
                         continue;
                     }
                 }
+            } else if matches!(direction, Direction::Inbound) {
+                // No connection exists yet. Let WFP continue to
+                // ALE_AUTH_RECV_ACCEPT, where the owning PID is available and the
+                // TCP/UDP connection will be pended and sent to Portmaster.
+                data.action_permit();
+                return;
             } else {
-                // Connection is not in the cache.
-                //
-                // This layer has no process ID of its own. No socket is associated
-                // with an inbound IP packet yet, so connections first observed here
-                // are created with an unknown PID.
+                // An outbound TCP/UDP packet should normally have been registered at
+                // ALE_AUTH_CONNECT. Preserve the defensive fallback for packets that
+                // reach this layer without a cache entry.
                 process_id = 0;
 
                 crate::dbg!(
@@ -409,11 +443,21 @@ fn ip_packet_layer(
                     process_id
                 );
                 if ipv6 {
-                    let conn = ConnectionV6::from_key(&key, process_id, effective_direction).unwrap();
-                    device.connection_cache.add_connection_v6(conn);
+                    match ConnectionV6::from_key(&key, process_id, effective_direction) {
+                        Ok(conn) => device.connection_cache.add_connection_v6(conn),
+                        Err(err) => {
+                            crate::err!("failed to build connection: {}", err);
+                            return;
+                        }
+                    }
                 } else {
-                    let conn = ConnectionV4::from_key(&key, process_id, effective_direction).unwrap();
-                    device.connection_cache.add_connection_v4(conn);
+                    match ConnectionV4::from_key(&key, process_id, effective_direction) {
+                        Ok(conn) => device.connection_cache.add_connection_v4(conn),
+                        Err(err) => {
+                            crate::err!("failed to build connection: {}", err);
+                            return;
+                        }
+                    }
                 }
             }
         }

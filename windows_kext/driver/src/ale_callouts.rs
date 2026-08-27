@@ -1,13 +1,17 @@
 use crate::connection::{Connection, ConnectionV4, ConnectionV6, Direction, Verdict};
 use crate::connection_map::Key;
 use crate::device::{Device, Packet};
+use alloc::string::String;
 
 use crate::info;
 use smoltcp::wire::{
     IpAddress, IpProtocol, Ipv4Address, Ipv6Address, IPV4_HEADER_LEN, IPV6_HEADER_LEN,
 };
 use wdk::filter_engine::callout_data::CalloutData;
-use wdk::filter_engine::layer::{self, FieldsAleAuthConnectV4, FieldsAleAuthConnectV6, ValueType};
+use wdk::filter_engine::layer::{
+    self, FieldsAleAuthConnectV4, FieldsAleAuthConnectV6, FieldsAleAuthRecvAcceptV4,
+    FieldsAleAuthRecvAcceptV6, ValueType,
+};
 use wdk::filter_engine::net_buffer::NetBufferList;
 use wdk::filter_engine::packet::{Injector, TransportPacketList};
 
@@ -131,6 +135,46 @@ pub fn ale_layer_connect_v6(data: CalloutData) {
     ale_layer_auth(data, ale_data);
 }
 
+pub fn ale_layer_recv_accept_v4(data: CalloutData) {
+    type Fields = FieldsAleAuthRecvAcceptV4;
+
+    let ale_data = AleLayerData {
+        is_ipv6: false,
+        reauthorize: data.is_reauthorize(Fields::Flags as usize),
+        process_id: data.get_process_id().unwrap_or(0),
+        protocol: get_protocol(&data, Fields::IpProtocol as usize),
+        direction: Direction::Inbound,
+        local_ip: get_ipv4_address(&data, Fields::IpLocalAddress as usize),
+        local_port: data.get_value_u16(Fields::IpLocalPort as usize),
+        remote_ip: get_ipv4_address(&data, Fields::IpRemoteAddress as usize),
+        remote_port: data.get_value_u16(Fields::IpRemotePort as usize),
+        interface_index: get_u32_or_zero(&data, Fields::InterfaceIndex as usize),
+        sub_interface_index: get_u32_or_zero(&data, Fields::SubInterfaceIndex as usize),
+    };
+
+    ale_layer_auth(data, ale_data);
+}
+
+pub fn ale_layer_recv_accept_v6(data: CalloutData) {
+    type Fields = FieldsAleAuthRecvAcceptV6;
+
+    let ale_data = AleLayerData {
+        is_ipv6: true,
+        reauthorize: data.is_reauthorize(Fields::Flags as usize),
+        process_id: data.get_process_id().unwrap_or(0),
+        protocol: get_protocol(&data, Fields::IpProtocol as usize),
+        direction: Direction::Inbound,
+        local_ip: get_ipv6_address(&data, Fields::IpLocalAddress as usize),
+        local_port: data.get_value_u16(Fields::IpLocalPort as usize),
+        remote_ip: get_ipv6_address(&data, Fields::IpRemoteAddress as usize),
+        remote_port: data.get_value_u16(Fields::IpRemotePort as usize),
+        interface_index: get_u32_or_zero(&data, Fields::InterfaceIndex as usize),
+        sub_interface_index: get_u32_or_zero(&data, Fields::SubInterfaceIndex as usize),
+    };
+
+    ale_layer_auth(data, ale_data);
+}
+
 fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
     // Make the default path as drop.
     data.block_and_absorb();
@@ -139,10 +183,17 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
         return;
     };
 
-    // Check if packet was previously injected from the packet layer.
-    if device
-        .injector
-        .was_network_packet_injected_by_self(data.get_layer_data() as _, ale_data.is_ipv6)
+    // Network-layer reinjection is used by the packet path, while packets held at
+    // ALE receive/accept are returned with the transport injector. Either kind can
+    // be indicated here again and must be permitted without creating another pend.
+    let layer_data = data.get_layer_data();
+    if !layer_data.is_null()
+        && (device
+            .injector
+            .was_network_packet_injected_by_self(layer_data as _, ale_data.is_ipv6)
+            || device
+                .injector
+                .was_transport_packet_injected_by_self(layer_data as _))
     {
         data.action_permit();
         return;
@@ -180,8 +231,8 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
     //
     // Register the connection here so the process ID is recorded while it is
     // available - the packet layer has no access to it and would store 0 - then
-    // permit and let the packet layer classify. Inbound is unaffected: it is
-    // already decided at the packet layer before reaching this one.
+    // permit and let the packet layer classify. Inbound UDP does not take this
+    // branch; it is authorized at ALE_AUTH_RECV_ACCEPT.
     if matches!(ale_data.protocol, IpProtocol::Udp)
         && matches!(ale_data.direction, Direction::Outbound)
     {
@@ -275,10 +326,13 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
             | Verdict::RedirectNameServer
             | Verdict::RedirectTunnel
             | Verdict::RedirectSplitTunnel => {
-                // Continue to packet layer.
+                // Authorize at ALE. Outbound traffic continues to the packet
+                // layer; inbound traffic has already passed it.
                 data.action_permit();
 
-                if device.is_owner_pid(ale_data.process_id as u32) && matches!(ale_data.direction, Direction::Outbound) {
+                if device.is_owner_pid(ale_data.process_id as u32)
+                    && matches!(ale_data.direction, Direction::Outbound)
+                {
                     // If this is Portmaster's own outbound connection, clear the write flag
                     // to prevent subsequent filters in the chain from overriding the permit action.
                     // This prevents other firewall applications from blocking Portmaster's own connections.
@@ -300,7 +354,7 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
                     // Handled by packet layer.
                     data.action_permit();
                 } else {
-                    // packet layer will still see the packets.
+                    // Inbound authorization is enforced here.
                     data.action_block_hard();
                 }
             }
@@ -309,7 +363,7 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
                     // Handled by packet layer.
                     data.action_permit();
                 } else {
-                    // packet layer will still see the packets.
+                    // Inbound authorization is enforced here.
                     data.block_and_absorb();
                 }
             }
@@ -323,37 +377,53 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
         // send status reported to the application. Inbound UDP still arrives here
         // and is safe to pend: there is no application send operation to freeze.
         let can_pend_connection = !ale_data.reauthorize;
-        match save_packet(device, &mut data, &ale_data, can_pend_connection) {
-            Ok(packet) => {
-                let info = device.packet_cache.push(
-                    (key, packet),
-                    ale_data.process_id,
-                    ale_data.direction,
-                    true,
-                );
-                if let Some(info) = info {
-                    let _ = device.event_queue.push(info);
-                }
-            }
+        let packet = match save_packet(device, &mut data, &ale_data, can_pend_connection) {
+            Ok(packet) => packet,
             Err(err) => {
                 crate::err!("failed to pend packet: {}", err);
+                return;
             }
         };
 
-        // Connection is not in cache, add it.
+        // Connection is not in cache, add it before publishing the request. A
+        // verdict can arrive as soon as the event becomes visible to user space.
         crate::dbg!(
             "ale layer adding connection: {} PID: {}",
             key,
             ale_data.process_id
         );
         if ale_data.is_ipv6 {
-            let conn =
-                ConnectionV6::from_key(&key, ale_data.process_id, ale_data.direction).unwrap();
-            device.connection_cache.add_connection_v6(conn);
+            match ConnectionV6::from_key(&key, ale_data.process_id, ale_data.direction) {
+                Ok(conn) => device.connection_cache.add_connection_v6(conn),
+                Err(err) => {
+                    crate::err!("failed to build connection: {}", err);
+                    if let Err(complete_err) = device.inject_packet(packet, true) {
+                        crate::err!("failed to complete ALE operation: {}", complete_err);
+                    }
+                    return;
+                }
+            }
         } else {
-            let conn =
-                ConnectionV4::from_key(&key, ale_data.process_id, ale_data.direction).unwrap();
-            device.connection_cache.add_connection_v4(conn);
+            match ConnectionV4::from_key(&key, ale_data.process_id, ale_data.direction) {
+                Ok(conn) => device.connection_cache.add_connection_v4(conn),
+                Err(err) => {
+                    crate::err!("failed to build connection: {}", err);
+                    if let Err(complete_err) = device.inject_packet(packet, true) {
+                        crate::err!("failed to complete ALE operation: {}", complete_err);
+                    }
+                    return;
+                }
+            }
+        }
+
+        let info = device.packet_cache.push(
+            (key, packet),
+            ale_data.process_id,
+            ale_data.direction,
+            true,
+        );
+        if let Some(info) = info {
+            let _ = device.event_queue.push(info);
         }
 
         // Drop packet. It will be re-injected after Portmaster returns a verdict.
@@ -377,7 +447,10 @@ fn save_packet(
         }
     };
     if save_packet_list {
-        packet_list = create_packet_list(device, callout_data, ale_data);
+        packet_list = create_packet_list(device, callout_data, ale_data)?;
+    }
+    if pend && matches!(ale_data.direction, Direction::Inbound) && packet_list.is_none() {
+        return Err("ALE receive/accept indication has no packet data".into());
     }
     if pend && matches!(ale_data.protocol, IpProtocol::Tcp | IpProtocol::Udp) {
         match callout_data.pend_operation(packet_list) {
@@ -393,24 +466,54 @@ fn create_packet_list(
     device: &Device,
     callout_data: &mut CalloutData,
     ale_data: &AleLayerData,
-) -> Option<TransportPacketList> {
+) -> Result<Option<TransportPacketList>, String> {
+    if callout_data.get_layer_data().is_null() {
+        return Ok(None);
+    }
+
     let mut nbl = NetBufferList::new(callout_data.get_layer_data() as _);
     let mut inbound = false;
+    let mut event_data_offset = 0;
     if let Direction::Inbound = ale_data.direction {
-        // Retreat by the size WFP reports, not the fixed base header length: with
-        // IPv4 options, or an IPv6 extension header chain, the header is longer and
-        // a fixed retreat leaves the buffer inside it. See retreat_to_ip_header in
-        // packet_callouts.rs for the full reasoning.
+        // At ALE_AUTH_RECV_ACCEPT the inbound data offset is at the payload.
+        // Retreat over both headers so the clone passed to
+        // FwpsInjectTransportReceiveAsync starts at the IP header.
         let base = if ale_data.is_ipv6 {
             IPV6_HEADER_LEN
         } else {
             IPV4_HEADER_LEN
         } as u32;
-        let size = match callout_data.get_ip_header_size() {
-            Some(size) if size >= base && size <= 128 => size,
-            _ => base,
+        let ip_header_size = callout_data
+            .get_ip_header_size()
+            .ok_or_else(|| String::from("missing ALE IP header size metadata"))?;
+        if ip_header_size < base {
+            return Err(alloc::format!(
+                "invalid ALE IP header size: {}",
+                ip_header_size
+            ));
+        }
+
+        let transport_header_size = callout_data
+            .get_transport_header_size()
+            .ok_or_else(|| String::from("missing ALE transport header size metadata"))?;
+        let minimum_transport_header_size = match ale_data.protocol {
+            IpProtocol::Tcp => 20,
+            IpProtocol::Udp => 8,
+            _ => 0,
         };
-        nbl.retreat(size, true);
+        if transport_header_size < minimum_transport_header_size {
+            return Err(alloc::format!(
+                "invalid ALE transport header size: {}",
+                transport_header_size
+            ));
+        }
+
+        let header_size = ip_header_size
+            .checked_add(transport_header_size)
+            .ok_or_else(|| String::from("ALE header size overflow"))?;
+        nbl.retreat(header_size, true)
+            .map_err(|err| alloc::format!("failed to retreat ALE packet: {}", err))?;
+        event_data_offset = ip_header_size as usize;
         inbound = true;
     }
 
@@ -418,18 +521,20 @@ fn create_packet_list(
         IpAddress::Ipv4(address) => &address.0,
         IpAddress::Ipv6(address) => &address.0,
     };
-    if let Ok(clone) = nbl.clone(&device.network_allocator) {
-        return Some(Injector::from_ale_callout(
-            ale_data.is_ipv6,
-            callout_data,
-            clone,
-            address,
-            inbound,
-            ale_data.interface_index,
-            ale_data.sub_interface_index,
-        ));
-    }
-    return None;
+    let clone = nbl
+        .clone(&device.network_allocator)
+        .map_err(|err| alloc::format!("failed to clone ALE packet: {}", err))?;
+
+    Ok(Some(Injector::from_ale_callout(
+        ale_data.is_ipv6,
+        callout_data,
+        clone,
+        event_data_offset,
+        address,
+        inbound,
+        ale_data.interface_index,
+        ale_data.sub_interface_index,
+    )))
 }
 
 pub fn endpoint_closure_v4(data: CalloutData) {
