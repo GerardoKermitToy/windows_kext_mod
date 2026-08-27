@@ -34,14 +34,13 @@ impl ConnectionCache {
         self.connections_v6.add(connection);
     }
 
-    /// Fills in the owning process of a connection that was created without one.
+    /// Updates the owning process of a connection when the incoming PID is usable.
     ///
     /// Returns true if the entry was updated.
     ///
-    /// Only a stored 0 is overwritten. A connection whose PID is already known
-    /// must never be re-attributed: WFP can indicate an established connection
-    /// again from an unrelated context, and the PID it reports then belongs to
-    /// that context rather than to the connection.
+    /// PID 0 is ignored. PID 4 may replace an unknown PID (0), but must not
+    /// replace a concrete application PID. Any other PID takes precedence and
+    /// replaces the currently stored value, including 0 or 4.
     ///
     /// The connections this does fix are the ones the inbound packet layer
     /// created: no socket is associated with a packet at that layer, so WFP
@@ -50,6 +49,7 @@ impl ConnectionCache {
     /// repeats the endpoint lookup - roughly 200 times for a single loopback
     /// connection in the capture above.
     pub fn update_process_id(&mut self, key: &Key, process_id: u64) -> bool {
+        // PID 0 carries no attribution and must never replace a stored value.
         if process_id == 0 {
             return false;
         }
@@ -57,7 +57,10 @@ impl ConnectionCache {
         if key.is_ipv6() {
             let _guard = self.lock_v6.write_lock();
             if let Some(conn) = self.connections_v6.get_mut(key) {
-                if conn.process_id == 0 {
+                // PID 4 may fill an unknown entry, while every other PID may
+                // replace the current value. A PID 4 must not replace a
+                // concrete application PID.
+                if conn.process_id == 0 || process_id != 4 {
                     conn.process_id = process_id;
                     return true;
                 }
@@ -65,7 +68,7 @@ impl ConnectionCache {
         } else {
             let _guard = self.lock_v4.write_lock();
             if let Some(conn) = self.connections_v4.get_mut(key) {
-                if conn.process_id == 0 {
+                if conn.process_id == 0 || process_id != 4 {
                     conn.process_id = process_id;
                     return true;
                 }
