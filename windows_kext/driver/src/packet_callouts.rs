@@ -160,40 +160,6 @@ impl ConnectionInfo {
     }
 }
 
-/// Resolves the process that owns the local endpoint of `key`, using the table
-/// filled at the bind layer.
-///
-/// Returns `None` when the port is unknown, which is the case for sockets that
-/// were bound before the driver loaded.
-///
-/// The port to look up is the local one, and which side of the key that is
-/// depends on the direction. `get_key_from_nbl_*` builds the key from the packet
-/// as it appears on the wire: for an outbound packet the local endpoint is the
-/// source, for an inbound packet it is the destination. Both end up in
-/// `key.local_*` for that reason, so `local_port` is correct either way - the
-/// direction is taken as an argument only to keep that reasoning checkable at
-/// the call site rather than implied.
-/// `ipv6` selects the address family, which is part of the key: the same port
-/// number can be held by two unrelated processes at once, one on each family.
-fn lookup_endpoint_pid(
-    device: &Device,
-    key: &Key,
-    ipv6: bool,
-    _direction: Direction,
-) -> Option<u64> {
-    let pid = device
-        .endpoint_pid_cache
-        .get(ipv6, key.protocol, key.local_port)?;
-
-    // A stored 0 carries no information; report it as unknown so callers do not
-    // treat it as a resolved process.
-    if pid == 0 {
-        return None;
-    }
-
-    Some(pid)
-}
-
 fn fast_track_pm_packets(key: &Key, _: Direction) -> bool {
     if key.local_port == PM_DNS_PORT || key.local_port == PM_SPN_PORT || key.local_port == PM_SPLIT_TUN_PORT {
         return key.local_address == key.remote_address;
@@ -286,10 +252,9 @@ fn ip_packet_layer(
         // semantically INBOUND. Track the effective direction separately.
         let mut effective_direction = direction;
 
-        // Protocols without ports - ICMP above all - are never resolved by the
-        // machinery below: they are not classified at the ALE layers, and the
-        // endpoint table is keyed by port, which they do not have. They used to be
-        // reported with PID 0 for that reason.
+        // Protocols without ports - ICMP above all - are not classified at the
+        // ALE layers and are reported with PID 0 unless packet-specific attribution
+        // below can resolve their originator.
         //
         // For an outbound packet the originator is available anyway, from the
         // thread this callout runs on. An application sending an echo request
@@ -389,22 +354,6 @@ fn ip_packet_layer(
                 get_connection_info(&mut device.connection_cache, &key, ipv6)
             {
                 process_id = conn_info.process_id;
-
-                // A cached connection can carry PID 0 when this layer was the one
-                // that created it - either before the owning process bound its
-                // port, or on a build that had no way to resolve it at all. Fall
-                // back to the bind-layer lookup so those connections stop
-                // reporting 0 once the information becomes available.
-                if process_id == 0 {
-                    if let Some(pid) = lookup_endpoint_pid(device, &key, ipv6, direction) {
-                        process_id = pid;
-                        // Write it back, so the entry stops reporting 0 and later
-                        // packets of this connection do not repeat the lookup. The
-                        // update only applies to a stored 0, so a PID that is
-                        // already known is never replaced.
-                        device.connection_cache.update_process_id(&key, pid);
-                    }
-                }
                 // Check if there is action for this connection.
                 match conn_info.verdict {
                     Verdict::Undecided | Verdict::Accept | Verdict::Block | Verdict::Drop => {}
@@ -449,13 +398,10 @@ fn ip_packet_layer(
             } else {
                 // Connection is not in the cache.
                 //
-                // This layer has no process ID of its own: no socket is
-                // associated with the packet at the inbound IP packet layer, so
-                // WFP supplies none. The owning process is resolved from the
-                // endpoint ownership recorded by the ALE monitor instead. It stays 0
-                // when no usable endpoint indication supplied a PID.
-                process_id = lookup_endpoint_pid(device, &key, ipv6, effective_direction)
-                    .unwrap_or(0);
+                // This layer has no process ID of its own. No socket is associated
+                // with an inbound IP packet yet, so connections first observed here
+                // are created with an unknown PID.
+                process_id = 0;
 
                 crate::dbg!(
                     "packet layer adding connection: {} PID: {}",

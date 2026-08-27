@@ -13,7 +13,6 @@ mod connection;
 mod connection_cache;
 mod connection_map;
 mod device;
-mod endpoint_pid_cache;
 mod entry;
 mod icmp_echo_cache;
 mod id_cache;

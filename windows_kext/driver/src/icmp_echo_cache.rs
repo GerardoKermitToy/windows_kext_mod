@@ -66,9 +66,9 @@ const ENTRY_TTL_MS: u64 = 10_000;
 const MAX_ENTRIES: usize = 512;
 
 pub struct IcmpEchoCache {
-    /// A map rather than a flat array: unlike the endpoint PID table, the key space
-    /// here includes a full address, so it cannot be indexed directly. The map
-    /// stays small because entries are removed as soon as they are used.
+    /// A map is used because the key space includes a full address and cannot be
+    /// indexed directly. The map stays small because entries are removed as soon
+    /// as they are used.
     entries: BTreeMap<EchoKey, EchoEntry>,
     lock: RwSpinLock,
 }
