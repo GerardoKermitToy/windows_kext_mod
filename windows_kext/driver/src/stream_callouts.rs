@@ -1,7 +1,7 @@
-use smoltcp::wire::{IpAddress, Ipv4Address, Ipv6Address};
+use smoltcp::wire::{Ipv4Address, Ipv6Address};
 use wdk::filter_engine::{callout_data::CalloutData, layer, net_buffer::NetBufferListIter};
 
-use crate::{bandwidth, connection::Direction, connection_map::Key, device::Device};
+use crate::{bandwidth, connection::Direction, device::Device};
 
 pub fn stream_layer_tcp_v4(data: CalloutData) {
     type Fields = layer::FieldsStreamV4;
@@ -154,22 +154,6 @@ fn is_self_injected(device: &Device, data: &CalloutData, ipv6: bool) -> bool {
         .was_network_packet_injected_by_self(data.get_layer_data() as _, ipv6)
 }
 
-/// Associates a concrete UDP connection instance with the endpoint seen at the
-/// datagram layer. If no live cache entry exists, there is nothing that periodic
-/// cleanup or a flow callback could identify safely, so no unbound peer is stored.
-fn track_udp_endpoint(device: &mut Device, data: &CalloutData, key: Key) {
-    let (Some(endpoint_handle), Some(instance_id)) = (
-        data.get_transport_endpoint_handle()
-            .filter(|endpoint_handle| *endpoint_handle != 0),
-        device.connection_cache.get_connection_instance_id(&key),
-    ) else {
-        return;
-    };
-    let _ = device
-        .udp_endpoint_cache
-        .associate_instance(endpoint_handle, key, instance_id);
-}
-
 pub fn stream_layer_udp_v4(data: CalloutData) {
     type Fields = layer::FieldsDatagramDataV4;
 
@@ -219,17 +203,6 @@ pub fn stream_layer_udp_v4(data: CalloutData) {
             .to_be_bytes(),
     );
     let remote_port = data.get_value_u16(Fields::IpRemotePort as usize);
-    track_udp_endpoint(
-        device,
-        &data,
-        Key {
-            protocol,
-            local_address: IpAddress::Ipv4(local_ip),
-            local_port,
-            remote_address: IpAddress::Ipv4(remote_ip),
-            remote_port,
-        },
-    );
     match direction {
         Direction::Outbound => {
             device.bandwidth_stats.update_udp_v4_tx(
@@ -293,17 +266,6 @@ pub fn stream_layer_udp_v6(data: CalloutData) {
     let remote_ip =
         Ipv6Address::from_bytes(data.get_value_byte_array16(Fields::IpRemoteAddress as usize));
     let remote_port = data.get_value_u16(Fields::IpRemotePort as usize);
-    track_udp_endpoint(
-        device,
-        &data,
-        Key {
-            protocol,
-            local_address: IpAddress::Ipv6(local_ip),
-            local_port,
-            remote_address: IpAddress::Ipv6(remote_ip),
-            remote_port,
-        },
-    );
     match direction {
         Direction::Outbound => {
             device.bandwidth_stats.update_udp_v6_tx(
