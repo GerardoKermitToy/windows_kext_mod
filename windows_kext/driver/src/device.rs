@@ -18,7 +18,7 @@ use wdk::{
 use crate::{
     array_holder::ArrayHolder, bandwidth::Bandwidth, callouts, connection_cache::ConnectionCache,
     connection_map::Key, dbg, err, icmp_echo_cache::IcmpEchoCache, id_cache::IdCache, logger,
-    packet_util::Redirect,
+    packet_util::Redirect, udp_endpoint_cache::UdpEndpointCache,
 };
 
 pub enum Packet {
@@ -33,6 +33,9 @@ pub struct Device {
     pub(crate) event_queue: IOQueue<Info>,          // Queue for events to user-space
     pub(crate) packet_cache: IdCache,               // Cache of pending packets waiting for verdict
     pub(crate) connection_cache: ConnectionCache,   // Cache of connections and their verdicts
+    /// UDP remote tuples grouped by WFP transport endpoint handle. A UDP socket
+    /// receives one endpoint-closure indication regardless of its remote peers.
+    pub(crate) udp_endpoint_cache: UdpEndpointCache,
     /// (remote address, echo identifier) -> PID that sent the request.
     /// An inbound echo reply has no process of its own to read, so it is matched
     /// against the outbound request that caused it.
@@ -64,6 +67,7 @@ impl Device {
             event_queue: IOQueue::new(),
             packet_cache: IdCache::new(),
             connection_cache: ConnectionCache::new(),
+            udp_endpoint_cache: UdpEndpointCache::new(),
             icmp_echo_cache: IcmpEchoCache::new(),
             injector: Injector::new(),
             network_allocator: NetworkAllocator::new(),
@@ -279,6 +283,7 @@ impl Device {
             CommandType::ClearCache => {
                 wdk::dbg!("ClearCache command");
                 self.connection_cache.clear();
+                self.udp_endpoint_cache.clear();
                 if let Err(err) = self.filter_engine.reset_all_filters() {
                     err!("failed to reset filters: {}", err);
                 }
@@ -358,6 +363,8 @@ impl Device {
                 .update_connection(key, crate::connection::Verdict::PermanentBlock);
             _ = self.inject_packet(packet, true); // Complete ALE pends and discard all packet clones.
         }
+
+        self.udp_endpoint_cache.clear();
     }
 
     pub fn inject_packet(&mut self, packet: Packet, blocked: bool) -> Result<(), String> {

@@ -37,6 +37,7 @@ mod packet_callouts;
 mod packet_util;
 #[cfg(not(test))]
 mod stream_callouts;
+mod udp_endpoint_cache;
 
 #[cfg(not(test))]
 use wdk::allocator::WindowsAllocator;

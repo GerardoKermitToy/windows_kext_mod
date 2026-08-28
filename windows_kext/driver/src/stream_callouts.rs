@@ -1,7 +1,7 @@
-use smoltcp::wire::{Ipv4Address, Ipv6Address};
+use smoltcp::wire::{IpAddress, Ipv4Address, Ipv6Address};
 use wdk::filter_engine::{callout_data::CalloutData, layer, net_buffer::NetBufferListIter};
 
-use crate::{bandwidth, connection::Direction, device::Device};
+use crate::{bandwidth, connection::Direction, connection_map::Key, device::Device};
 
 pub fn stream_layer_tcp_v4(data: CalloutData) {
     type Fields = layer::FieldsStreamV4;
@@ -154,6 +154,17 @@ fn is_self_injected(device: &Device, data: &CalloutData, ipv6: bool) -> bool {
         .was_network_packet_injected_by_self(data.get_layer_data() as _, ipv6)
 }
 
+/// Associates a UDP tuple with the socket endpoint seen at the datagram layer.
+///
+/// The endpoint handle is also available at the ALE authorization layers, but the
+/// datagram layer is a useful fallback for paths where authorization did not expose
+/// a handle. Repeated associations are ignored by the endpoint cache.
+fn track_udp_endpoint(device: &mut Device, data: &CalloutData, key: Key) {
+    if let Some(endpoint_handle) = data.get_transport_endpoint_handle() {
+        device.udp_endpoint_cache.associate(endpoint_handle, key);
+    }
+}
+
 pub fn stream_layer_udp_v4(data: CalloutData) {
     type Fields = layer::FieldsDatagramDataV4;
 
@@ -165,7 +176,7 @@ pub fn stream_layer_udp_v4(data: CalloutData) {
     // indicated here as well. Their bytes must not be attributed to UDP,
     // especially since ICMP reports type/code in the port fields, which would
     // corrupt the counters of an unrelated UDP connection.
-	let protocol = smoltcp::wire::IpProtocol::from(data.get_value_u8(Fields::IpProtocol as usize));
+    let protocol = smoltcp::wire::IpProtocol::from(data.get_value_u8(Fields::IpProtocol as usize));
     if protocol != smoltcp::wire::IpProtocol::Udp {
         return;
     }
@@ -203,6 +214,17 @@ pub fn stream_layer_udp_v4(data: CalloutData) {
             .to_be_bytes(),
     );
     let remote_port = data.get_value_u16(Fields::IpRemotePort as usize);
+    track_udp_endpoint(
+        device,
+        &data,
+        Key {
+            protocol,
+            local_address: IpAddress::Ipv4(local_ip),
+            local_port,
+            remote_address: IpAddress::Ipv4(remote_ip),
+            remote_port,
+        },
+    );
     match direction {
         Direction::Outbound => {
             device.bandwidth_stats.update_udp_v4_tx(
@@ -236,7 +258,7 @@ pub fn stream_layer_udp_v6(data: CalloutData) {
         return;
     };
 
-	let protocol = smoltcp::wire::IpProtocol::from(data.get_value_u8(Fields::IpProtocol as usize));
+    let protocol = smoltcp::wire::IpProtocol::from(data.get_value_u8(Fields::IpProtocol as usize));
     if protocol != smoltcp::wire::IpProtocol::Udp {
         return;
     }
@@ -266,6 +288,17 @@ pub fn stream_layer_udp_v6(data: CalloutData) {
     let remote_ip =
         Ipv6Address::from_bytes(data.get_value_byte_array16(Fields::IpRemoteAddress as usize));
     let remote_port = data.get_value_u16(Fields::IpRemotePort as usize);
+    track_udp_endpoint(
+        device,
+        &data,
+        Key {
+            protocol,
+            local_address: IpAddress::Ipv6(local_ip),
+            local_port,
+            remote_address: IpAddress::Ipv6(remote_ip),
+            remote_port,
+        },
+    );
     match direction {
         Direction::Outbound => {
             device.bandwidth_stats.update_udp_v6_tx(

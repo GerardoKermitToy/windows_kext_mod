@@ -1,6 +1,7 @@
 use crate::connection::{Connection, ConnectionV4, ConnectionV6, Direction, Verdict};
 use crate::connection_map::Key;
 use crate::device::{Device, Packet};
+use crate::udp_endpoint_cache::UdpEndpointTake;
 use alloc::string::String;
 
 use crate::info;
@@ -222,6 +223,15 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
 
     let key = ale_data.as_key();
 
+    // WFP reports one endpoint closure per non-TCP socket, not one closure per
+    // UDP remote tuple. Associate every UDP authorization with the socket's
+    // transport endpoint handle so that closure can end all of its cached peers.
+    if matches!(ale_data.protocol, IpProtocol::Udp) {
+        if let Some(endpoint_handle) = data.get_transport_endpoint_handle() {
+            device.udp_endpoint_cache.associate(endpoint_handle, key);
+        }
+    }
+
     // Outbound UDP is decided at the IP packet layer, not here.
     //
     // Holding a datagram at this layer corrupts the send status seen by the
@@ -426,12 +436,10 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
             }
         }
 
-        let info = device.packet_cache.push(
-            (key, packet),
-            ale_data.process_id,
-            ale_data.direction,
-            true,
-        );
+        let info =
+            device
+                .packet_cache
+                .push((key, packet), ale_data.process_id, ale_data.direction, true);
         if let Some(info) = info {
             let _ = device.event_queue.push(info);
         }
@@ -547,54 +555,164 @@ fn create_packet_list(
     )))
 }
 
+fn emit_connection_end_v4(device: &mut Device, conn: ConnectionV4, process_id: u64) {
+    let info = protocol::info::connection_end_event_v4_info(
+        if conn.process_id == 0 {
+            process_id
+        } else {
+            conn.process_id
+        },
+        conn.get_direction() as u8,
+        u8::from(conn.protocol),
+        conn.local_address.0,
+        conn.remote_address.0,
+        conn.local_port,
+        conn.remote_port,
+    );
+    let _ = device.event_queue.push(info);
+}
+
+fn emit_connection_end_v6(device: &mut Device, conn: ConnectionV6, process_id: u64) {
+    let info = protocol::info::connection_end_event_v6_info(
+        if conn.process_id == 0 {
+            process_id
+        } else {
+            conn.process_id
+        },
+        conn.get_direction() as u8,
+        u8::from(conn.protocol),
+        conn.local_address.0,
+        conn.remote_address.0,
+        conn.local_port,
+        conn.remote_port,
+    );
+    let _ = device.event_queue.push(info);
+}
+
+fn end_udp_endpoint(device: &mut Device, endpoint_handle: u64, process_id: u64) -> Option<bool> {
+    let endpoint = match device.udp_endpoint_cache.take(endpoint_handle) {
+        UdpEndpointTake::Tracked(endpoint) => endpoint,
+        // Treat a repeated lifetime indication as complete. In particular, do not
+        // run the local-port fallback a second time after the handle was consumed.
+        UdpEndpointTake::AlreadyTaken => return Some(true),
+        // An untracked handle needs the coarse local-endpoint fallback too.
+        UdpEndpointTake::Unknown => return Some(false),
+    };
+
+    for key in endpoint.keys {
+        if key.is_ipv6() {
+            if let Some(conn) = device.connection_cache.end_connection_v6(key) {
+                emit_connection_end_v6(device, conn, process_id);
+            }
+        } else if let Some(conn) = device.connection_cache.end_connection_v4(key) {
+            emit_connection_end_v4(device, conn, process_id);
+        }
+    }
+
+    Some(true)
+}
+
+fn end_local_endpoint_v4(
+    device: &mut Device,
+    protocol: IpProtocol,
+    local_port: u16,
+    local_address: Option<IpAddress>,
+    process_id: u64,
+) {
+    if let Some(conns) = device.connection_cache.end_all_on_endpoint_v4(
+        (protocol, local_port),
+        local_address,
+        (process_id != 0).then_some(process_id),
+    ) {
+        for conn in conns {
+            emit_connection_end_v4(device, conn, process_id);
+        }
+    }
+}
+
+fn end_local_endpoint_v6(
+    device: &mut Device,
+    protocol: IpProtocol,
+    local_port: u16,
+    local_address: Option<IpAddress>,
+    process_id: u64,
+) {
+    if let Some(conns) = device.connection_cache.end_all_on_endpoint_v6(
+        (protocol, local_port),
+        local_address,
+        (process_id != 0).then_some(process_id),
+    ) {
+        for conn in conns {
+            emit_connection_end_v6(device, conn, process_id);
+        }
+    }
+}
+
 pub fn endpoint_closure_v4(data: CalloutData) {
     type Fields = layer::FieldsAleEndpointClosureV4;
     let Some(device) = crate::entry::get_device() else {
         return;
     };
-    let ip_address_type = data.get_value_type(Fields::IpLocalAddress as usize);
-    // The remote endpoint is checked as well, not just the local one. WFP leaves
-    // IpRemoteAddress and IpRemotePort as FWP_EMPTY for closures that have no
-    // remote peer (a listening socket, for example). Reading them regardless
-    // returns whatever the union happens to hold, and the resulting key either
-    // matches no cached connection - so the entry is never removed and the cache
-    // grows - or matches an unrelated one and ends the wrong connection.
-    //
-    // The v6 path already validates both addresses; this brings v4 in line.
-    let remote_address_type = data.get_value_type(Fields::IpRemoteAddress as usize);
-    let remote_port_type = data.get_value_type(Fields::IpRemotePort as usize);
-    let remote_present = matches!(remote_address_type, ValueType::FwpUint32)
-        && matches!(remote_port_type, ValueType::FwpUint16);
+    let process_id = data.get_process_id().unwrap_or(0);
+    let protocol = get_protocol_if_present(&data, Fields::IpProtocol as usize);
 
-    if matches!(ip_address_type, ValueType::FwpUint32) && remote_present {
-        let key = Key {
-            protocol: get_protocol(&data, Fields::IpProtocol as usize),
-            local_address: get_ipv4_address(&data, Fields::IpLocalAddress as usize),
-            local_port: data.get_value_u16(Fields::IpLocalPort as usize),
-            remote_address: get_ipv4_address(&data, Fields::IpRemoteAddress as usize),
-            remote_port: data.get_value_u16(Fields::IpRemotePort as usize),
-        };
-
-        let conn = device.connection_cache.end_connection_v4(key);
-        if let Some(conn) = conn {
-            let info = protocol::info::connection_end_event_v4_info(
-                data.get_process_id().unwrap_or(0),
-                conn.get_direction() as u8,
-                u8::from(get_protocol(&data, Fields::IpProtocol as usize)),
-                conn.local_address.0,
-                conn.remote_address.0,
-                conn.local_port,
-                conn.remote_port,
-            );
-            let _ = device.event_queue.push(info);
+    // UDP closure is socket-level and may omit its remote tuple. Resolve every
+    // peer through the endpoint handle before considering fixed fields.
+    if matches!(protocol, Some(IpProtocol::Udp)) {
+        let endpoint_handle = data.get_transport_endpoint_handle();
+        let endpoint_complete =
+            endpoint_handle.and_then(|handle| end_udp_endpoint(device, handle, process_id));
+        if matches!(endpoint_complete, Some(true)) {
+            return;
         }
-    } else {
-        // Invalid ip address type. Just ignore the error.
-        // err!(
-        //     device.logger,
-        //     "unknown ipv4 address type: {:?}",
-        //     ip_address_type
-        // );
+        // A second lifetime indication for an already-consumed handle must not
+        // fall back to the local port: a new socket may have reused that port.
+        if endpoint_handle.is_some() && endpoint_complete.is_none() {
+            return;
+        }
+
+        let Some(local_port) = get_u16_if_present(&data, Fields::IpLocalPort as usize) else {
+            return;
+        };
+        end_local_endpoint_v4(
+            device,
+            IpProtocol::Udp,
+            local_port,
+            get_ipv4_address_if_present(&data, Fields::IpLocalAddress as usize),
+            process_id,
+        );
+        return;
+    }
+
+    let Some(protocol) = protocol else {
+        // A generic UDP closure can omit the protocol as well as the remote tuple.
+        // The endpoint map contains only UDP associations, so it remains safe to
+        // consume a known handle here. An unknown handle cannot be matched safely.
+        if let Some(endpoint_handle) = data.get_transport_endpoint_handle() {
+            let _ = end_udp_endpoint(device, endpoint_handle, process_id);
+        }
+        return;
+    };
+
+    let (Some(local_address), Some(local_port), Some(remote_address), Some(remote_port)) = (
+        get_ipv4_address_if_present(&data, Fields::IpLocalAddress as usize),
+        get_u16_if_present(&data, Fields::IpLocalPort as usize),
+        get_ipv4_address_if_present(&data, Fields::IpRemoteAddress as usize),
+        get_u16_if_present(&data, Fields::IpRemotePort as usize),
+    ) else {
+        return;
+    };
+
+    let key = Key {
+        protocol,
+        local_address,
+        local_port,
+        remote_address,
+        remote_port,
+    };
+
+    if let Some(conn) = device.connection_cache.end_connection_v4(key) {
+        emit_connection_end_v4(device, conn, process_id);
     }
 }
 
@@ -603,43 +721,63 @@ pub fn endpoint_closure_v6(data: CalloutData) {
     let Some(device) = crate::entry::get_device() else {
         return;
     };
-    let local_ip_address_type = data.get_value_type(Fields::IpLocalAddress as usize);
-    let remote_ip_address_type = data.get_value_type(Fields::IpRemoteAddress as usize);
-    // Ports are validated too: the addresses being present does not guarantee the
-    // port fields are, and an unpopulated port would silently become part of the
-    // key. See endpoint_closure_v4 for the consequences.
-    let ports_present = matches!(
-        data.get_value_type(Fields::IpLocalPort as usize),
-        ValueType::FwpUint16
-    ) && matches!(
-        data.get_value_type(Fields::IpRemotePort as usize),
-        ValueType::FwpUint16
-    );
+    let process_id = data.get_process_id().unwrap_or(0);
+    let protocol = get_protocol_if_present(&data, Fields::IpProtocol as usize);
 
-    if let ValueType::FwpByteArray16Type = local_ip_address_type {
-        if matches!(remote_ip_address_type, ValueType::FwpByteArray16Type) && ports_present {
-            let key = Key {
-                protocol: get_protocol(&data, Fields::IpProtocol as usize),
-                local_address: get_ipv6_address(&data, Fields::IpLocalAddress as usize),
-                local_port: data.get_value_u16(Fields::IpLocalPort as usize),
-                remote_address: get_ipv6_address(&data, Fields::IpRemoteAddress as usize),
-                remote_port: data.get_value_u16(Fields::IpRemotePort as usize),
-            };
-
-            let conn = device.connection_cache.end_connection_v6(key);
-            if let Some(conn) = conn {
-                let info = protocol::info::connection_end_event_v6_info(
-                    data.get_process_id().unwrap_or(0),
-                    conn.get_direction() as u8,
-                    u8::from(get_protocol(&data, Fields::IpProtocol as usize)),
-                    conn.local_address.0,
-                    conn.remote_address.0,
-                    conn.local_port,
-                    conn.remote_port,
-                );
-                let _ = device.event_queue.push(info);
-            }
+    // UDP closure is socket-level and may omit its remote tuple. Resolve every
+    // peer through the endpoint handle before considering fixed fields.
+    if matches!(protocol, Some(IpProtocol::Udp)) {
+        let endpoint_handle = data.get_transport_endpoint_handle();
+        let endpoint_complete =
+            endpoint_handle.and_then(|handle| end_udp_endpoint(device, handle, process_id));
+        if matches!(endpoint_complete, Some(true)) {
+            return;
         }
+        // A second lifetime indication for an already-consumed handle must not
+        // fall back to the local port: a new socket may have reused that port.
+        if endpoint_handle.is_some() && endpoint_complete.is_none() {
+            return;
+        }
+
+        let Some(local_port) = get_u16_if_present(&data, Fields::IpLocalPort as usize) else {
+            return;
+        };
+        end_local_endpoint_v6(
+            device,
+            IpProtocol::Udp,
+            local_port,
+            get_ipv6_address_if_present(&data, Fields::IpLocalAddress as usize),
+            process_id,
+        );
+        return;
+    }
+
+    let Some(protocol) = protocol else {
+        if let Some(endpoint_handle) = data.get_transport_endpoint_handle() {
+            let _ = end_udp_endpoint(device, endpoint_handle, process_id);
+        }
+        return;
+    };
+
+    let (Some(local_address), Some(local_port), Some(remote_address), Some(remote_port)) = (
+        get_ipv6_address_if_present(&data, Fields::IpLocalAddress as usize),
+        get_u16_if_present(&data, Fields::IpLocalPort as usize),
+        get_ipv6_address_if_present(&data, Fields::IpRemoteAddress as usize),
+        get_u16_if_present(&data, Fields::IpRemotePort as usize),
+    ) else {
+        return;
+    };
+
+    let key = Key {
+        protocol,
+        local_address,
+        local_port,
+        remote_address,
+        remote_port,
+    };
+
+    if let Some(conn) = device.connection_cache.end_connection_v6(key) {
+        emit_connection_end_v6(device, conn, process_id);
     }
 }
 
@@ -663,9 +801,7 @@ pub fn ale_flow_established_monitor(data: CalloutData) {
     let Some(device) = crate::entry::get_device() else {
         return;
     };
-    let Some(process_id) = data.get_process_id().filter(|pid| *pid != 0) else {
-        return;
-    };
+    let process_id = data.get_process_id().filter(|pid| *pid != 0);
 
     let key = match data.layer {
         layer::Layer::AleFlowEstablishedV4 => {
@@ -725,9 +861,17 @@ pub fn ale_flow_established_monitor(data: CalloutData) {
         _ => return,
     };
 
+    if matches!(key.protocol, IpProtocol::Udp) {
+        if let Some(endpoint_handle) = data.get_transport_endpoint_handle() {
+            device.udp_endpoint_cache.associate(endpoint_handle, key);
+        }
+    }
+
     // update_process_id applies the PID precedence rules and safely does nothing
     // when no matching cached tuple exists.
-    device.connection_cache.update_process_id(&key, process_id);
+    if let Some(process_id) = process_id {
+        device.connection_cache.update_process_id(&key, process_id);
+    }
 }
 
 pub fn ale_resource_monitor(data: CalloutData) {
@@ -754,16 +898,7 @@ pub fn ale_resource_monitor(data: CalloutData) {
                     process_id,
                 );
                 for conn in conns {
-                    let info = protocol::info::connection_end_event_v4_info(
-                        process_id,
-                        conn.get_direction() as u8,
-                        data.get_value_u8(Fields::IpProtocol as usize),
-                        conn.local_address.0,
-                        conn.remote_address.0,
-                        conn.local_port,
-                        conn.remote_port,
-                    );
-                    let _ = device.event_queue.push(info);
+                    emit_connection_end_v4(device, conn, process_id);
                 }
             }
         }
@@ -785,21 +920,29 @@ pub fn ale_resource_monitor(data: CalloutData) {
                     process_id,
                 );
                 for conn in conns {
-                    let info = protocol::info::connection_end_event_v6_info(
-                        process_id,
-                        conn.get_direction() as u8,
-                        data.get_value_u8(Fields::IpProtocol as usize),
-                        conn.local_address.0,
-                        conn.remote_address.0,
-                        conn.local_port,
-                        conn.remote_port,
-                    );
-                    let _ = device.event_queue.push(info);
+                    emit_connection_end_v6(device, conn, process_id);
                 }
             }
         }
         layer::Layer::AleResourceReleaseV4 => {
             type Fields = layer::FieldsAleResourceReleaseV4;
+            let process_id = data.get_process_id().unwrap_or(0);
+            if matches!(
+                get_protocol(&data, Fields::IpProtocol as usize),
+                IpProtocol::Udp
+            ) {
+                let endpoint_handle = data.get_transport_endpoint_handle();
+                let endpoint_complete =
+                    endpoint_handle.and_then(|handle| end_udp_endpoint(device, handle, process_id));
+                if matches!(endpoint_complete, Some(true)) {
+                    return;
+                }
+                if endpoint_handle.is_some() && endpoint_complete.is_none() {
+                    // Endpoint closure may already have consumed this handle. Do not
+                    // sweep a local port that a replacement socket can now own.
+                    return;
+                }
+            }
             if let Some(conns) = device.connection_cache.end_all_on_endpoint_v4(
                 (
                     get_protocol(&data, Fields::IpProtocol as usize),
@@ -816,21 +959,29 @@ pub fn ale_resource_monitor(data: CalloutData) {
                     process_id,
                 );
                 for conn in conns {
-                    let info = protocol::info::connection_end_event_v4_info(
-                        process_id,
-                        conn.get_direction() as u8,
-                        data.get_value_u8(Fields::IpProtocol as usize),
-                        conn.local_address.0,
-                        conn.remote_address.0,
-                        conn.local_port,
-                        conn.remote_port,
-                    );
-                    let _ = device.event_queue.push(info);
+                    emit_connection_end_v4(device, conn, process_id);
                 }
             }
         }
         layer::Layer::AleResourceReleaseV6 => {
             type Fields = layer::FieldsAleResourceReleaseV6;
+            let process_id = data.get_process_id().unwrap_or(0);
+            if matches!(
+                get_protocol(&data, Fields::IpProtocol as usize),
+                IpProtocol::Udp
+            ) {
+                let endpoint_handle = data.get_transport_endpoint_handle();
+                let endpoint_complete =
+                    endpoint_handle.and_then(|handle| end_udp_endpoint(device, handle, process_id));
+                if matches!(endpoint_complete, Some(true)) {
+                    return;
+                }
+                if endpoint_handle.is_some() && endpoint_complete.is_none() {
+                    // Endpoint closure may already have consumed this handle. Do not
+                    // sweep a local port that a replacement socket can now own.
+                    return;
+                }
+            }
             if let Some(conns) = device.connection_cache.end_all_on_endpoint_v6(
                 (
                     get_protocol(&data, Fields::IpProtocol as usize),
@@ -847,16 +998,7 @@ pub fn ale_resource_monitor(data: CalloutData) {
                     process_id,
                 );
                 for conn in conns {
-                    let info = protocol::info::connection_end_event_v6_info(
-                        process_id,
-                        conn.get_direction() as u8,
-                        data.get_value_u8(Fields::IpProtocol as usize),
-                        conn.local_address.0,
-                        conn.remote_address.0,
-                        conn.local_port,
-                        conn.remote_port,
-                    );
-                    let _ = device.event_queue.push(info);
+                    emit_connection_end_v6(device, conn, process_id);
                 }
             }
         }

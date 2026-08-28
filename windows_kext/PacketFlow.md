@@ -49,6 +49,8 @@ If another indication arrives while the cache entry is still `Undecided`, it is 
 
 The inspection callouts at `ALE_FLOW_ESTABLISHED_V4/V6` refresh the process ID of an existing TCP or UDP cache entry. TCP reaches this layer after its three-way handshake; UDP reaches it immediately after `ALE_AUTH_CONNECT` or `ALE_AUTH_RECV_ACCEPT` authorizes the first packet for a remote tuple. Required fixed fields are type-checked before the five-tuple is read, because the filters also see non-TCP/UDP protocols and generic flows that cannot be matched safely to an exact cache key.
 
+For UDP, each authorized remote tuple is also associated with WFP's transport endpoint handle. Windows emits `ALE_ENDPOINT_CLOSURE` once for the UDP socket, not once per remote peer, so closure ends all tuples recorded for that handle. The datagram layer repeats the association as a fallback when an authorization path does not expose the handle.
+
 The cache's PID precedence rules ignore PID 0, prevent System (PID 4) from replacing a concrete application, and allow a concrete application PID to replace less reliable attribution. This repairs packet-layer fallback entries and refreshes the UDP owner without changing the cached verdict.
 
 `ALE_FLOW_ESTABLISHED` is not emitted again for successful reauthorization, so this monitor cannot attribute a flow that was already active when the driver loaded.
