@@ -15,6 +15,20 @@ pub static PM_DNS_PORT:       u16 = 53;
 pub static PM_SPN_PORT:       u16 = 717;
 pub static PM_SPLIT_TUN_PORT: u16 = 719;
 
+#[inline]
+fn get_system_timestamp_ms() -> u64 {
+    #[cfg(not(test))]
+    {
+        wdk::utils::get_system_timestamp_ms()
+    }
+
+    #[cfg(test)]
+    {
+        // Kernel time is unavailable to the user-mode unit-test executable.
+        0
+    }
+}
+
 /// Returns true if `remote_port` is a port that `redirect_equals` can match on.
 ///
 /// Every arm of `redirect_equals` rejects the key unless its remote port equals
@@ -243,7 +257,7 @@ impl ConnectionV4 {
             return Err("wrong ip address version".to_string());
         };
 
-        let timestamp = wdk::utils::get_system_timestamp_ms();
+        let timestamp = get_system_timestamp_ms();
 
         Ok(Self {
             protocol: key.protocol,
@@ -403,7 +417,7 @@ impl ConnectionV6 {
         let IpAddress::Ipv6(remote_address) = key.remote_address else {
             return Err("wrong ip address version".to_string());
         };
-        let timestamp = wdk::utils::get_system_timestamp_ms();
+        let timestamp = get_system_timestamp_ms();
 
         Ok(Self {
             protocol: key.protocol,

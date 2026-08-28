@@ -94,6 +94,8 @@ impl ConnectionCache {
         None
     }
 
+    /// Reads a live IPv4 connection. Ended entries are not current connection
+    /// state and are ignored by ALE and update paths.
     pub fn read_connection_v4<T>(
         &self,
         key: &Key,
@@ -103,6 +105,8 @@ impl ConnectionCache {
         self.connections_v4.read(key, process_connection)
     }
 
+    /// Reads a live IPv6 connection. Ended entries are not current connection
+    /// state and are ignored by ALE and update paths.
     pub fn read_connection_v6<T>(
         &self,
         key: &Key,
@@ -110,6 +114,30 @@ impl ConnectionCache {
     ) -> Option<T> {
         let _guard = self.lock_v6.read_lock();
         self.connections_v6.read(key, process_connection)
+    }
+
+    /// Reads current IPv4 state, falling back to an ended entry only for a late
+    /// packet that has no live connection match.
+    pub fn read_connection_v4_with_ended_fallback<T>(
+        &self,
+        key: &Key,
+        process_connection: fn(&ConnectionV4) -> Option<T>,
+    ) -> Option<T> {
+        let _guard = self.lock_v4.read_lock();
+        self.connections_v4
+            .read_with_ended_fallback(key, process_connection)
+    }
+
+    /// Reads current IPv6 state, falling back to an ended entry only for a late
+    /// packet that has no live connection match.
+    pub fn read_connection_v6_with_ended_fallback<T>(
+        &self,
+        key: &Key,
+        process_connection: fn(&ConnectionV6) -> Option<T>,
+    ) -> Option<T> {
+        let _guard = self.lock_v6.read_lock();
+        self.connections_v6
+            .read_with_ended_fallback(key, process_connection)
     }
 
     pub fn end_connection_v4(&mut self, key: Key) -> Option<ConnectionV4> {

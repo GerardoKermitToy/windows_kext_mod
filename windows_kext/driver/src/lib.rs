@@ -1,26 +1,44 @@
 #![cfg_attr(not(test), no_std)]
-#![no_main]
+#![cfg_attr(not(test), no_main)]
 #![allow(clippy::needless_return)]
 
 extern crate alloc;
 
+// Unit tests link as a user-mode executable, where the WFP/NDIS kernel imports
+// used by the other modules are unavailable. Keep the pure connection modules
+// in that graph and compile the full driver graph for every non-test build.
+#[cfg(not(test))]
 mod ale_callouts;
+#[cfg(not(test))]
 mod array_holder;
+#[cfg(not(test))]
 mod bandwidth;
+#[cfg(not(test))]
 mod callouts;
+#[cfg(not(test))]
 mod common;
 mod connection;
+#[cfg(not(test))]
 mod connection_cache;
 mod connection_map;
+#[cfg(not(test))]
 mod device;
+#[cfg(not(test))]
 mod entry;
+#[cfg(not(test))]
 mod icmp_echo_cache;
+#[cfg(not(test))]
 mod id_cache;
+#[cfg(not(test))]
 pub mod logger;
+#[cfg(not(test))]
 mod packet_callouts;
+#[cfg(not(test))]
 mod packet_util;
+#[cfg(not(test))]
 mod stream_callouts;
 
+#[cfg(not(test))]
 use wdk::allocator::WindowsAllocator;
 
 // For consistent behavior during development and production only release mode should be used.
@@ -32,9 +50,11 @@ compile_error!("Must be built in release mode to ensure consistent behavior and 
 use core::panic::PanicInfo;
 
 // Declaration of the global memory allocator
+#[cfg(not(test))]
 #[global_allocator]
 static HEAP: WindowsAllocator = WindowsAllocator {};
 
+#[cfg(not(test))]
 #[no_mangle]
 pub extern "system" fn _DllMainCRTStartup() {}
 

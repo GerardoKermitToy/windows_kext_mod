@@ -552,8 +552,11 @@ fn get_connection_info(
     key: &Key,
     ipv6: bool,
 ) -> Option<ConnectionInfo> {
+    // A packet already in flight can arrive after endpoint closure. Preserve the
+    // ended-entry fallback for this packet-level policy path, while ALE and
+    // cache-update callers use live-only lookups.
     if ipv6 {
-        let conn_info = connection_cache.read_connection_v6(
+        let conn_info = connection_cache.read_connection_v6_with_ended_fallback(
             key,
             |conn: &ConnectionV6| -> Option<ConnectionInfo> {
                 // Function is is behind spin lock. Just copy and return.
@@ -562,7 +565,7 @@ fn get_connection_info(
         );
         return conn_info;
     } else {
-        let conn_info = connection_cache.read_connection_v4(
+        let conn_info = connection_cache.read_connection_v4_with_ended_fallback(
             key,
             |conn: &ConnectionV4| -> Option<ConnectionInfo> {
                 // Function is is behind spin lock. Just copy and return.

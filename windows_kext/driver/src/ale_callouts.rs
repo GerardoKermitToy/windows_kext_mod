@@ -246,6 +246,8 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
     {
         // Only register once. A cached connection may already carry a verdict,
         // and overwriting it with Undecided would send it for a decision again.
+        // The cache read is live-only, so a retained ended entry cannot suppress
+        // registration of a tuple that has just been reused.
         let known = if ale_data.is_ipv6 {
             device
                 .connection_cache

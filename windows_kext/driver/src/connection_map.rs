@@ -79,8 +79,9 @@ impl Key {
 /// The sort key is deliberately *not* unique. Several connections can share a
 /// remote endpoint on the same local port: an ended entry still awaiting cleanup
 /// in front of its live replacement, or entries that differ only in local
-/// address. Lookups therefore resolve the whole run of equal keys and apply the
-/// same first-match rules as before, in insertion order.
+/// address. Lookups therefore resolve the whole run of equal keys. They retain
+/// insertion order among equally viable entries, but an ended entry can never
+/// shadow a live replacement.
 pub struct ConnectionMap<T: Connection>(BTreeMap<(IpProtocol, u16), Vec<T>>);
 
 /// Returns the range of entries whose remote endpoint equals `target`.
@@ -96,6 +97,47 @@ fn equal_range<T: Connection>(connections: &[T], target: (IpAddress, u16)) -> Ra
     start..end
 }
 
+/// Returns the first live match and remembers the first ended match as a
+/// possible late-packet fallback.
+fn live_and_ended_match<T, F>(connections: &[T], mut matches: F) -> (Option<&T>, Option<&T>)
+where
+    T: Connection,
+    F: FnMut(&T) -> bool,
+{
+    let mut ended_match = None;
+
+    for conn in connections {
+        if !matches(conn) {
+            continue;
+        }
+
+        if !conn.has_ended() {
+            return (Some(conn), ended_match);
+        }
+
+        if ended_match.is_none() {
+            ended_match = Some(conn);
+        }
+    }
+
+    (None, ended_match)
+}
+
+#[inline]
+fn get_system_timestamp_ms() -> u64 {
+    #[cfg(not(test))]
+    {
+        wdk::utils::get_system_timestamp_ms()
+    }
+
+    #[cfg(test)]
+    {
+        // Keep test timestamps beyond both cleanup thresholds without linking
+        // the kernel clock into the user-mode test executable.
+        Duration::from_secs(60 * 60).as_millis() as u64
+    }
+}
+
 impl<T: Connection + Clone> ConnectionMap<T> {
     pub fn new() -> Self {
         Self(BTreeMap::new())
@@ -107,8 +149,8 @@ impl<T: Connection + Clone> ConnectionMap<T> {
             // Insert *after* any entries with the same remote endpoint. That keeps
             // the vector in insertion order within a run of equal keys, which the
             // lookups rely on: `end` expects to reach a live connection that was
-            // added behind an ended one, and `read` returning the oldest match
-            // preserves the previous behaviour of scanning from the front.
+            // added behind an ended one, while `read_with_ended_fallback` keeps
+            // the oldest ended match for late packets.
             let index = connections.partition_point(|c| c.remote_key() <= conn.remote_key());
             connections.insert(index, conn);
         } else {
@@ -116,12 +158,18 @@ impl<T: Connection + Clone> ConnectionMap<T> {
         }
     }
 
+    /// Returns the live connection matching `key` for mutation.
+    ///
+    /// Ended entries are deliberately not a fallback here. A delayed verdict or
+    /// PID update belongs either to a live replacement or to no current
+    /// connection; mutating retained history would make a stale verdict visible
+    /// to late packets without changing the active flow.
     pub fn get_mut(&mut self, key: &Key) -> Option<&mut T> {
         if let Some(connections) = self.0.get_mut(&key.small()) {
             let range = equal_range(connections, (key.remote_address, key.remote_port));
             for conn in &mut connections[range] {
-                if conn.remote_equals(key) {
-                    conn.set_last_accessed_time(wdk::utils::get_system_timestamp_ms());
+                if conn.remote_equals(key) && !conn.has_ended() {
+                    conn.set_last_accessed_time(get_system_timestamp_ms());
                     return Some(conn);
                 }
             }
@@ -130,15 +178,43 @@ impl<T: Connection + Clone> ConnectionMap<T> {
         None
     }
 
+    /// Reads the best live connection matching `key`.
+    ///
+    /// Live exact matches take precedence over live redirect matches. Ended
+    /// entries are deliberately ignored so connection-establishment and update
+    /// paths cannot mistake retained history for a current flow.
     pub fn read<C>(&self, key: &Key, read_connection: fn(&T) -> Option<C>) -> Option<C> {
+        self.read_matching(key, read_connection, false)
+    }
+
+    /// Reads the best connection matching `key`, including retained history.
+    ///
+    /// Live exact and redirect matches still take precedence. An ended match is
+    /// returned only when no live candidate exists, preserving policy for a
+    /// packet already in flight after its connection closed.
+    pub fn read_with_ended_fallback<C>(
+        &self,
+        key: &Key,
+        read_connection: fn(&T) -> Option<C>,
+    ) -> Option<C> {
+        self.read_matching(key, read_connection, true)
+    }
+
+    fn read_matching<C>(
+        &self,
+        key: &Key,
+        read_connection: fn(&T) -> Option<C>,
+        use_ended_fallback: bool,
+    ) -> Option<C> {
         if let Some(connections) = self.0.get(&key.small()) {
             // Exact remote match first, over the run of equal keys only.
             let range = equal_range(connections, (key.remote_address, key.remote_port));
-            for conn in &connections[range] {
-                if conn.remote_equals(key) {
-                    conn.set_last_accessed_time(wdk::utils::get_system_timestamp_ms());
-                    return read_connection(conn);
-                }
+            let (live_exact, ended_exact) =
+                live_and_ended_match(&connections[range], |conn| conn.remote_equals(key));
+
+            if let Some(conn) = live_exact {
+                conn.set_last_accessed_time(get_system_timestamp_ms());
+                return read_connection(conn);
             }
 
             // A redirected connection cannot be found by the search above: it is
@@ -151,13 +227,23 @@ impl<T: Connection + Clone> ConnectionMap<T> {
             // ports, so for any other remote port the scan cannot match and is
             // skipped - which is what keeps an inbound flood, where every lookup
             // misses, off the O(n) path.
-            if is_redirect_port(key.remote_port) {
-                for conn in connections {
-                    if conn.redirect_equals(key) {
-                        conn.set_last_accessed_time(wdk::utils::get_system_timestamp_ms());
-                        return read_connection(conn);
-                    }
-                }
+            let (live_redirect, ended_redirect) = if is_redirect_port(key.remote_port) {
+                live_and_ended_match(connections, |conn| conn.redirect_equals(key))
+            } else {
+                (None, None)
+            };
+
+            // Any live redirect is newer connection state than retained ended
+            // history, even if that history happens to be an exact match for the
+            // redirect endpoint. Exact matching still wins when both are live.
+            let ended_match = if use_ended_fallback {
+                ended_exact.or(ended_redirect)
+            } else {
+                None
+            };
+            if let Some(conn) = live_redirect.or(ended_match) {
+                conn.set_last_accessed_time(get_system_timestamp_ms());
+                return read_connection(conn);
             }
         }
 
@@ -185,7 +271,7 @@ impl<T: Connection + Clone> ConnectionMap<T> {
             let range = equal_range(connections, (key.remote_address, key.remote_port));
             for conn in &mut connections[range] {
                 if conn.remote_equals(&key) && !conn.has_ended() {
-                    conn.end(wdk::utils::get_system_timestamp_ms());
+                    conn.end(get_system_timestamp_ms());
                     return Some(conn.clone());
                 }
             }
@@ -222,7 +308,7 @@ impl<T: Connection + Clone> ConnectionMap<T> {
                     .unwrap_or(true);
 
                 if !conn.has_ended() && address_matches && process_matches {
-                    conn.end(wdk::utils::get_system_timestamp_ms());
+                    conn.end(get_system_timestamp_ms());
                     vec.push(conn.clone());
                 }
             }
@@ -236,7 +322,7 @@ impl<T: Connection + Clone> ConnectionMap<T> {
     }
 
     pub fn clean_ended_connections(&mut self) {
-        let now = wdk::utils::get_system_timestamp_ms();
+        let now = get_system_timestamp_ms();
         const TEN_MINUETS: u64 = Duration::from_secs(60 * 10).as_millis() as u64;
         let before_ten_minutes = now - TEN_MINUETS;
         let before_one_minute = now - Duration::from_secs(60).as_millis() as u64;
@@ -268,5 +354,145 @@ impl<T: Connection + Clone> ConnectionMap<T> {
             count += conn.len();
         }
         return count;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ConnectionMap, Key};
+    use crate::connection::{Connection, ConnectionV4, Direction, Verdict, PM_DNS_PORT};
+    use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Address};
+
+    fn key(remote_address: [u8; 4], remote_port: u16) -> Key {
+        Key {
+            protocol: IpProtocol::Udp,
+            local_address: IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 1)),
+            local_port: 50_000,
+            remote_address: IpAddress::Ipv4(Ipv4Address::from_bytes(&remote_address)),
+            remote_port,
+        }
+    }
+
+    fn live(key: &Key, process_id: u64) -> ConnectionV4 {
+        ConnectionV4::from_key(key, process_id, Direction::Outbound).expect("IPv4 key")
+    }
+
+    fn ended(key: &Key, process_id: u64) -> ConnectionV4 {
+        let mut conn = live(key, process_id);
+        conn.end(1);
+        conn
+    }
+
+    fn redirected(mut conn: ConnectionV4) -> ConnectionV4 {
+        conn.verdict = Verdict::RedirectNameServer;
+        conn
+    }
+
+    fn read_process_id(conn: &ConnectionV4) -> Option<u64> {
+        Some(conn.process_id)
+    }
+
+    #[test]
+    fn reused_live_exact_entry_wins_and_survives_cleanup() {
+        let tuple = key([8, 8, 8, 8], 53);
+        let mut map = ConnectionMap::new();
+        map.add(ended(&tuple, 10));
+        map.add(live(&tuple, 20));
+
+        assert_eq!(map.read(&tuple, read_process_id), Some(20));
+        assert_eq!(
+            map.read_with_ended_fallback(&tuple, read_process_id),
+            Some(20)
+        );
+
+        let conn = map.get_mut(&tuple).expect("live entry");
+        assert_eq!(conn.process_id, 20);
+        conn.process_id = 21;
+
+        map.clean_ended_connections();
+
+        assert_eq!(map.get_count(), 1);
+        assert_eq!(map.read(&tuple, read_process_id), Some(21));
+    }
+
+    #[test]
+    fn ended_exact_entry_is_read_only_late_packet_fallback() {
+        let tuple = key([8, 8, 4, 4], 53);
+        let mut map = ConnectionMap::new();
+        map.add(ended(&tuple, 10));
+
+        assert_eq!(map.read(&tuple, read_process_id), None);
+        assert_eq!(
+            map.read_with_ended_fallback(&tuple, read_process_id),
+            Some(10)
+        );
+        assert!(map.get_mut(&tuple).is_none());
+    }
+
+    #[test]
+    fn reused_live_redirect_entry_wins() {
+        let original = key([8, 8, 8, 8], 53);
+        let redirect_target = key([127, 0, 0, 1], PM_DNS_PORT);
+        let mut map = ConnectionMap::new();
+        map.add(redirected(ended(&original, 10)));
+        map.add(redirected(live(&original, 20)));
+
+        assert_eq!(map.read(&redirect_target, read_process_id), Some(20));
+        assert_eq!(
+            map.read_with_ended_fallback(&redirect_target, read_process_id),
+            Some(20)
+        );
+    }
+
+    #[test]
+    fn live_redirect_wins_over_ended_exact_fallback() {
+        let redirect_target = key([127, 0, 0, 1], PM_DNS_PORT);
+        let original = key([8, 8, 8, 8], 53);
+        let mut map = ConnectionMap::new();
+        map.add(ended(&redirect_target, 10));
+        map.add(redirected(live(&original, 20)));
+
+        assert_eq!(
+            map.read_with_ended_fallback(&redirect_target, read_process_id),
+            Some(20)
+        );
+    }
+
+    #[test]
+    fn live_exact_wins_over_live_redirect() {
+        let redirect_target = key([127, 0, 0, 1], PM_DNS_PORT);
+        let original = key([8, 8, 8, 8], 53);
+        let mut map = ConnectionMap::new();
+        map.add(redirected(live(&original, 20)));
+        map.add(live(&redirect_target, 10));
+
+        assert_eq!(map.read(&redirect_target, read_process_id), Some(10));
+    }
+
+    #[test]
+    fn end_skips_ended_entry_and_ends_live_replacement() {
+        let tuple = key([1, 1, 1, 1], 443);
+        let mut map = ConnectionMap::new();
+        map.add(ended(&tuple, 10));
+        map.add(live(&tuple, 20));
+
+        let ended = map.end(tuple).expect("live entry");
+
+        assert_eq!(ended.process_id, 20);
+        assert!(map.get_mut(&tuple).is_none());
+    }
+
+    #[test]
+    fn ended_redirect_is_late_packet_fallback() {
+        let original = key([8, 8, 8, 8], 53);
+        let redirect_target = key([127, 0, 0, 1], PM_DNS_PORT);
+        let mut map = ConnectionMap::new();
+        map.add(redirected(ended(&original, 10)));
+
+        assert_eq!(map.read(&redirect_target, read_process_id), None);
+        assert_eq!(
+            map.read_with_ended_fallback(&redirect_target, read_process_id),
+            Some(10)
+        );
     }
 }
