@@ -18,7 +18,7 @@ use wdk::{
 use crate::{
     array_holder::ArrayHolder, bandwidth::Bandwidth, callouts, connection_cache::ConnectionCache,
     connection_map::Key, dbg, err, icmp_echo_cache::IcmpEchoCache, id_cache::IdCache, logger,
-    packet_util::Redirect, udp_endpoint_cache::UdpEndpointCache,
+    packet_util::Redirect, udp_endpoint_cache::UdpEndpointCache, udp_flow_cache::UdpFlowCache,
 };
 
 pub enum Packet {
@@ -36,6 +36,8 @@ pub struct Device {
     /// UDP remote tuples grouped by WFP transport endpoint handle. A UDP socket
     /// receives one endpoint-closure indication regardless of its remote peers.
     pub(crate) udp_endpoint_cache: UdpEndpointCache,
+    /// Contexts currently owned by WFP for per-peer UDP ALE flows.
+    pub(crate) udp_flow_cache: UdpFlowCache,
     /// (remote address, echo identifier) -> PID that sent the request.
     /// An inbound echo reply has no process of its own to read, so it is matched
     /// against the outbound request that caused it.
@@ -68,6 +70,7 @@ impl Device {
             packet_cache: IdCache::new(),
             connection_cache: ConnectionCache::new(),
             udp_endpoint_cache: UdpEndpointCache::new(),
+            udp_flow_cache: UdpFlowCache::new(),
             icmp_echo_cache: IcmpEchoCache::new(),
             injector: Injector::new(),
             network_allocator: NetworkAllocator::new(),
@@ -336,7 +339,16 @@ impl Device {
             }
             CommandType::CleanEndedConnections => {
                 wdk::dbg!("CleanEndedConnections command");
-                self.connection_cache.clean_ended_connections();
+                let (inactive_v4, inactive_v6) = self.connection_cache.clean_ended_connections();
+                // Native WFP flow contexts own tracked UDP connections. These are
+                // only watchdog expirations for UDP entries that never acquired flow
+                // tracking, and must still be visible to user space.
+                for conn in inactive_v4 {
+                    crate::ale_callouts::emit_connection_end_v4(self, conn, 0);
+                }
+                for conn in inactive_v6 {
+                    crate::ale_callouts::emit_connection_end_v6(self, conn, 0);
+                }
                 // Same intent for the ICMP echo table: an unanswered request is
                 // state that is no longer needed. Expired entries only, so that
                 // requests still in flight keep their process attribution.
@@ -344,6 +356,50 @@ impl Device {
                 // Doing it here also keeps the sweep off the packet path - the
                 // only other one runs inside a callout at DISPATCH_LEVEL.
                 self.icmp_echo_cache.clean_expired_entries();
+            }
+        }
+    }
+
+    /// Removes every context still owned by WFP before callout unregistration.
+    ///
+    /// `FwpsCalloutUnregisterById0` returns STATUS_DEVICE_BUSY while any context
+    /// remains associated. Keep the global Device pointer valid until the resulting
+    /// flowDeleteFn callbacks have drained this cache.
+    pub fn prepare_unload(&mut self) {
+        self.udp_flow_cache.start_shutdown();
+        while !self.udp_flow_cache.is_drained() {
+            for registration in self.udp_flow_cache.pending_removals() {
+                match wdk::filter_engine::flow::remove_context(
+                    registration.flow_id,
+                    registration.layer_id,
+                    registration.callout_id,
+                ) {
+                    Ok(wdk::filter_engine::flow::RemoveContextResult::Removed)
+                    | Ok(wdk::filter_engine::flow::RemoveContextResult::Pending) => {}
+                    Ok(wdk::filter_engine::flow::RemoveContextResult::AlreadyGone) => {
+                        // WFP has no association left and therefore cannot call
+                        // flowDeleteFn; reclaim the driver-owned allocation here.
+                        crate::ale_callouts::reclaim_udp_flow_context(
+                            self,
+                            registration.flow_context,
+                        );
+                    }
+                    Err(err) => {
+                        self.udp_flow_cache.retry_removal(registration.flow_context);
+                        crate::err!(
+                            "failed to remove UDP flow context {}: {}",
+                            registration.flow_id,
+                            err
+                        );
+                    }
+                }
+            }
+
+            if !self.udp_flow_cache.is_drained() {
+                // STATUS_PENDING completes through flowDeleteFn after any active
+                // classification returns. Each association is requested once unless
+                // the WFP removal call itself failed.
+                wdk::utils::sleep_ms(1);
             }
         }
     }

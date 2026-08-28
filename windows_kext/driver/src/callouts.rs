@@ -79,7 +79,8 @@ pub fn get_callout_vec() -> Vec<Callout> {
             consts::FWP_ACTION_CALLOUT_INSPECTION,
             FilterType::NonResettable,
             ale_callouts::ale_flow_established_monitor,
-        ),
+        )
+        .with_flow_delete_fn(ale_callouts::udp_flow_delete),
         Callout::new(
             "Portmaster flow established IPv6",
             "Portmaster uses this layer to attribute IPv6 TCP and UDP flows",
@@ -88,7 +89,8 @@ pub fn get_callout_vec() -> Vec<Callout> {
             consts::FWP_ACTION_CALLOUT_INSPECTION,
             FilterType::NonResettable,
             ale_callouts::ale_flow_established_monitor,
-        ),
+        )
+        .with_flow_delete_fn(ale_callouts::udp_flow_delete),
         // -----------------------------------------
         // ALE resource assignment and release.
         // Callout::new(

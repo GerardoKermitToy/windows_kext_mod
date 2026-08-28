@@ -279,6 +279,27 @@ impl<T: Connection + Clone> ConnectionMap<T> {
         return None;
     }
 
+    /// Ends the live connection matching both its tuple and cache-instance ID.
+    ///
+    /// WFP flow deletion can race with tuple reuse. Binding the callback to the
+    /// instance that existed when its context was associated prevents an old flow
+    /// from ending a newer connection with the same five-tuple.
+    pub fn end_instance(&mut self, key: Key, instance_id: u64) -> Option<T> {
+        if let Some(connections) = self.0.get_mut(&key.small()) {
+            let range = equal_range(connections, (key.remote_address, key.remote_port));
+            for conn in &mut connections[range] {
+                if conn.remote_equals(&key)
+                    && conn.get_instance_id() == instance_id
+                    && !conn.has_ended()
+                {
+                    conn.end(get_system_timestamp_ms());
+                    return Some(conn.clone());
+                }
+            }
+        }
+        None
+    }
+
     /// Ends live connections for one local endpoint and returns copies of them.
     ///
     /// The map is grouped by protocol and local port, but that grouping is not a
@@ -321,31 +342,39 @@ impl<T: Connection + Clone> ConnectionMap<T> {
         self.0.clear();
     }
 
-    pub fn clean_ended_connections(&mut self) {
+    /// Removes ended history and returns untracked UDP entries that have been idle
+    /// for ten minutes.
+    ///
+    /// A UDP connection covered by WFP flow deletion remains until that native
+    /// lifetime signal arrives. The long idle timeout is only a watchdog for UDP
+    /// entries whose flow never established or whose context association failed.
+    pub fn clean_ended_connections(&mut self) -> Vec<T> {
         let now = get_system_timestamp_ms();
-        const TEN_MINUETS: u64 = Duration::from_secs(60 * 10).as_millis() as u64;
-        let before_ten_minutes = now - TEN_MINUETS;
-        let before_one_minute = now - Duration::from_secs(60).as_millis() as u64;
+        const TEN_MINUTES: u64 = Duration::from_secs(60 * 10).as_millis() as u64;
+        let before_ten_minutes = now.saturating_sub(TEN_MINUTES);
+        let before_one_minute = now.saturating_sub(Duration::from_secs(60).as_millis() as u64);
+        let mut inactive = Vec::new();
 
         for (_, connections) in self.0.iter_mut() {
             // `retain` preserves the relative order of the entries it keeps, so
             // the sort order the lookups depend on survives the sweep.
             connections.retain(|c| {
-                if c.has_ended() && c.get_end_time() < before_one_minute {
-                    // Ended more than 1 minute ago
+                if c.has_ended() {
+                    return c.get_end_time() >= before_one_minute;
+                }
+
+                if !c.has_lifecycle_tracking() && c.get_last_accessed_time() < before_ten_minutes {
+                    if c.get_protocol() == IpProtocol::Udp {
+                        inactive.push(c.clone());
+                    }
                     return false;
                 }
 
-                if c.get_last_accessed_time() < before_ten_minutes {
-                    // Last active more than 10 minutes ago
-                    return false;
-                }
-
-                // Keep
-                return true;
+                true
             });
         }
         self.0.retain(|_, v| !v.is_empty());
+        inactive
     }
 
     pub fn get_count(&self) -> usize {
@@ -480,6 +509,67 @@ mod tests {
 
         assert_eq!(ended.process_id, 20);
         assert!(map.get_mut(&tuple).is_none());
+    }
+
+    #[test]
+    fn cleanup_keeps_native_lifecycle_tracked_entry() {
+        let tuple = key([203, 0, 113, 1], 443);
+        let mut conn = live(&tuple, 10);
+        conn.mark_lifecycle_tracked();
+        let mut map = ConnectionMap::new();
+        map.add(conn);
+
+        assert!(map.clean_ended_connections().is_empty());
+        assert_eq!(map.get_count(), 1);
+        assert_eq!(map.read(&tuple, read_process_id), Some(10));
+    }
+
+    #[test]
+    fn cleanup_reports_untracked_inactive_entry_as_watchdog() {
+        let tuple = key([203, 0, 113, 3], 443);
+        let mut map = ConnectionMap::new();
+        map.add(live(&tuple, 10));
+
+        let inactive = map.clean_ended_connections();
+
+        assert_eq!(inactive.len(), 1);
+        assert_eq!(inactive[0].process_id, 10);
+        assert_eq!(map.get_count(), 0);
+    }
+
+    #[test]
+    fn cleanup_silently_discards_untracked_tcp_as_before() {
+        let mut tuple = key([203, 0, 113, 4], 443);
+        tuple.protocol = IpProtocol::Tcp;
+        let mut map = ConnectionMap::new();
+        map.add(live(&tuple, 10));
+
+        assert!(map.clean_ended_connections().is_empty());
+        assert_eq!(map.get_count(), 0);
+    }
+
+    #[test]
+    fn cleanup_removes_ended_entry_after_grace_period() {
+        let tuple = key([203, 0, 113, 2], 443);
+        let mut map = ConnectionMap::new();
+        map.add(ended(&tuple, 10));
+
+        assert!(map.clean_ended_connections().is_empty());
+        assert_eq!(map.get_count(), 0);
+    }
+
+    #[test]
+    fn stale_flow_instance_cannot_end_reused_tuple() {
+        let tuple = key([198, 51, 100, 1], 443);
+        let old = live(&tuple, 10);
+        let old_instance_id = old.get_instance_id();
+        let mut map = ConnectionMap::new();
+        map.add(old);
+        map.clear();
+        map.add(live(&tuple, 20));
+
+        assert!(map.end_instance(tuple, old_instance_id).is_none());
+        assert_eq!(map.read(&tuple, read_process_id), Some(20));
     }
 
     #[test]

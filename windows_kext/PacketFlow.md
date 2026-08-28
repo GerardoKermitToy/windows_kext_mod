@@ -49,7 +49,7 @@ If another indication arrives while the cache entry is still `Undecided`, it is 
 
 The inspection callouts at `ALE_FLOW_ESTABLISHED_V4/V6` refresh the process ID of an existing TCP or UDP cache entry. TCP reaches this layer after its three-way handshake; UDP reaches it immediately after `ALE_AUTH_CONNECT` or `ALE_AUTH_RECV_ACCEPT` authorizes the first packet for a remote tuple. Required fixed fields are type-checked before the five-tuple is read, because the filters also see non-TCP/UDP protocols and generic flows that cannot be matched safely to an exact cache key.
 
-For UDP, each authorized remote tuple is also associated with WFP's transport endpoint handle. Windows emits `ALE_ENDPOINT_CLOSURE` once for the UDP socket, not once per remote peer, so closure ends all tuples recorded for that handle. The datagram layer repeats the association as a fallback when an authorization path does not expose the handle.
+For UDP, the driver associates a context containing the remote tuple with the WFP flow via `FwpsFlowAssociateContext`. WFP invokes `flowDeleteFn` when that peer flow expires — unicast UDP defaults to a 60-second idle lifetime — and the callback emits the connection-end event. Every authorized tuple is also associated with WFP's transport endpoint handle. Windows emits `ALE_ENDPOINT_CLOSURE` once for the UDP socket, not once per remote peer, so socket closure ends any tuples that still have a live cache entry. The datagram layer repeats the endpoint association as a fallback when an authorization path does not expose the handle.
 
 The cache's PID precedence rules ignore PID 0, prevent System (PID 4) from replacing a concrete application, and allow a concrete application PID to replace less reliable attribution. This repairs packet-layer fallback entries and refreshes the UDP owner without changing the cached verdict.
 
@@ -81,4 +81,4 @@ Individual IP fragments are permitted until WFP presents the reassembled datagra
 
 ## Connection cache
 
-The cache stores TCP and UDP keys, direction, process ID, verdict, redirect state, and activity timestamps. Endpoint-closure and resource-release callouts mark connections as ended. Cleanup removes ended entries after one minute and inactive entries after ten minutes.
+The cache stores TCP and UDP keys, direction, process ID, verdict, redirect state, and activity timestamps. Native WFP flow deletion, endpoint closure, and resource release mark tracked connections as ended and emit their lifecycle event. Cleanup removes ended entries after their one-minute late-packet grace period. A ten-minute watchdog emits END only for UDP entries that never acquired native WFP flow tracking; other untracked stale cache state is discarded as before.

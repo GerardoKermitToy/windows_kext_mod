@@ -8,9 +8,10 @@ use windows_sys::Win32::{
         IpHelper::IP_ADDRESS_PREFIX,
         WindowsFilteringPlatform::{
             FWPS_METADATA_FIELD_COMPARTMENT_ID, FWPS_METADATA_FIELD_COMPLETION_HANDLE,
-            FWPS_METADATA_FIELD_FRAGMENT_DATA, FWPS_METADATA_FIELD_IP_HEADER_SIZE,
-            FWPS_METADATA_FIELD_PROCESS_ID, FWPS_METADATA_FIELD_PROCESS_PATH,
-            FWPS_METADATA_FIELD_REMOTE_SCOPE_ID, FWPS_METADATA_FIELD_TRANSPORT_CONTROL_DATA,
+            FWPS_METADATA_FIELD_FLOW_HANDLE, FWPS_METADATA_FIELD_FRAGMENT_DATA,
+            FWPS_METADATA_FIELD_IP_HEADER_SIZE, FWPS_METADATA_FIELD_PROCESS_ID,
+            FWPS_METADATA_FIELD_PROCESS_PATH, FWPS_METADATA_FIELD_REMOTE_SCOPE_ID,
+            FWPS_METADATA_FIELD_TRANSPORT_CONTROL_DATA,
             FWPS_METADATA_FIELD_TRANSPORT_ENDPOINT_HANDLE,
             FWPS_METADATA_FIELD_TRANSPORT_HEADER_SIZE, FWP_BYTE_BLOB, FWP_DIRECTION,
         },
@@ -90,6 +91,14 @@ pub(crate) struct FwpsIncomingMetadataValues {
 impl FwpsIncomingMetadataValues {
     pub(crate) fn has_field(&self, field: u32) -> bool {
         self.current_metadata_values & field > 0
+    }
+
+    pub(crate) fn get_flow_handle(&self) -> Option<u64> {
+        if self.has_field(FWPS_METADATA_FIELD_FLOW_HANDLE) {
+            return Some(self.flow_handle);
+        }
+
+        None
     }
 
     pub(crate) fn get_process_id(&self) -> Option<u64> {

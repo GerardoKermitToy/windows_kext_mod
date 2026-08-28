@@ -88,8 +88,6 @@ unsafe extern "C" fn generic_notify(
     return STATUS_SUCCESS;
 }
 
-unsafe extern "C" fn generic_delete_notify(_layer_id: u16, _callout_id: u32, _flow_context: u64) {}
-
 pub(crate) fn register_callout(
     device_object: *mut DEVICE_OBJECT,
     filter_engine_handle: HANDLE,
@@ -98,13 +96,14 @@ pub(crate) fn register_callout(
     guid: u128,
     layer: Layer,
     callout_fn: FwpsCalloutClassifyFn,
+    flow_delete_fn: Option<crate::ffi::FwpsCalloutFlowDeleteNotifyFn>,
 ) -> Result<u32, String> {
     let s_callout = FWPS_CALLOUT3 {
         calloutKey: GUID::from_u128(guid),
         flags: 0,
         classifyFn: Some(callout_fn),
         notifyFn: Some(generic_notify),
-        flowDeleteFn: Some(generic_delete_notify),
+        flowDeleteFn: flow_delete_fn,
     };
 
     unsafe {

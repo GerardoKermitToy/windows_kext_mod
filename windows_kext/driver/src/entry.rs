@@ -72,16 +72,18 @@ pub extern "system" fn driver_entry(
 
 // driver_unload function is called when service delete is called from user-space.
 unsafe extern "system" fn driver_unload(_object: *const DRIVER_OBJECT) {
-    info!("Unloading complete");
-    // Atomically null the pointer before freeing. Any core that performs an Acquire load
-    // *after* this swap will see null and bail out safely. Any core that already loaded a
-    // non-null pointer before this swap is protected by the OS-level serialisation:
-    //   - WFP callouts: FilterEngine::drop() (field declared first in Device) calls the WFP
-    //     unregister APIs which block until every in-flight classify callback has returned,
-    //     so no callout thread holds a live reference by the time the memory is freed.
-    //   - IRP dispatch (read/write/ioctl): the I/O Manager guarantees no dispatch routine
-    //     is executing when driver_unload is called.
-    // The swap is executed exactly once, on the unload path.
+    info!("Unloading driver");
+    // Flow-associated UDP contexts keep their callout registered. Remove them while
+    // DEVICE is still published so flowDeleteFn can finish context cleanup.
+    if let Some(device) = get_device() {
+        device.prepare_unload();
+    }
+
+    // Null the global pointer only after all flow contexts have drained. Any core
+    // that loads it afterwards bails out. A classify callback that loaded it before
+    // this swap is covered by FwpsCalloutUnregisterById0 in FilterEngine::drop,
+    // which waits for in-flight callouts before the Device allocation is freed.
+    // The I/O Manager likewise guarantees no dispatch routine is executing here.
     let ptr = DEVICE.swap(core::ptr::null_mut(), Ordering::AcqRel);
     if !ptr.is_null() {
         unsafe { drop(Box::from_raw(ptr)); }

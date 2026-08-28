@@ -77,6 +77,37 @@ impl ConnectionCache {
         false
     }
 
+    /// Returns the instance ID of the current live entry.
+    pub fn get_connection_instance_id(&self, key: &Key) -> Option<u64> {
+        if key.is_ipv6() {
+            self.read_connection_v6(key, |conn| Some(conn.get_instance_id()))
+        } else {
+            self.read_connection_v4(key, |conn| Some(conn.get_instance_id()))
+        }
+    }
+
+    /// Marks one specific live entry as covered by a native WFP lifetime callback.
+    pub fn mark_lifecycle_tracked(&mut self, key: &Key, instance_id: u64) -> bool {
+        if key.is_ipv6() {
+            let _guard = self.lock_v6.write_lock();
+            if let Some(conn) = self.connections_v6.get_mut(key) {
+                if conn.get_instance_id() == instance_id {
+                    conn.mark_lifecycle_tracked();
+                    return true;
+                }
+            }
+        } else {
+            let _guard = self.lock_v4.write_lock();
+            if let Some(conn) = self.connections_v4.get_mut(key) {
+                if conn.get_instance_id() == instance_id {
+                    conn.mark_lifecycle_tracked();
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     pub fn update_connection(&mut self, key: Key, verdict: Verdict) -> Option<RedirectInfo> {
         if key.is_ipv6() {
             let _guard = self.lock_v6.write_lock();
@@ -140,6 +171,24 @@ impl ConnectionCache {
             .read_with_ended_fallback(key, process_connection)
     }
 
+    pub fn end_connection_instance_v4(
+        &mut self,
+        key: Key,
+        instance_id: u64,
+    ) -> Option<ConnectionV4> {
+        let _guard = self.lock_v4.write_lock();
+        self.connections_v4.end_instance(key, instance_id)
+    }
+
+    pub fn end_connection_instance_v6(
+        &mut self,
+        key: Key,
+        instance_id: u64,
+    ) -> Option<ConnectionV6> {
+        let _guard = self.lock_v6.write_lock();
+        self.connections_v6.end_instance(key, instance_id)
+    }
+
     pub fn end_connection_v4(&mut self, key: Key) -> Option<ConnectionV4> {
         let _guard = self.lock_v4.write_lock();
         self.connections_v4.end(key)
@@ -172,15 +221,18 @@ impl ConnectionCache {
             .end_all_on_endpoint(key, local_address, process_id)
     }
 
-    pub fn clean_ended_connections(&mut self) {
-        {
+    /// Cleans retained history and returns untracked UDP entries expired by the
+    /// fallback watchdog. The caller must publish END for each returned entry.
+    pub fn clean_ended_connections(&mut self) -> (Vec<ConnectionV4>, Vec<ConnectionV6>) {
+        let inactive_v4 = {
             let _guard = self.lock_v4.write_lock();
-            self.connections_v4.clean_ended_connections();
-        }
-        {
+            self.connections_v4.clean_ended_connections()
+        };
+        let inactive_v6 = {
             let _guard = self.lock_v6.write_lock();
-            self.connections_v6.clean_ended_connections();
-        }
+            self.connections_v6.clean_ended_connections()
+        };
+        (inactive_v4, inactive_v6)
     }
 
     pub fn clear(&mut self) {

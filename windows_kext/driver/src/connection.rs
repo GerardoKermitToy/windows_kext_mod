@@ -15,6 +15,17 @@ pub static PM_DNS_PORT:       u16 = 53;
 pub static PM_SPN_PORT:       u16 = 717;
 pub static PM_SPLIT_TUN_PORT: u16 = 719;
 
+static NEXT_CONNECTION_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_connection_instance_id() -> u64 {
+    loop {
+        let id = NEXT_CONNECTION_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);
+        if id != 0 {
+            return id;
+        }
+    }
+}
+
 #[inline]
 fn get_system_timestamp_ms() -> u64 {
     #[cfg(not(test))]
@@ -196,7 +207,9 @@ pub trait Connection {
     fn is_ipv6(&self) -> bool;
     /// Returns the direction of the connection.
     fn get_direction(&self) -> Direction;
-    // Returns the process id of the connection.
+    /// Returns the unique cache-instance ID of the connection.
+    fn get_instance_id(&self) -> u64;
+    /// Returns the process ID of the connection.
     fn get_process_id(&self) -> u64;
     /// Ends the connection.
     fn end(&mut self, timestamp: u64);
@@ -208,6 +221,10 @@ pub trait Connection {
     fn get_end_time(&self) -> u64;
     /// Returns the timestamp when the connection was last accessed.
     fn get_last_accessed_time(&self) -> u64;
+    /// Returns whether WFP has a native flow-deletion callback for this connection.
+    fn has_lifecycle_tracking(&self) -> bool;
+    /// Marks the connection as covered by a WFP flow-deletion callback.
+    fn mark_lifecycle_tracked(&mut self);
     /// Sets the timestamp when the connection was last accessed.
     fn set_last_accessed_time(&self, timestamp: u64);
 }
@@ -220,7 +237,9 @@ pub struct ConnectionV4 {
     pub(crate) remote_port: u16,
     pub(crate) verdict: Verdict,
     pub(crate) process_id: u64,
+    pub(crate) instance_id: u64,
     pub(crate) last_accessed_timestamp: AtomicU64,
+    pub(crate) lifecycle_tracked: bool,
     pub(crate) extra: Box<ConnectionExtra>,
 }
 
@@ -232,7 +251,9 @@ pub struct ConnectionV6 {
     pub(crate) remote_port: u16,
     pub(crate) verdict: Verdict,
     pub(crate) process_id: u64,
+    pub(crate) instance_id: u64,
     pub(crate) last_accessed_timestamp: AtomicU64,
+    pub(crate) lifecycle_tracked: bool,
     pub(crate) extra: Box<ConnectionExtra>,
 }
 
@@ -267,7 +288,9 @@ impl ConnectionV4 {
             remote_port: key.remote_port,
             verdict: Verdict::Undecided,
             process_id,
+            instance_id: next_connection_instance_id(),
             last_accessed_timestamp: AtomicU64::new(timestamp),
+            lifecycle_tracked: false,
             extra: Box::new(ConnectionExtra {
                 direction,
                 end_timestamp: 0,
@@ -363,6 +386,10 @@ impl Connection for ConnectionV4 {
         false
     }
 
+    fn get_instance_id(&self) -> u64 {
+        self.instance_id
+    }
+
     fn get_process_id(&self) -> u64 {
         self.process_id
     }
@@ -383,6 +410,14 @@ impl Connection for ConnectionV4 {
         self.last_accessed_timestamp.load(Ordering::Relaxed)
     }
 
+    fn has_lifecycle_tracking(&self) -> bool {
+        self.lifecycle_tracked
+    }
+
+    fn mark_lifecycle_tracked(&mut self) {
+        self.lifecycle_tracked = true;
+    }
+
     fn set_last_accessed_time(&self, timestamp: u64) {
         self.last_accessed_timestamp
             .store(timestamp, Ordering::Relaxed);
@@ -399,9 +434,11 @@ impl Clone for ConnectionV4 {
             remote_port: self.remote_port,
             verdict: self.verdict,
             process_id: self.process_id,
+            instance_id: self.instance_id,
             last_accessed_timestamp: AtomicU64::new(
                 self.last_accessed_timestamp.load(Ordering::Relaxed),
             ),
+            lifecycle_tracked: self.lifecycle_tracked,
             extra: self.extra.clone(),
         }
     }
@@ -427,7 +464,9 @@ impl ConnectionV6 {
             remote_port: key.remote_port,
             verdict: Verdict::Undecided,
             process_id,
+            instance_id: next_connection_instance_id(),
             last_accessed_timestamp: AtomicU64::new(timestamp),
+            lifecycle_tracked: false,
             extra: Box::new(ConnectionExtra {
                 direction,
                 end_timestamp: 0,
@@ -522,6 +561,10 @@ impl Connection for ConnectionV6 {
         true
     }
 
+    fn get_instance_id(&self) -> u64 {
+        self.instance_id
+    }
+
     fn get_process_id(&self) -> u64 {
         self.process_id
     }
@@ -542,6 +585,14 @@ impl Connection for ConnectionV6 {
         self.last_accessed_timestamp.load(Ordering::Relaxed)
     }
 
+    fn has_lifecycle_tracking(&self) -> bool {
+        self.lifecycle_tracked
+    }
+
+    fn mark_lifecycle_tracked(&mut self) {
+        self.lifecycle_tracked = true;
+    }
+
     fn set_last_accessed_time(&self, timestamp: u64) {
         self.last_accessed_timestamp
             .store(timestamp, Ordering::Relaxed);
@@ -558,9 +609,11 @@ impl Clone for ConnectionV6 {
             remote_port: self.remote_port,
             verdict: self.verdict,
             process_id: self.process_id,
+            instance_id: self.instance_id,
             last_accessed_timestamp: AtomicU64::new(
                 self.last_accessed_timestamp.load(Ordering::Relaxed),
             ),
+            lifecycle_tracked: self.lifecycle_tracked,
             extra: self.extra.clone(),
         }
     }

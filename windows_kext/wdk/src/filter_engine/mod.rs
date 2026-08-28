@@ -22,6 +22,7 @@ pub mod callout_data;
 pub(crate) mod classify;
 #[allow(dead_code)]
 pub mod ffi;
+pub mod flow;
 pub mod layer;
 pub(crate) mod metadata;
 pub mod net_buffer;
@@ -201,7 +202,7 @@ unsafe extern "C" fn catch_all_callout(
     layer_data: *mut c_void,
     _context: *mut c_void,
     filter: *const FWPS_FILTER2,
-    _flow_context: u64,
+    flow_context: u64,
     classify_out: *mut ClassifyOut,
 ) {
     let filter = &(*filter);
@@ -216,7 +217,9 @@ unsafe extern "C" fn catch_all_callout(
         );
         let data = CalloutData {
             layer: callout.layer,
-            callout_id: filter.context as usize,
+            layer_id: (*fixed_values).layer_id,
+            callout_id: callout.id,
+            flow_context,
             values: array,
             metadata: meta_values,
             classify_out,

@@ -35,7 +35,7 @@ pub(crate) type FwpsCalloutNotifyFn = unsafe extern "C" fn(
     filter: *mut FWPS_FILTER2,
 ) -> NTSTATUS;
 
-pub(crate) type FwpsCalloutFlowDeleteNotifyFn =
+pub type FwpsCalloutFlowDeleteNotifyFn =
     unsafe extern "C" fn(layerId: u16, calloutId: u32, flowContext: u64);
 
 /// The FWPS_ACTION0 structure specifies the run-time action that the filter engine takes if all of the filter's filtering conditions are true.
@@ -315,6 +315,19 @@ extern "C" {
         callout: *const FWPS_CALLOUT3,
         calloutId: *mut u32,
     ) -> NTSTATUS;
+
+    /// The FwpsFlowAssociateContext0 function associates a callout-owned context
+    /// with a WFP data flow.
+    pub(crate) fn FwpsFlowAssociateContext0(
+        flowId: u64,
+        layerId: u16,
+        calloutId: u32,
+        flowContext: u64,
+    ) -> NTSTATUS;
+
+    /// The FwpsFlowRemoveContext0 function removes a previously associated flow
+    /// context. A successful or pending removal invokes the callout's flowDeleteFn.
+    pub(crate) fn FwpsFlowRemoveContext0(flowId: u64, layerId: u16, calloutId: u32) -> NTSTATUS;
 
     /// The FwpsPendOperation0 function is called by a callout to suspend packet processing pending completion of another operation.
     pub(crate) fn FwpsPendOperation0(

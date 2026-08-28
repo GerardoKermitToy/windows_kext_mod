@@ -1,5 +1,5 @@
 use crate::{
-    ffi::{FwpsCompleteOperation0, FwpsPendOperation0},
+    ffi::{FwpsCompleteOperation0, FwpsFlowAssociateContext0, FwpsPendOperation0},
     utils::check_ntstatus,
 };
 
@@ -22,7 +22,7 @@ use windows_sys::Win32::{
 
 pub enum ClassifyDefer {
     Initial(HANDLE, Option<TransportPacketList>),
-    Reauthorization(usize, Option<TransportPacketList>),
+    Reauthorization(u32, Option<TransportPacketList>),
 }
 
 impl ClassifyDefer {
@@ -84,7 +84,9 @@ impl ClassifyDefer {
 
 pub struct CalloutData<'a> {
     pub layer: Layer,
-    pub(crate) callout_id: usize,
+    pub(crate) layer_id: u16,
+    pub(crate) callout_id: u32,
+    pub(crate) flow_context: u64,
     pub(crate) values: &'a [Value],
     pub(crate) metadata: *const FwpsIncomingMetadataValues,
     pub(crate) classify_out: *mut ClassifyOut,
@@ -118,6 +120,42 @@ impl<'a> CalloutData<'a> {
         unsafe {
             return self.values[index].value.byte_array16.as_ref().unwrap();
         };
+    }
+
+    pub fn get_flow_handle(&self) -> Option<u64> {
+        unsafe { (*self.metadata).get_flow_handle() }
+    }
+
+    pub fn has_flow_context(&self) -> bool {
+        self.flow_context != 0
+    }
+
+    pub fn get_layer_id(&self) -> u16 {
+        self.layer_id
+    }
+
+    pub fn get_callout_id(&self) -> u32 {
+        self.callout_id
+    }
+
+    /// Associates a non-zero driver-owned context with the current WFP flow.
+    /// On success WFP owns the association and returns the same value to the
+    /// callout's flowDeleteFn. The caller retains ownership when this fails.
+    pub fn associate_flow_context(&self, flow_context: u64) -> Result<(), String> {
+        if flow_context == 0 {
+            return Err("flow context must not be zero".to_string());
+        }
+        if self.has_flow_context() {
+            return Err("flow already has a context for this callout".to_string());
+        }
+        let Some(flow_id) = self.get_flow_handle().filter(|flow_id| *flow_id != 0) else {
+            return Err("flow handle metadata is missing or zero".to_string());
+        };
+
+        let status = unsafe {
+            FwpsFlowAssociateContext0(flow_id, self.layer_id, self.callout_id, flow_context)
+        };
+        check_ntstatus(status)
     }
 
     pub fn get_process_id(&self) -> Option<u64> {
@@ -262,9 +300,5 @@ impl<'a> CalloutData<'a> {
             }
             _ => false,
         }
-    }
-
-    pub fn get_callout_id(&self) -> usize {
-        self.callout_id
     }
 }

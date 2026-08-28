@@ -1,5 +1,5 @@
 use super::{callout_data::CalloutData, ffi, layer::Layer};
-use crate::ffi::FwpsCalloutClassifyFn;
+use crate::ffi::{FwpsCalloutClassifyFn, FwpsCalloutFlowDeleteNotifyFn};
 use alloc::{borrow::ToOwned, format, string::String};
 use windows_sys::{Wdk::Foundation::DEVICE_OBJECT, Win32::Foundation::HANDLE};
 
@@ -20,6 +20,7 @@ pub struct Callout {
     pub(crate) filter_type: FilterType,
     pub(crate) filter_id: u64,
     pub(crate) callout_fn: fn(CalloutData),
+    pub(crate) flow_delete_fn: Option<FwpsCalloutFlowDeleteNotifyFn>,
 }
 
 impl Callout {
@@ -44,7 +45,15 @@ impl Callout {
             filter_type,
             filter_id: 0,
             callout_fn,
+            flow_delete_fn: None,
         }
+    }
+
+    /// Registers a flow-deletion callback for callouts that associate contexts
+    /// with WFP data flows.
+    pub fn with_flow_delete_fn(mut self, flow_delete_fn: FwpsCalloutFlowDeleteNotifyFn) -> Self {
+        self.flow_delete_fn = Some(flow_delete_fn);
+        self
     }
 
     pub fn register_filter(
@@ -87,6 +96,7 @@ impl Callout {
             self.guid,
             self.layer,
             callout_fn,
+            self.flow_delete_fn,
         ) {
             Ok(id) => {
                 self.registered = true;

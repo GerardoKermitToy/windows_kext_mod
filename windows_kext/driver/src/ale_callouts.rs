@@ -2,7 +2,8 @@ use crate::connection::{Connection, ConnectionV4, ConnectionV6, Direction, Verdi
 use crate::connection_map::Key;
 use crate::device::{Device, Packet};
 use crate::udp_endpoint_cache::UdpEndpointTake;
-use alloc::string::String;
+use crate::udp_flow_cache::UdpFlowRegistration;
+use alloc::{boxed::Box, string::String};
 
 use crate::info;
 use smoltcp::wire::{
@@ -555,7 +556,7 @@ fn create_packet_list(
     )))
 }
 
-fn emit_connection_end_v4(device: &mut Device, conn: ConnectionV4, process_id: u64) {
+pub(crate) fn emit_connection_end_v4(device: &mut Device, conn: ConnectionV4, process_id: u64) {
     let info = protocol::info::connection_end_event_v4_info(
         if conn.process_id == 0 {
             process_id
@@ -572,7 +573,7 @@ fn emit_connection_end_v4(device: &mut Device, conn: ConnectionV4, process_id: u
     let _ = device.event_queue.push(info);
 }
 
-fn emit_connection_end_v6(device: &mut Device, conn: ConnectionV6, process_id: u64) {
+pub(crate) fn emit_connection_end_v6(device: &mut Device, conn: ConnectionV6, process_id: u64) {
     let info = protocol::info::connection_end_event_v6_info(
         if conn.process_id == 0 {
             process_id
@@ -589,6 +590,147 @@ fn emit_connection_end_v6(device: &mut Device, conn: ConnectionV6, process_id: u
     let _ = device.event_queue.push(info);
 }
 
+struct UdpFlowContext {
+    key: Key,
+    process_id: u64,
+    connection_instance_id: u64,
+    endpoint_handle: Option<u64>,
+    flow_cache: *const crate::udp_flow_cache::UdpFlowCache,
+}
+
+pub(crate) fn reclaim_udp_flow_context(device: &Device, flow_context: u64) {
+    if device.udp_flow_cache.cancel_registration(flow_context) {
+        unsafe {
+            drop(Box::from_raw(flow_context as *mut UdpFlowContext));
+        }
+    }
+}
+
+/// Associates the cached UDP tuple with WFP's native ALE-flow lifetime.
+///
+/// The registration table owns only the identifiers needed during driver unload.
+/// WFP owns `flow_context` after association succeeds and returns it exactly once
+/// through `udp_flow_delete` when the peer flow expires or its socket closes.
+fn associate_udp_flow_context(
+    device: &mut Device,
+    data: &CalloutData,
+    key: Key,
+    endpoint_handle: Option<u64>,
+) {
+    if data.has_flow_context() {
+        return;
+    }
+    let Some(flow_id) = data.get_flow_handle() else {
+        crate::err!("UDP flow has no WFP flow handle: {}", key);
+        return;
+    };
+
+    let Some(connection_instance_id) = device.connection_cache.get_connection_instance_id(&key)
+    else {
+        return;
+    };
+    if let Some(endpoint_handle) = endpoint_handle {
+        device
+            .udp_endpoint_cache
+            .associate_instance(endpoint_handle, key, connection_instance_id);
+    }
+    let registration =
+        UdpFlowRegistration::new(flow_id, data.get_layer_id(), data.get_callout_id());
+    let flow_context = Box::into_raw(Box::new(UdpFlowContext {
+        key,
+        process_id: data.get_process_id().unwrap_or(0),
+        connection_instance_id,
+        endpoint_handle,
+        flow_cache: &device.udp_flow_cache,
+    })) as u64;
+
+    if !device.udp_flow_cache.register(flow_context, registration) {
+        unsafe {
+            drop(Box::from_raw(flow_context as *mut UdpFlowContext));
+        }
+        return;
+    }
+
+    if let Err(err) = data.associate_flow_context(flow_context) {
+        // Normally a failed FwpsFlowAssociateContext call never transfers
+        // ownership to WFP. Keep the conditional as a guard for the termination
+        // race where flowDeleteFn has already claimed the registration.
+        reclaim_udp_flow_context(device, flow_context);
+        crate::err!("failed to associate UDP flow {}: {}", key, err);
+        return;
+    }
+
+    // From this point WFP owns the context. flowDeleteFn may already have claimed
+    // it while FwpsFlowAssociateContext0 was returning.
+    if device.udp_flow_cache.mark_associated(flow_context) {
+        device
+            .connection_cache
+            .mark_lifecycle_tracked(&key, connection_instance_id);
+    }
+}
+
+/// WFP invokes this after a UDP ALE flow reaches its native idle timeout or its
+/// socket closes. The context is driver-owned again on entry and must be freed
+/// even when the Device has already stopped accepting events.
+pub(crate) unsafe extern "C" fn udp_flow_delete(
+    _layer_id: u16,
+    _callout_id: u32,
+    flow_context: u64,
+) {
+    if flow_context == 0 {
+        return;
+    }
+
+    // Claim the callback before reconstructing the Box. This both rejects a
+    // duplicate notification and keeps unload from freeing Device while this
+    // callback is still executing. `flow_cache` remains valid until unload has
+    // drained every registration and in-flight callback.
+    let context_pointer = flow_context as *const UdpFlowContext;
+    let flow_cache = unsafe { &*(*context_pointer).flow_cache };
+    let Some(shutting_down) = flow_cache.begin_callback(flow_context) else {
+        return;
+    };
+    let context = unsafe { Box::from_raw(flow_context as *mut UdpFlowContext) };
+
+    // During unload the callback only has to reclaim its WFP context. In
+    // particular, do not mutate connection/endpoint state while prepare_unload is
+    // synchronously or asynchronously removing contexts.
+    if shutting_down {
+        flow_cache.finish_callback();
+        return;
+    }
+
+    let Some(device) = crate::entry::get_device() else {
+        flow_cache.finish_callback();
+        return;
+    };
+
+    if let Some(endpoint_handle) = context.endpoint_handle {
+        device.udp_endpoint_cache.dissociate(
+            endpoint_handle,
+            context.key,
+            context.connection_instance_id,
+        );
+    }
+
+    let key = context.key;
+    if key.is_ipv6() {
+        if let Some(conn) = device
+            .connection_cache
+            .end_connection_instance_v6(key, context.connection_instance_id)
+        {
+            emit_connection_end_v6(device, conn, context.process_id);
+        }
+    } else if let Some(conn) = device
+        .connection_cache
+        .end_connection_instance_v4(key, context.connection_instance_id)
+    {
+        emit_connection_end_v4(device, conn, context.process_id);
+    }
+
+    flow_cache.finish_callback();
+}
+
 fn end_udp_endpoint(device: &mut Device, endpoint_handle: u64, process_id: u64) -> Option<bool> {
     let endpoint = match device.udp_endpoint_cache.take(endpoint_handle) {
         UdpEndpointTake::Tracked(endpoint) => endpoint,
@@ -599,13 +741,30 @@ fn end_udp_endpoint(device: &mut Device, endpoint_handle: u64, process_id: u64) 
         UdpEndpointTake::Unknown => return Some(false),
     };
 
-    for key in endpoint.keys {
+    for peer in endpoint.peers {
+        let key = peer.key;
         if key.is_ipv6() {
-            if let Some(conn) = device.connection_cache.end_connection_v6(key) {
+            let conn = if let Some(instance_id) = peer.instance_id {
+                device
+                    .connection_cache
+                    .end_connection_instance_v6(key, instance_id)
+            } else {
+                device.connection_cache.end_connection_v6(key)
+            };
+            if let Some(conn) = conn {
                 emit_connection_end_v6(device, conn, process_id);
             }
-        } else if let Some(conn) = device.connection_cache.end_connection_v4(key) {
-            emit_connection_end_v4(device, conn, process_id);
+        } else {
+            let conn = if let Some(instance_id) = peer.instance_id {
+                device
+                    .connection_cache
+                    .end_connection_instance_v4(key, instance_id)
+            } else {
+                device.connection_cache.end_connection_v4(key)
+            };
+            if let Some(conn) = conn {
+                emit_connection_end_v4(device, conn, process_id);
+            }
         }
     }
 
@@ -861,16 +1020,18 @@ pub fn ale_flow_established_monitor(data: CalloutData) {
         _ => return,
     };
 
-    if matches!(key.protocol, IpProtocol::Udp) {
-        if let Some(endpoint_handle) = data.get_transport_endpoint_handle() {
-            device.udp_endpoint_cache.associate(endpoint_handle, key);
-        }
-    }
-
-    // update_process_id applies the PID precedence rules and safely does nothing
-    // when no matching cached tuple exists.
+    // Refresh attribution before exposing the context to WFP: a flow can begin
+    // terminating as soon as it has been associated.
     if let Some(process_id) = process_id {
         device.connection_cache.update_process_id(&key, process_id);
+    }
+
+    if matches!(key.protocol, IpProtocol::Udp) {
+        let endpoint_handle = data.get_transport_endpoint_handle();
+        if let Some(endpoint_handle) = endpoint_handle {
+            device.udp_endpoint_cache.associate(endpoint_handle, key);
+        }
+        associate_udp_flow_context(device, &data, key, endpoint_handle);
     }
 }
 
