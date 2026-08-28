@@ -373,7 +373,7 @@ impl<T: Connection + Clone> ConnectionMap<T> {
         let before_one_minute = now.saturating_sub(Duration::from_secs(60).as_millis() as u64);
         let mut inactive = Vec::new();
 
-        for (_, connections) in self.0.iter_mut() {
+        for connections in self.0.values_mut() {
             // `retain` preserves the relative order of the entries it keeps, so
             // the sort order the lookups depend on survives the sweep.
             connections.retain(|c| {
@@ -393,6 +393,21 @@ impl<T: Connection + Clone> ConnectionMap<T> {
         }
         self.0.retain(|_, v| !v.is_empty());
         inactive
+    }
+
+    /// Appends the IDs of every live UDP cache instance without refreshing activity.
+    ///
+    /// Periodic UDP lifecycle cleanup uses this snapshot after taking its endpoint
+    /// and flow snapshots. A newly created association therefore cannot be mistaken
+    /// for stale state, and inspecting an instance does not postpone its timeout.
+    pub fn append_live_udp_instance_ids(&self, instance_ids: &mut Vec<u64>) {
+        for connections in self.0.values() {
+            for connection in connections {
+                if connection.get_protocol() == IpProtocol::Udp && !connection.has_ended() {
+                    instance_ids.push(connection.get_instance_id());
+                }
+            }
+        }
     }
 
     pub fn get_count(&self) -> usize {
@@ -615,6 +630,26 @@ mod tests {
         assert!(map.touch_instance(&tuple, instance_id));
         assert!(map.clean_ended_connections().is_empty());
         assert_eq!(map.get_count(), 1);
+    }
+
+    #[test]
+    fn live_udp_instance_snapshot_excludes_ended_and_tcp() {
+        let udp_key = key([198, 51, 100, 4], 443);
+        let live_udp = live(&udp_key, 10);
+        let live_udp_instance_id = live_udp.get_instance_id();
+        let ended_udp = ended(&key([198, 51, 100, 5], 443), 20);
+        let mut tcp_key = key([198, 51, 100, 6], 443);
+        tcp_key.protocol = IpProtocol::Tcp;
+        let live_tcp = live(&tcp_key, 30);
+
+        let mut map = ConnectionMap::new();
+        map.add(live_udp);
+        map.add(ended_udp);
+        map.add(live_tcp);
+
+        let mut instance_ids = alloc::vec::Vec::new();
+        map.append_live_udp_instance_ids(&mut instance_ids);
+        assert_eq!(instance_ids, alloc::vec![live_udp_instance_id]);
     }
 
     #[test]

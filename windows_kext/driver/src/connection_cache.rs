@@ -224,6 +224,24 @@ impl ConnectionCache {
         (inactive_v4, inactive_v6)
     }
 
+    /// Returns a sorted snapshot of every live UDP connection-cache instance ID
+    /// without refreshing connection activity.
+    pub fn live_udp_instance_ids(&self) -> Vec<u64> {
+        let mut instance_ids = Vec::new();
+        {
+            let _guard = self.lock_v4.read_lock();
+            self.connections_v4
+                .append_live_udp_instance_ids(&mut instance_ids);
+        }
+        {
+            let _guard = self.lock_v6.read_lock();
+            self.connections_v6
+                .append_live_udp_instance_ids(&mut instance_ids);
+        }
+        instance_ids.sort_unstable();
+        instance_ids
+    }
+
     pub fn clear(&mut self) {
         {
             let _guard = self.lock_v4.write_lock();

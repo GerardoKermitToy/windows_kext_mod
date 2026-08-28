@@ -20,46 +20,20 @@ impl RwSpinLock {
         Self
     }
 
+    fn read_lock(&self) {}
     fn write_lock(&self) {}
 }
 
 use crate::connection_map::Key;
 
-struct EndpointPeer {
-    key: Key,
-    instance_id: Option<u64>,
-}
-
-struct EndpointEntry {
-    peers: Vec<EndpointPeer>,
-}
-
-pub struct ClosedUdpPeer {
+#[derive(Clone, Copy)]
+pub struct UdpEndpointPeer {
     pub key: Key,
-    pub instance_id: Option<u64>,
-}
-
-pub struct ClosedUdpEndpoint {
-    pub peers: Vec<ClosedUdpPeer>,
-}
-
-/// Result of consuming an endpoint lifetime indication.
-///
-/// `Unknown` means this handle was never tracked, so the caller may use a coarse
-/// local-endpoint fallback. `AlreadyTaken` means an earlier closure or resource
-/// release already consumed the handle; falling back again could end a replacement
-/// socket that reused the same local port.
-pub enum UdpEndpointTake {
-    Tracked(ClosedUdpEndpoint),
-    AlreadyTaken,
-    Unknown,
+    pub instance_id: u64,
 }
 
 pub struct UdpEndpointCache {
-    endpoints: BTreeMap<u64, EndpointEntry>,
-    /// Tombstones suppress duplicate closure/resource-release sweeps. Handles are
-    /// removed from this map when a later association reuses them.
-    closed_endpoints: BTreeMap<u64, ()>,
+    endpoints: BTreeMap<u64, Vec<UdpEndpointPeer>>,
     lock: RwSpinLock,
 }
 
@@ -67,159 +41,140 @@ impl UdpEndpointCache {
     pub fn new() -> Self {
         Self {
             endpoints: BTreeMap::new(),
-            closed_endpoints: BTreeMap::new(),
             lock: RwSpinLock::default(),
         }
     }
 
-    /// Associates one UDP remote tuple with its socket endpoint.
+    /// Associates one concrete connection-cache instance with its endpoint.
     ///
-    /// Reauthorizations and repeated indications are idempotent.
-    pub fn associate(&mut self, endpoint_handle: u64, key: Key) {
-        if endpoint_handle == 0 {
-            return;
-        }
-
-        let _guard = self.lock.write_lock();
-        // A handle can be reused after its previous socket has closed.
-        self.closed_endpoints.remove(&endpoint_handle);
-
-        if let Some(entry) = self.endpoints.get_mut(&endpoint_handle) {
-            if entry.peers.iter().any(|peer| peer.key == key) {
-                return;
-            }
-            entry.peers.push(EndpointPeer {
-                key,
-                instance_id: None,
-            });
-            return;
-        }
-
-        self.endpoints.insert(
-            endpoint_handle,
-            EndpointEntry {
-                peers: alloc::vec![EndpointPeer {
-                    key,
-                    instance_id: None,
-                }],
-            },
-        );
-    }
-
-    /// Associates one concrete cache instance with its endpoint.
-    ///
-    /// An earlier authorization/datagram observation may have inserted an unbound
-    /// key. Bind that observation in place; a later flow with the same tuple gets a
-    /// separate peer so delayed closure cannot target its replacement.
-    pub fn associate_instance(&mut self, endpoint_handle: u64, key: Key, instance_id: u64) {
+    /// Returns true only when this call inserted a new association. Callers that
+    /// expose a context to WFP can use the result to roll back their own insertion
+    /// if `FwpsFlowAssociateContext0` fails without removing an association that
+    /// was already tracking the connection independently.
+    pub fn associate_instance(&mut self, endpoint_handle: u64, key: Key, instance_id: u64) -> bool {
         if endpoint_handle == 0 || instance_id == 0 {
-            return;
+            return false;
         }
 
         let _guard = self.lock.write_lock();
-        self.closed_endpoints.remove(&endpoint_handle);
-
-        if let Some(entry) = self.endpoints.get_mut(&endpoint_handle) {
-            if entry
-                .peers
+        if let Some(peers) = self.endpoints.get_mut(&endpoint_handle) {
+            if peers
                 .iter()
-                .any(|peer| peer.key == key && peer.instance_id == Some(instance_id))
+                .any(|peer| peer.key == key && peer.instance_id == instance_id)
             {
-                return;
+                return false;
             }
-            if let Some(peer) = entry
-                .peers
-                .iter_mut()
-                .find(|peer| peer.key == key && peer.instance_id.is_none())
-            {
-                peer.instance_id = Some(instance_id);
-                return;
-            }
-            entry.peers.push(EndpointPeer {
-                key,
-                instance_id: Some(instance_id),
-            });
-            return;
+            peers.push(UdpEndpointPeer { key, instance_id });
+            return true;
         }
 
         self.endpoints.insert(
             endpoint_handle,
-            EndpointEntry {
-                peers: alloc::vec![EndpointPeer {
-                    key,
-                    instance_id: Some(instance_id),
-                }],
-            },
+            alloc::vec![UdpEndpointPeer { key, instance_id }],
         );
+        true
     }
 
-    /// Removes a peer whose WFP ALE flow has ended.
-    ///
-    /// The endpoint entry itself is retained even when it becomes empty. A later
-    /// socket-closure indication must still be recognized as tracked so it does not
-    /// fall back to sweeping a local port that may already have been reused.
+    /// Removes a peer whose WFP ALE flow has ended. Empty endpoint entries are
+    /// dropped with their peer allocation; unknown/repeated lifetime indications
+    /// are safe to ignore and therefore need neither empty sentinels nor tombstones.
     pub fn dissociate(&mut self, endpoint_handle: u64, key: Key, instance_id: u64) -> bool {
         if endpoint_handle == 0 || instance_id == 0 {
             return false;
         }
 
         let _guard = self.lock.write_lock();
-        let Some(entry) = self.endpoints.get_mut(&endpoint_handle) else {
+        let Some(peers) = self.endpoints.get_mut(&endpoint_handle) else {
             return false;
         };
-        let previous_len = entry.peers.len();
-        entry
-            .peers
-            .retain(|peer| peer.key != key || peer.instance_id != Some(instance_id));
-        entry.peers.len() != previous_len
+        let previous_len = peers.len();
+        peers.retain(|peer| peer.key != key || peer.instance_id != instance_id);
+        let removed = peers.len() != previous_len;
+        let remove_endpoint = removed && peers.is_empty();
+        if removed && !remove_endpoint {
+            release_excess_capacity(peers);
+        }
+        if remove_endpoint {
+            self.endpoints.remove(&endpoint_handle);
+        }
+        removed
+    }
+
+    /// Returns the connection-cache instance IDs represented by this cache.
+    ///
+    /// The snapshot is taken before the live connection snapshot during periodic
+    /// cleanup. Therefore an association created afterwards is left for the next
+    /// pass rather than being mistaken for stale state.
+    pub fn instance_ids(&self) -> Vec<u64> {
+        let _guard = self.lock.read_lock();
+        let count = self.endpoints.values().map(Vec::len).sum();
+        let mut instance_ids = Vec::with_capacity(count);
+        for peers in self.endpoints.values() {
+            instance_ids.extend(peers.iter().map(|peer| peer.instance_id));
+        }
+        instance_ids
+    }
+
+    /// Removes associations for connection-cache instances that no longer exist.
+    ///
+    /// Empty endpoint entries are removed together with their peer buffers. The
+    /// input is consumed so sorting it does not require another allocation.
+    pub fn remove_instances(&mut self, mut instance_ids: Vec<u64>) -> usize {
+        if instance_ids.is_empty() {
+            return 0;
+        }
+        instance_ids.sort_unstable();
+        instance_ids.dedup();
+
+        let _guard = self.lock.write_lock();
+        let mut removed = 0;
+        self.endpoints.retain(|_, peers| {
+            let previous_len = peers.len();
+            peers.retain(|peer| instance_ids.binary_search(&peer.instance_id).is_err());
+            let removed_from_endpoint = previous_len - peers.len();
+            removed += removed_from_endpoint;
+            if removed_from_endpoint != 0 && !peers.is_empty() {
+                release_excess_capacity(peers);
+            }
+            !peers.is_empty()
+        });
+        removed
     }
 
     /// Consumes one endpoint lifetime indication and returns every UDP tuple
     /// observed on its socket.
-    pub fn take(&mut self, endpoint_handle: u64) -> UdpEndpointTake {
+    ///
+    /// An unknown handle leaves no state behind. Callers with a concrete handle
+    /// deliberately do not use a local-port fallback for an unknown or repeated
+    /// indication: ignoring it is safer than ending a replacement socket, and the
+    /// inactivity watchdog still retires any unmatched bookkeeping.
+    pub fn take(&mut self, endpoint_handle: u64) -> Option<Vec<UdpEndpointPeer>> {
         if endpoint_handle == 0 {
-            return UdpEndpointTake::Unknown;
+            return None;
         }
 
         let _guard = self.lock.write_lock();
-        if let Some(entry) = self.endpoints.remove(&endpoint_handle) {
-            remember_closed(&mut self.closed_endpoints, endpoint_handle);
-            return UdpEndpointTake::Tracked(ClosedUdpEndpoint {
-                peers: entry
-                    .peers
-                    .into_iter()
-                    .map(|peer| ClosedUdpPeer {
-                        key: peer.key,
-                        instance_id: peer.instance_id,
-                    })
-                    .collect(),
-            });
-        }
-
-        if self.closed_endpoints.contains_key(&endpoint_handle) {
-            UdpEndpointTake::AlreadyTaken
-        } else {
-            // Remember an untracked handle too: a later resource-release
-            // indication for the same endpoint must not sweep a reused port twice.
-            remember_closed(&mut self.closed_endpoints, endpoint_handle);
-            UdpEndpointTake::Unknown
-        }
+        self.endpoints.remove(&endpoint_handle)
     }
 
     pub fn clear(&mut self) {
         let _guard = self.lock.write_lock();
         self.endpoints.clear();
-        self.closed_endpoints.clear();
     }
 }
 
-fn remember_closed(closed_endpoints: &mut BTreeMap<u64, ()>, endpoint_handle: u64) {
-    closed_endpoints.insert(endpoint_handle, ());
+/// Releases high-water allocation without reallocating after every individual
+/// flow deletion. Non-empty vectors shrink after capacity exceeds live state by
+/// at least four times; empty vectors are dropped with their endpoint entry.
+fn release_excess_capacity(peers: &mut Vec<UdpEndpointPeer>) {
+    if peers.len() <= peers.capacity() / 4 {
+        peers.shrink_to_fit();
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{UdpEndpointCache, UdpEndpointTake};
+    use super::UdpEndpointCache;
     use crate::connection_map::Key;
     use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Address};
 
@@ -236,56 +191,80 @@ mod tests {
     #[test]
     fn groups_remote_tuples_under_one_endpoint_and_takes_once() {
         let mut cache = UdpEndpointCache::new();
-        cache.associate(10, key(1000));
-        cache.associate(10, key(1001));
-        cache.associate(10, key(1001));
+        assert!(cache.associate_instance(10, key(1000), 100));
+        assert!(cache.associate_instance(10, key(1001), 101));
+        assert!(!cache.associate_instance(10, key(1001), 101));
 
-        let UdpEndpointTake::Tracked(closed) = cache.take(10) else {
-            panic!("endpoint was not tracked");
-        };
-        assert_eq!(closed.peers.len(), 2);
-        assert!(matches!(cache.take(10), UdpEndpointTake::AlreadyTaken));
+        let closed = cache.take(10).expect("endpoint was not tracked");
+        assert_eq!(closed.len(), 2);
+        assert!(cache.take(10).is_none());
     }
 
     #[test]
     fn flow_delete_dissociates_only_its_cache_instance() {
         let mut cache = UdpEndpointCache::new();
         let peer = key(1000);
-        cache.associate(10, peer);
-        cache.associate_instance(10, peer, 100);
-        cache.associate_instance(10, peer, 200);
+        assert!(cache.associate_instance(10, peer, 100));
+        assert!(cache.associate_instance(10, peer, 200));
 
         assert!(cache.dissociate(10, peer, 100));
         assert!(!cache.dissociate(10, peer, 100));
 
-        let UdpEndpointTake::Tracked(closed) = cache.take(10) else {
-            panic!("endpoint was no longer tracked");
-        };
-        assert_eq!(closed.peers.len(), 1);
-        assert_eq!(closed.peers[0].instance_id, Some(200));
+        let closed = cache.take(10).expect("endpoint was no longer tracked");
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].instance_id, 200);
     }
 
     #[test]
-    fn flow_delete_keeps_empty_endpoint_tracked() {
+    fn flow_delete_removes_empty_endpoint_and_peer_buffer() {
         let mut cache = UdpEndpointCache::new();
         let peer = key(1000);
-        cache.associate_instance(10, peer, 100);
+        assert!(cache.associate_instance(10, peer, 100));
 
         assert!(cache.dissociate(10, peer, 100));
-
-        let UdpEndpointTake::Tracked(closed) = cache.take(10) else {
-            panic!("empty endpoint was no longer tracked");
-        };
-        assert!(closed.peers.is_empty());
+        assert!(!cache.endpoints.contains_key(&10));
+        assert!(cache.take(10).is_none());
     }
 
     #[test]
-    fn unknown_handles_are_tombstoned_after_first_take() {
+    fn dissociate_releases_excess_capacity_while_peers_remain() {
         let mut cache = UdpEndpointCache::new();
-        assert!(matches!(cache.take(10), UdpEndpointTake::Unknown));
-        assert!(matches!(cache.take(10), UdpEndpointTake::AlreadyTaken));
+        for offset in 0..64u16 {
+            assert!(cache.associate_instance(10, key(1_000 + offset), 1_000 + u64::from(offset),));
+        }
+        let peak_capacity = cache.endpoints.get(&10).expect("endpoint").capacity();
 
-        cache.associate(10, key(1000));
-        assert!(matches!(cache.take(10), UdpEndpointTake::Tracked(_)));
+        for offset in 0..63u16 {
+            assert!(cache.dissociate(10, key(1_000 + offset), 1_000 + u64::from(offset),));
+        }
+
+        let peers = cache.endpoints.get(&10).expect("live peer was removed");
+        assert_eq!(peers.len(), 1);
+        assert!(peers.capacity() < peak_capacity);
+        assert!(peers.capacity() <= peers.len() * 4);
+    }
+
+    #[test]
+    fn unknown_handles_leave_no_tombstones() {
+        let mut cache = UdpEndpointCache::new();
+        assert!(cache.take(10).is_none());
+        assert!(cache.take(10).is_none());
+        assert!(cache.endpoints.is_empty());
+    }
+
+    #[test]
+    fn cleanup_removes_stale_instances_and_empty_endpoints() {
+        let mut cache = UdpEndpointCache::new();
+        assert!(cache.associate_instance(10, key(1000), 100));
+        assert!(cache.associate_instance(10, key(1001), 101));
+        assert!(cache.associate_instance(20, key(2000), 200));
+
+        assert_eq!(cache.remove_instances(alloc::vec![200, 100, 200]), 2);
+        assert_eq!(cache.instance_ids(), alloc::vec![101]);
+
+        let first = cache.take(10).expect("first endpoint was removed");
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].instance_id, 101);
+        assert!(cache.take(20).is_none());
     }
 }

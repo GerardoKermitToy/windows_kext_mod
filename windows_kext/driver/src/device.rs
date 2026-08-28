@@ -19,9 +19,18 @@ use wdk::{
 };
 
 use crate::{
-    array_holder::ArrayHolder, bandwidth::Bandwidth, callouts, connection_cache::ConnectionCache,
-    connection_map::Key, dbg, err, icmp_echo_cache::IcmpEchoCache, id_cache::IdCache, logger,
-    packet_util::Redirect, udp_endpoint_cache::UdpEndpointCache, udp_flow_cache::UdpFlowCache,
+    array_holder::ArrayHolder,
+    bandwidth::Bandwidth,
+    callouts,
+    connection_cache::ConnectionCache,
+    connection_map::Key,
+    dbg, err,
+    icmp_echo_cache::IcmpEchoCache,
+    id_cache::IdCache,
+    logger,
+    packet_util::Redirect,
+    udp_endpoint_cache::UdpEndpointCache,
+    udp_flow_cache::{UdpFlowCache, UdpFlowRegistration},
 };
 
 pub enum Packet {
@@ -33,9 +42,9 @@ pub enum Packet {
 pub struct Device {
     pub(crate) filter_engine: FilterEngine,
     pub(crate) read_leftover: ArrayHolder,
-    pub(crate) event_queue: IOQueue<Info>,          // Queue for events to user-space
-    pub(crate) packet_cache: IdCache,               // Cache of pending packets waiting for verdict
-    pub(crate) connection_cache: ConnectionCache,   // Cache of connections and their verdicts
+    pub(crate) event_queue: IOQueue<Info>, // Queue for events to user-space
+    pub(crate) packet_cache: IdCache,      // Cache of pending packets waiting for verdict
+    pub(crate) connection_cache: ConnectionCache, // Cache of connections and their verdicts
     /// UDP remote tuples grouped by WFP transport endpoint handle. A UDP socket
     /// receives one endpoint-closure indication regardless of its remote peers.
     pub(crate) udp_endpoint_cache: UdpEndpointCache,
@@ -91,9 +100,6 @@ impl Device {
         let p = self.owner_pid.load(Ordering::Acquire);
         p != 0 && p == pid
     }
-
-    /// Cleanup is called just before drop.
-    // pub fn cleanup(&mut self) {}
 
     fn write_buffer(&mut self, read_request: &mut ReadRequest, info: Info) {
         let bytes = info.as_bytes();
@@ -294,6 +300,7 @@ impl Device {
                 wdk::dbg!("ClearCache command");
                 self.connection_cache.clear();
                 self.udp_endpoint_cache.clear();
+                self.clean_udp_lifecycle_state();
                 if let Err(err) = self.filter_engine.reset_all_filters() {
                     err!("failed to reset filters: {}", err);
                 }
@@ -359,6 +366,11 @@ impl Device {
                 for conn in inactive_v6 {
                     crate::ale_callouts::emit_connection_end_v6(self, conn, 0);
                 }
+                // Reconcile only after the watchdog has removed inactive connection
+                // instances. Removing a WFP callout context does not close the UDP
+                // socket or flow; it merely asks WFP to return our allocation through
+                // flowDeleteFn.
+                self.clean_udp_lifecycle_state();
                 // Same intent for the ICMP echo table: an unanswered request is
                 // state that is no longer needed. Expired entries only, so that
                 // requests still in flight keep their process attribution.
@@ -366,6 +378,75 @@ impl Device {
                 // Doing it here also keeps the sweep off the packet path - the
                 // only other one runs inside a callout at DISPATCH_LEVEL.
                 self.icmp_echo_cache.clean_expired_entries();
+            }
+        }
+    }
+
+    /// Removes one associated WFP flow context without terminating the socket or
+    /// its network flow. WFP reclaims only the callout-owned bookkeeping and invokes
+    /// `udp_flow_delete`, which frees the allocation and consumes the exact cache
+    /// instance if it is still live.
+    fn remove_udp_flow_context(&self, registration: UdpFlowRegistration) {
+        match wdk::filter_engine::flow::remove_context(
+            registration.flow_id,
+            registration.layer_id,
+            registration.callout_id,
+        ) {
+            Ok(wdk::filter_engine::flow::RemoveContextResult::Removed)
+            | Ok(wdk::filter_engine::flow::RemoveContextResult::Pending) => {}
+            Ok(wdk::filter_engine::flow::RemoveContextResult::AlreadyGone) => {
+                // WFP has no association left and therefore cannot call
+                // flowDeleteFn; reclaim the driver-owned allocation here.
+                crate::ale_callouts::reclaim_udp_flow_context(
+                    self,
+                    registration.flow_context,
+                    registration.connection_instance_id,
+                );
+            }
+            Err(err) => {
+                self.udp_flow_cache.retry_removal(
+                    registration.flow_context,
+                    registration.connection_instance_id,
+                );
+                crate::err!(
+                    "failed to remove UDP flow context {}: {}",
+                    registration.flow_id,
+                    err
+                );
+            }
+        }
+    }
+
+    /// Reconciles endpoint/flow bookkeeping with the live connection cache.
+    ///
+    /// Snapshot order is intentional: endpoint and flow state are captured before
+    /// live connections. Any association created concurrently is therefore visible
+    /// in the later live snapshot or remains untouched until the next pass.
+    fn clean_udp_lifecycle_state(&mut self) {
+        let endpoint_instances = self.udp_endpoint_cache.instance_ids();
+        let flow_candidates = self.udp_flow_cache.removal_candidates();
+        let live_instances = self.connection_cache.live_udp_instance_ids();
+
+        let stale_endpoint_instances = endpoint_instances
+            .into_iter()
+            .filter(|instance_id| live_instances.binary_search(instance_id).is_err())
+            .collect();
+        let _ = self
+            .udp_endpoint_cache
+            .remove_instances(stale_endpoint_instances);
+
+        for (flow_context, connection_instance_id) in flow_candidates {
+            if live_instances
+                .binary_search(&connection_instance_id)
+                .is_ok()
+            {
+                continue;
+            }
+            if let Some(registration) = self
+                .udp_flow_cache
+                .claim_removal(flow_context, connection_instance_id)
+            {
+                self.remove_udp_flow_context(registration);
             }
         }
     }
@@ -379,30 +460,7 @@ impl Device {
         self.udp_flow_cache.start_shutdown();
         while !self.udp_flow_cache.is_drained() {
             for registration in self.udp_flow_cache.pending_removals() {
-                match wdk::filter_engine::flow::remove_context(
-                    registration.flow_id,
-                    registration.layer_id,
-                    registration.callout_id,
-                ) {
-                    Ok(wdk::filter_engine::flow::RemoveContextResult::Removed)
-                    | Ok(wdk::filter_engine::flow::RemoveContextResult::Pending) => {}
-                    Ok(wdk::filter_engine::flow::RemoveContextResult::AlreadyGone) => {
-                        // WFP has no association left and therefore cannot call
-                        // flowDeleteFn; reclaim the driver-owned allocation here.
-                        crate::ale_callouts::reclaim_udp_flow_context(
-                            self,
-                            registration.flow_context,
-                        );
-                    }
-                    Err(err) => {
-                        self.udp_flow_cache.retry_removal(registration.flow_context);
-                        crate::err!(
-                            "failed to remove UDP flow context {}: {}",
-                            registration.flow_id,
-                            err
-                        );
-                    }
-                }
+                self.remove_udp_flow_context(registration);
             }
 
             if !self.udp_flow_cache.is_drained() {

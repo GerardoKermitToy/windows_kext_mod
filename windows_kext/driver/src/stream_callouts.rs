@@ -154,21 +154,20 @@ fn is_self_injected(device: &Device, data: &CalloutData, ipv6: bool) -> bool {
         .was_network_packet_injected_by_self(data.get_layer_data() as _, ipv6)
 }
 
-/// Associates a UDP tuple with the socket endpoint seen at the datagram layer.
-///
-/// The endpoint handle is also available at the ALE authorization layers, but the
-/// datagram layer is a useful fallback for paths where authorization did not expose
-/// a handle. Repeated associations are ignored by the endpoint cache.
+/// Associates a concrete UDP connection instance with the endpoint seen at the
+/// datagram layer. If no live cache entry exists, there is nothing that periodic
+/// cleanup or a flow callback could identify safely, so no unbound peer is stored.
 fn track_udp_endpoint(device: &mut Device, data: &CalloutData, key: Key) {
-    if let Some(endpoint_handle) = data.get_transport_endpoint_handle() {
-        if let Some(instance_id) = device.connection_cache.get_connection_instance_id(&key) {
-            device
-                .udp_endpoint_cache
-                .associate_instance(endpoint_handle, key, instance_id);
-        } else {
-            device.udp_endpoint_cache.associate(endpoint_handle, key);
-        }
-    }
+    let (Some(endpoint_handle), Some(instance_id)) = (
+        data.get_transport_endpoint_handle()
+            .filter(|endpoint_handle| *endpoint_handle != 0),
+        device.connection_cache.get_connection_instance_id(&key),
+    ) else {
+        return;
+    };
+    let _ = device
+        .udp_endpoint_cache
+        .associate_instance(endpoint_handle, key, instance_id);
 }
 
 pub fn stream_layer_udp_v4(data: CalloutData) {
