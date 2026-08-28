@@ -250,6 +250,23 @@ impl<T: Connection + Clone> ConnectionMap<T> {
         None
     }
 
+    /// Refreshes one exact live cache instance.
+    pub fn touch_instance(&mut self, key: &Key, instance_id: u64) -> bool {
+        if let Some(connections) = self.0.get_mut(&key.small()) {
+            let range = equal_range(connections, (key.remote_address, key.remote_port));
+            for conn in &mut connections[range] {
+                if conn.remote_equals(key)
+                    && conn.get_instance_id() == instance_id
+                    && !conn.has_ended()
+                {
+                    conn.set_last_accessed_time(get_system_timestamp_ms());
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Ends the connection matching `key` and returns a copy of it, or `None` if
     /// there is no live match.
     ///
@@ -342,16 +359,17 @@ impl<T: Connection + Clone> ConnectionMap<T> {
         self.0.clear();
     }
 
-    /// Removes ended history and returns untracked UDP entries that have been idle
-    /// for ten minutes.
+    /// Removes ended history and returns UDP entries that have been idle for ten
+    /// minutes.
     ///
-    /// A UDP connection covered by WFP flow deletion remains until that native
-    /// lifetime signal arrives. The long idle timeout is only a watchdog for UDP
-    /// entries whose flow never established or whose context association failed.
+    /// WFP's documented UDP idle lifetime is not a reliable callback deadline on
+    /// current Windows versions. Native flow deletion can end a connection earlier,
+    /// but the cache watchdog still publishes and removes every stale UDP entry so
+    /// user space cannot retain it indefinitely. This is bookkeeping only: removing
+    /// a cache entry does not abort the WFP flow or close the application's socket.
     pub fn clean_ended_connections(&mut self) -> Vec<T> {
         let now = get_system_timestamp_ms();
         const TEN_MINUTES: u64 = Duration::from_secs(60 * 10).as_millis() as u64;
-        let before_ten_minutes = now.saturating_sub(TEN_MINUTES);
         let before_one_minute = now.saturating_sub(Duration::from_secs(60).as_millis() as u64);
         let mut inactive = Vec::new();
 
@@ -363,7 +381,7 @@ impl<T: Connection + Clone> ConnectionMap<T> {
                     return c.get_end_time() >= before_one_minute;
                 }
 
-                if !c.has_lifecycle_tracking() && c.get_last_accessed_time() < before_ten_minutes {
+                if now.saturating_sub(c.get_last_accessed_time()) >= TEN_MINUTES {
                     if c.get_protocol() == IpProtocol::Udp {
                         inactive.push(c.clone());
                     }
@@ -390,6 +408,7 @@ impl<T: Connection + Clone> ConnectionMap<T> {
 mod tests {
     use super::{ConnectionMap, Key};
     use crate::connection::{Connection, ConnectionV4, Direction, Verdict, PM_DNS_PORT};
+    use core::time::Duration;
     use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Address};
 
     fn key(remote_address: [u8; 4], remote_port: u16) -> Key {
@@ -512,21 +531,8 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_keeps_native_lifecycle_tracked_entry() {
+    fn cleanup_reports_inactive_udp_as_watchdog() {
         let tuple = key([203, 0, 113, 1], 443);
-        let mut conn = live(&tuple, 10);
-        conn.mark_lifecycle_tracked();
-        let mut map = ConnectionMap::new();
-        map.add(conn);
-
-        assert!(map.clean_ended_connections().is_empty());
-        assert_eq!(map.get_count(), 1);
-        assert_eq!(map.read(&tuple, read_process_id), Some(10));
-    }
-
-    #[test]
-    fn cleanup_reports_untracked_inactive_entry_as_watchdog() {
-        let tuple = key([203, 0, 113, 3], 443);
         let mut map = ConnectionMap::new();
         map.add(live(&tuple, 10));
 
@@ -535,6 +541,32 @@ mod tests {
         assert_eq!(inactive.len(), 1);
         assert_eq!(inactive[0].process_id, 10);
         assert_eq!(map.get_count(), 0);
+    }
+
+    #[test]
+    fn cleanup_expires_udp_at_exact_ten_minute_boundary() {
+        let tuple = key([203, 0, 113, 5], 443);
+        let conn = live(&tuple, 10);
+        conn.set_last_accessed_time(Duration::from_secs(50 * 60).as_millis() as u64);
+        let mut map = ConnectionMap::new();
+        map.add(conn);
+
+        let inactive = map.clean_ended_connections();
+
+        assert_eq!(inactive.len(), 1);
+        assert_eq!(map.get_count(), 0);
+    }
+
+    #[test]
+    fn cleanup_keeps_udp_active_within_ten_minutes() {
+        let tuple = key([203, 0, 113, 6], 443);
+        let conn = live(&tuple, 10);
+        conn.set_last_accessed_time(Duration::from_secs(50 * 60).as_millis() as u64 + 1);
+        let mut map = ConnectionMap::new();
+        map.add(conn);
+
+        assert!(map.clean_ended_connections().is_empty());
+        assert_eq!(map.get_count(), 1);
     }
 
     #[test]
@@ -569,6 +601,33 @@ mod tests {
         map.add(live(&tuple, 20));
 
         assert!(map.end_instance(tuple, old_instance_id).is_none());
+        assert_eq!(map.read(&tuple, read_process_id), Some(20));
+    }
+
+    #[test]
+    fn exact_instance_activity_postpones_udp_expiry() {
+        let tuple = key([198, 51, 100, 3], 443);
+        let conn = live(&tuple, 10);
+        let instance_id = conn.get_instance_id();
+        let mut map = ConnectionMap::new();
+        map.add(conn);
+
+        assert!(map.touch_instance(&tuple, instance_id));
+        assert!(map.clean_ended_connections().is_empty());
+        assert_eq!(map.get_count(), 1);
+    }
+
+    #[test]
+    fn stale_instance_cannot_refresh_reused_tuple() {
+        let tuple = key([198, 51, 100, 2], 443);
+        let old = live(&tuple, 10);
+        let old_instance_id = old.get_instance_id();
+        let mut map = ConnectionMap::new();
+        map.add(old);
+        map.clear();
+        map.add(live(&tuple, 20));
+
+        assert!(!map.touch_instance(&tuple, old_instance_id));
         assert_eq!(map.read(&tuple, read_process_id), Some(20));
     }
 

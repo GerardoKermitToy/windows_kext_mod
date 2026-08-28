@@ -86,26 +86,15 @@ impl ConnectionCache {
         }
     }
 
-    /// Marks one specific live entry as covered by a native WFP lifetime callback.
-    pub fn mark_lifecycle_tracked(&mut self, key: &Key, instance_id: u64) -> bool {
+    /// Refreshes one exact live cache instance.
+    pub fn touch_connection_instance(&mut self, key: &Key, instance_id: u64) -> bool {
         if key.is_ipv6() {
             let _guard = self.lock_v6.write_lock();
-            if let Some(conn) = self.connections_v6.get_mut(key) {
-                if conn.get_instance_id() == instance_id {
-                    conn.mark_lifecycle_tracked();
-                    return true;
-                }
-            }
+            self.connections_v6.touch_instance(key, instance_id)
         } else {
             let _guard = self.lock_v4.write_lock();
-            if let Some(conn) = self.connections_v4.get_mut(key) {
-                if conn.get_instance_id() == instance_id {
-                    conn.mark_lifecycle_tracked();
-                    return true;
-                }
-            }
+            self.connections_v4.touch_instance(key, instance_id)
         }
-        false
     }
 
     pub fn update_connection(&mut self, key: Key, verdict: Verdict) -> Option<RedirectInfo> {
@@ -221,8 +210,8 @@ impl ConnectionCache {
             .end_all_on_endpoint(key, local_address, process_id)
     }
 
-    /// Cleans retained history and returns untracked UDP entries expired by the
-    /// fallback watchdog. The caller must publish END for each returned entry.
+    /// Cleans retained history and returns UDP entries expired by the fallback
+    /// inactivity watchdog. The caller must publish END for each returned entry.
     pub fn clean_ended_connections(&mut self) -> (Vec<ConnectionV4>, Vec<ConnectionV6>) {
         let inactive_v4 = {
             let _guard = self.lock_v4.write_lock();

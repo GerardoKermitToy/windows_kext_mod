@@ -1,5 +1,8 @@
 use alloc::{string::String, vec::Vec};
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::{
+    ffi::c_void,
+    sync::atomic::{AtomicPtr, AtomicU32, Ordering},
+};
 use num_traits::FromPrimitive;
 use protocol::{command::CommandType, info::Info};
 use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Address, Ipv6Address};
@@ -45,9 +48,12 @@ pub struct Device {
     pub(crate) injector: Injector,
     pub(crate) network_allocator: NetworkAllocator,
     pub(crate) bandwidth_stats: Bandwidth,
-    /// PID of the user-space process that currently holds the device handle open.
-    /// Written once on IRP_MJ_CREATE, cleared on IRP_MJ_CLEANUP.
-    /// AtomicU32 gives lock-free reads in callouts with zero overhead.
+    /// File object for the one accepted user-mode device open. The pointer is an
+    /// opaque identity token; it is never dereferenced. A rejected CREATE gets a
+    /// different file object, so its CLEANUP cannot release the active owner.
+    pub(crate) owner_file_object: AtomicPtr<c_void>,
+    /// PID belonging to `owner_file_object`, used by callouts to recognize the
+    /// current Portmaster process. Zero means that no device open is accepted.
     pub(crate) owner_pid: AtomicU32,
 }
 
@@ -75,6 +81,7 @@ impl Device {
             injector: Injector::new(),
             network_allocator: NetworkAllocator::new(),
             bandwidth_stats: Bandwidth::new(),
+            owner_file_object: AtomicPtr::new(core::ptr::null_mut()),
             owner_pid: AtomicU32::new(0),
         })
     }
@@ -340,9 +347,12 @@ impl Device {
             CommandType::CleanEndedConnections => {
                 wdk::dbg!("CleanEndedConnections command");
                 let (inactive_v4, inactive_v6) = self.connection_cache.clean_ended_connections();
-                // Native WFP flow contexts own tracked UDP connections. These are
-                // only watchdog expirations for UDP entries that never acquired flow
-                // tracking, and must still be visible to user space.
+                // Native flow deletion emits promptly when WFP actually reclaims
+                // the ALE flow. This ten-minute watchdog also covers associated UDP
+                // flows whose Windows cleanup callback is delayed until socket close.
+                // It expires only Portmaster's cache record; it does not abort the
+                // WFP flow or close the socket. Either path consumes the exact live
+                // cache instance, so the later one cannot duplicate END.
                 for conn in inactive_v4 {
                     crate::ale_callouts::emit_connection_end_v4(self, conn, 0);
                 }

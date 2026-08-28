@@ -221,10 +221,6 @@ pub trait Connection {
     fn get_end_time(&self) -> u64;
     /// Returns the timestamp when the connection was last accessed.
     fn get_last_accessed_time(&self) -> u64;
-    /// Returns whether WFP has a native flow-deletion callback for this connection.
-    fn has_lifecycle_tracking(&self) -> bool;
-    /// Marks the connection as covered by a WFP flow-deletion callback.
-    fn mark_lifecycle_tracked(&mut self);
     /// Sets the timestamp when the connection was last accessed.
     fn set_last_accessed_time(&self, timestamp: u64);
 }
@@ -239,7 +235,6 @@ pub struct ConnectionV4 {
     pub(crate) process_id: u64,
     pub(crate) instance_id: u64,
     pub(crate) last_accessed_timestamp: AtomicU64,
-    pub(crate) lifecycle_tracked: bool,
     pub(crate) extra: Box<ConnectionExtra>,
 }
 
@@ -253,7 +248,6 @@ pub struct ConnectionV6 {
     pub(crate) process_id: u64,
     pub(crate) instance_id: u64,
     pub(crate) last_accessed_timestamp: AtomicU64,
-    pub(crate) lifecycle_tracked: bool,
     pub(crate) extra: Box<ConnectionExtra>,
 }
 
@@ -290,7 +284,6 @@ impl ConnectionV4 {
             process_id,
             instance_id: next_connection_instance_id(),
             last_accessed_timestamp: AtomicU64::new(timestamp),
-            lifecycle_tracked: false,
             extra: Box::new(ConnectionExtra {
                 direction,
                 end_timestamp: 0,
@@ -410,14 +403,6 @@ impl Connection for ConnectionV4 {
         self.last_accessed_timestamp.load(Ordering::Relaxed)
     }
 
-    fn has_lifecycle_tracking(&self) -> bool {
-        self.lifecycle_tracked
-    }
-
-    fn mark_lifecycle_tracked(&mut self) {
-        self.lifecycle_tracked = true;
-    }
-
     fn set_last_accessed_time(&self, timestamp: u64) {
         self.last_accessed_timestamp
             .store(timestamp, Ordering::Relaxed);
@@ -438,7 +423,6 @@ impl Clone for ConnectionV4 {
             last_accessed_timestamp: AtomicU64::new(
                 self.last_accessed_timestamp.load(Ordering::Relaxed),
             ),
-            lifecycle_tracked: self.lifecycle_tracked,
             extra: self.extra.clone(),
         }
     }
@@ -466,7 +450,6 @@ impl ConnectionV6 {
             process_id,
             instance_id: next_connection_instance_id(),
             last_accessed_timestamp: AtomicU64::new(timestamp),
-            lifecycle_tracked: false,
             extra: Box::new(ConnectionExtra {
                 direction,
                 end_timestamp: 0,
@@ -585,14 +568,6 @@ impl Connection for ConnectionV6 {
         self.last_accessed_timestamp.load(Ordering::Relaxed)
     }
 
-    fn has_lifecycle_tracking(&self) -> bool {
-        self.lifecycle_tracked
-    }
-
-    fn mark_lifecycle_tracked(&mut self) {
-        self.lifecycle_tracked = true;
-    }
-
     fn set_last_accessed_time(&self, timestamp: u64) {
         self.last_accessed_timestamp
             .store(timestamp, Ordering::Relaxed);
@@ -613,7 +588,6 @@ impl Clone for ConnectionV6 {
             last_accessed_timestamp: AtomicU64::new(
                 self.last_accessed_timestamp.load(Ordering::Relaxed),
             ),
-            lifecycle_tracked: self.lifecycle_tracked,
             extra: self.extra.clone(),
         }
     }

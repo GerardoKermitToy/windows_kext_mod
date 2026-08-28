@@ -172,8 +172,9 @@ public:
     Driver(const Driver&) = delete;
     Driver& operator=(const Driver&) = delete;
 
-    // Installs (if needed) and starts the kernel service, then opens the device.
-    // sys_path must be an absolute path to the .sys file.
+    // Installs a new demand-start kernel service and starts it. Fails if a
+    // PortmasterKext service already exists instead of taking ownership of an
+    // independently managed driver instance. sys_path must be absolute.
     bool Install(const std::wstring& sys_path, std::string& error);
 
     // Opens the device with FILE_FLAG_OVERLAPPED, then starts the named-pipe
@@ -230,7 +231,8 @@ public:
     bool RequestCleanEndedConnections(std::string& error);
     bool RequestClearCache(std::string& error);
 
-    // Closes the handle, stops the service and deletes it from the SCM.
+    // Closes the device handle. Stops the service only if this instance started
+    // it, and deletes the service only if this instance created it.
     void Cleanup();
 
 private:

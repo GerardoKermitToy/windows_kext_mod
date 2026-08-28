@@ -663,9 +663,13 @@ fn associate_udp_flow_context(
     // From this point WFP owns the context. flowDeleteFn may already have claimed
     // it while FwpsFlowAssociateContext0 was returning.
     if device.udp_flow_cache.mark_associated(flow_context) {
-        device
+        // Touch only the exact cache instance that received this context. Besides
+        // confirming that tuple reuse has not replaced it, this records the
+        // association time as activity so the ten-minute fallback starts after
+        // flow establishment rather than an earlier packet-layer observation.
+        let _ = device
             .connection_cache
-            .mark_lifecycle_tracked(&key, connection_instance_id);
+            .touch_connection_instance(&key, connection_instance_id);
     }
 }
 

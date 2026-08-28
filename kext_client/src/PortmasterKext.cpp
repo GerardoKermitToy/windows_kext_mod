@@ -210,18 +210,15 @@ bool Driver::Install(const std::wstring& sys_path, std::string& error) {
     if (service == nullptr) {
         const DWORD err = GetLastError();
         if (err == ERROR_SERVICE_EXISTS) {
-            // A previous run left the service behind. Reuse it rather than
-            // failing, but do not claim ownership for deletion.
-            service = OpenServiceW(static_cast<SC_HANDLE>(scm_), service_name_.c_str(),
-                                   SERVICE_ALL_ACCESS);
-            if (service == nullptr) {
-                error = "OpenService failed: " + LastErrorText(GetLastError());
-                return false;
-            }
-        } else {
-            error = "CreateService failed: " + LastErrorText(err);
+            error = "the PortmasterKext service already exists; another controller may own it";
+            CloseServiceHandle(static_cast<SC_HANDLE>(scm_));
+            scm_ = nullptr;
             return false;
         }
+        error = "CreateService failed: " + LastErrorText(err);
+        CloseServiceHandle(static_cast<SC_HANDLE>(scm_));
+        scm_ = nullptr;
+        return false;
     }
     service_created_ = true;
 
@@ -287,7 +284,7 @@ void Driver::Cleanup() {
         return;
     }
 
-    if (service_created_) {
+    if (service_created_ || service_started_) {
         SC_HANDLE service = OpenServiceW(static_cast<SC_HANDLE>(scm_), service_name_.c_str(),
                                          SERVICE_ALL_ACCESS);
         if (service != nullptr) {
@@ -296,12 +293,14 @@ void Driver::Cleanup() {
                 // Best effort: the driver may already be unloading.
                 ControlService(service, SERVICE_CONTROL_STOP, &status);
             }
-            DeleteService(service);
+            if (service_created_) {
+                DeleteService(service);
+            }
             CloseServiceHandle(service);
         }
-        service_created_ = false;
-        service_started_ = false;
     }
+    service_created_ = false;
+    service_started_ = false;
 
     CloseServiceHandle(static_cast<SC_HANDLE>(scm_));
     scm_ = nullptr;

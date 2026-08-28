@@ -78,6 +78,55 @@ struct Options {
     uint8_t filter_protocol = 0;
 };
 
+// The monitor owns the driver's full userspace lifecycle: it loads the service,
+// drains a single event queue, and unloads the service when it exits. Letting two
+// instances do that independently can unload the WDF control device while the
+// other process still has an open file object. Keep the exclusion in userspace so
+// a duplicate exits before it touches either the SCM or the device.
+class SingleInstanceGuard {
+public:
+    ~SingleInstanceGuard() {
+        if (mutex_ != nullptr) {
+            if (owned_) {
+                ReleaseMutex(mutex_);
+            }
+            CloseHandle(mutex_);
+        }
+    }
+
+    bool Acquire(std::string& error) {
+        mutex_ = CreateMutexW(nullptr, TRUE, L"Global\\PortmasterKextMonitor.Singleton");
+        if (mutex_ == nullptr) {
+            error = "CreateMutexW failed: error " + std::to_string(GetLastError());
+            return false;
+        }
+
+        if (GetLastError() != ERROR_ALREADY_EXISTS) {
+            owned_ = true;
+            return true;
+        }
+
+        const DWORD wait = WaitForSingleObject(mutex_, 0);
+        if (wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED) {
+            owned_ = true;
+            return true;
+        }
+
+        if (wait == WAIT_TIMEOUT) {
+            error = "another kext_monitor instance is already running";
+        } else {
+            error = "WaitForSingleObject failed: error " + std::to_string(GetLastError());
+        }
+        CloseHandle(mutex_);
+        mutex_ = nullptr;
+        return false;
+    }
+
+private:
+    HANDLE mutex_ = nullptr;
+    bool owned_ = false;
+};
+
 bool ParseUnsignedDecimal(const wchar_t* text, uint64_t maximum, uint64_t& result) {
     if (text == nullptr || *text == L'\0') {
         return false;
@@ -507,6 +556,14 @@ int wmain(int argc, wchar_t** argv) {
 
     const std::wstring sys_path = ResolveSysPath(opt.sys_path);
 
+    SingleInstanceGuard single_instance;
+    std::string instance_error;
+    if (!single_instance.Acquire(instance_error)) {
+        std::printf("ERROR: %s. No service or device state was changed.\n",
+                    instance_error.c_str());
+        return 1;
+    }
+
     if (!opt.out_path.empty()) {
         g_out = _wfopen(opt.out_path.c_str(), L"w");
         if (g_out == nullptr) {
@@ -535,7 +592,7 @@ int wmain(int argc, wchar_t** argv) {
         std::printf("\nERROR: install failed: %s\n", error.c_str());
         return 1;
     }
-    std::printf("Service installed and started.\n");
+    std::printf("Service is available and running.\n");
 
     if (!driver.Open(error)) {
         std::printf("\nERROR: open device failed: %s\n", error.c_str());
@@ -887,7 +944,7 @@ int wmain(int argc, wchar_t** argv) {
     // before the process exits.
     driver.Cleanup();
     g_driver = nullptr;
-    std::printf("Service stopped and deleted.\n");
+    std::printf("Device closed; owned service state cleaned up.\n");
 
     if (g_out != nullptr && g_out != stdout) {
         std::fclose(g_out);

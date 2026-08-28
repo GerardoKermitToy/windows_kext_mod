@@ -1,3 +1,5 @@
+use core::ffi::c_void;
+
 use windows_sys::{
     Wdk::{
         Foundation::{IO_STACK_LOCATION_0_4, IRP},
@@ -26,11 +28,32 @@ impl CreateRequest<'_> {
         unsafe { crate::ffi::PsGetCurrentProcessId() as u32 }
     }
 
+    /// Returns the kernel file object that identifies this particular open.
+    /// The pointer is used only as an opaque identity token by the driver.
+    pub fn get_file_object(&self) -> *mut c_void {
+        unsafe {
+            let irp_sp = self
+                .irp
+                .Tail
+                .Overlay
+                .Anonymous2
+                .Anonymous
+                .CurrentStackLocation;
+            (*irp_sp).FileObject.cast()
+        }
+    }
+
     pub fn complete(&mut self) {
         // FILE_OPENED (1): indicates the device was opened (not created/superseded).
         const FILE_OPENED: usize = 1;
         self.irp.IoStatus.Information = FILE_OPENED;
         self.irp.IoStatus.Anonymous.Status = STATUS_SUCCESS;
+        unsafe { IofCompleteRequest(self.irp, IO_NO_INCREMENT as i8) };
+    }
+
+    pub fn fail(&mut self, status: NTSTATUS) {
+        self.irp.IoStatus.Information = 0;
+        self.irp.IoStatus.Anonymous.Status = status;
         unsafe { IofCompleteRequest(self.irp, IO_NO_INCREMENT as i8) };
     }
 
@@ -47,6 +70,44 @@ pub struct CleanupRequest<'a> {
 impl CleanupRequest<'_> {
     pub fn new(irp: &mut IRP) -> CleanupRequest<'_> {
         CleanupRequest { irp }
+    }
+
+    pub fn get_file_object(&self) -> *mut c_void {
+        unsafe {
+            let irp_sp = self
+                .irp
+                .Tail
+                .Overlay
+                .Anonymous2
+                .Anonymous
+                .CurrentStackLocation;
+            (*irp_sp).FileObject.cast()
+        }
+    }
+
+    pub fn complete(&mut self) {
+        self.irp.IoStatus.Information = 0;
+        self.irp.IoStatus.Anonymous.Status = STATUS_SUCCESS;
+        unsafe { IofCompleteRequest(self.irp, IO_NO_INCREMENT as i8) };
+    }
+
+    pub fn get_status(&self) -> NTSTATUS {
+        unsafe { self.irp.IoStatus.Anonymous.Status }
+    }
+}
+
+/// Wraps an IRP_MJ_CLOSE request.
+///
+/// The driver supplies a raw WDM dispatch table for its WDF control device, so
+/// CLOSE must be completed by the same table rather than falling back to KMDF's
+/// device dispatch after driver-owned teardown has begun.
+pub struct CloseRequest<'a> {
+    irp: &'a mut IRP,
+}
+
+impl CloseRequest<'_> {
+    pub fn new(irp: &mut IRP) -> CloseRequest<'_> {
+        CloseRequest { irp }
     }
 
     pub fn complete(&mut self) {
