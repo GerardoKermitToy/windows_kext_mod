@@ -59,6 +59,14 @@ fn get_protocol(data: &CalloutData, index: usize) -> IpProtocol {
     IpProtocol::from(data.get_value_u8(index))
 }
 
+fn get_protocol_if_present(data: &CalloutData, index: usize) -> Option<IpProtocol> {
+    matches!(data.get_value_type(index), ValueType::FwpUint8).then(|| get_protocol(data, index))
+}
+
+fn get_u16_if_present(data: &CalloutData, index: usize) -> Option<u16> {
+    matches!(data.get_value_type(index), ValueType::FwpUint16).then(|| data.get_value_u16(index))
+}
+
 /// Reads a `FWP_UINT32` field, returning 0 when the field is not populated.
 ///
 /// Several fields are only filled in at some layers. Reading the union member
@@ -633,85 +641,91 @@ pub fn endpoint_closure_v6(data: CalloutData) {
     }
 }
 
-/// Records the owning process when a TCP flow completes its three-way handshake.
+/// Refreshes the owning process when a TCP or UDP ALE flow becomes active.
 ///
-/// This layer fires after the SYN/SYN-ACK/ACK handshake completes, for both
-/// outbound and inbound connections. It provides a second opportunity to attribute
-/// flows that were created at the packet layer with PID=0 - either because the
-/// packet layer saw them before any ALE indication, or because of a race between
-/// the packet and ALE layers during connection setup.
+/// WFP indicates TCP here after the three-way handshake completes. UDP has no
+/// handshake, so its flow is indicated immediately after `ALE_AUTH_CONNECT` or
+/// `ALE_AUTH_RECV_ACCEPT` authorizes the first packet for a remote tuple.
 ///
-/// For outbound flows, the connect layer already runs before any packet is sent,
-/// so this adds no new information. For inbound flows, the packet layer creates
-/// the connection when it sees the first packet (often the SYN), and this layer
-/// fires immediately after the handshake completes, giving one more chance to
-/// resolve a PID=0 entry before user-visible logging.
+/// The authorization layers normally cache the flow with its owning PID. This
+/// layer provides a second opportunity to repair entries created by the packet
+/// fallback with PID 0, or entries whose earlier attribution was less reliable
+/// than the concrete application PID supplied for the established flow.
 ///
-/// This does NOT help connections that were fully established before the driver
-/// loaded - their handshake already finished, so this layer never fires for them.
+/// This does not help flows that were already active before the driver loaded:
+/// successful reauthorization does not produce another flow-established
+/// indication.
 ///
 /// Registered as an inspection callout.
 pub fn ale_flow_established_monitor(data: CalloutData) {
     let Some(device) = crate::entry::get_device() else {
         return;
     };
+    let Some(process_id) = data.get_process_id().filter(|pid| *pid != 0) else {
+        return;
+    };
 
-    let (ipv6, local_ip, local_port, remote_ip, remote_port, protocol) = match data.layer {
+    let key = match data.layer {
         layer::Layer::AleFlowEstablishedV4 => {
             type Fields = layer::FieldsAleFlowEstablishedV4;
-            (
-                false,
-                get_ipv4_address(&data, Fields::IpLocalAddress as usize),
-                data.get_value_u16(Fields::IpLocalPort as usize),
-                get_ipv4_address(&data, Fields::IpRemoteAddress as usize),
-                data.get_value_u16(Fields::IpRemotePort as usize),
-                get_protocol(&data, Fields::IpProtocol as usize),
-            )
+
+            let Some(protocol) = get_protocol_if_present(&data, Fields::IpProtocol as usize) else {
+                return;
+            };
+            if !matches!(protocol, IpProtocol::Tcp | IpProtocol::Udp) {
+                return;
+            }
+
+            let (Some(local_address), Some(local_port), Some(remote_address), Some(remote_port)) = (
+                get_ipv4_address_if_present(&data, Fields::IpLocalAddress as usize),
+                get_u16_if_present(&data, Fields::IpLocalPort as usize),
+                get_ipv4_address_if_present(&data, Fields::IpRemoteAddress as usize),
+                get_u16_if_present(&data, Fields::IpRemotePort as usize),
+            ) else {
+                return;
+            };
+
+            Key {
+                protocol,
+                local_address,
+                local_port,
+                remote_address,
+                remote_port,
+            }
         }
         layer::Layer::AleFlowEstablishedV6 => {
             type Fields = layer::FieldsAleFlowEstablishedV6;
-            (
-                true,
-                get_ipv6_address(&data, Fields::IpLocalAddress as usize),
-                data.get_value_u16(Fields::IpLocalPort as usize),
-                get_ipv6_address(&data, Fields::IpRemoteAddress as usize),
-                data.get_value_u16(Fields::IpRemotePort as usize),
-                get_protocol(&data, Fields::IpProtocol as usize),
-            )
+
+            let Some(protocol) = get_protocol_if_present(&data, Fields::IpProtocol as usize) else {
+                return;
+            };
+            if !matches!(protocol, IpProtocol::Tcp | IpProtocol::Udp) {
+                return;
+            }
+
+            let (Some(local_address), Some(local_port), Some(remote_address), Some(remote_port)) = (
+                get_ipv6_address_if_present(&data, Fields::IpLocalAddress as usize),
+                get_u16_if_present(&data, Fields::IpLocalPort as usize),
+                get_ipv6_address_if_present(&data, Fields::IpRemoteAddress as usize),
+                get_u16_if_present(&data, Fields::IpRemotePort as usize),
+            ) else {
+                return;
+            };
+
+            Key {
+                protocol,
+                local_address,
+                local_port,
+                remote_address,
+                remote_port,
+            }
         }
         _ => return,
     };
 
-    if protocol != IpProtocol::Tcp {
-        return;
-    }
-
-    let Some(process_id) = data.get_process_id() else {
-        return;
-    };
-
-    let key = Key {
-        protocol,
-        local_address: local_ip,
-        local_port,
-        remote_address: remote_ip,
-        remote_port,
-    };
-
-    // Check if connection exists in cache with PID=0, and if so, update it.
-    let cached_pid = if ipv6 {
-        device
-            .connection_cache
-            .read_connection_v6(&key, |conn| -> Option<u64> { Some(conn.process_id) })
-    } else {
-        device
-            .connection_cache
-            .read_connection_v4(&key, |conn| -> Option<u64> { Some(conn.process_id) })
-    };
-
-    if let Some(0) = cached_pid {
-        device.connection_cache.update_process_id(&key, process_id);
-    }
+    // update_process_id applies the PID precedence rules and safely does nothing
+    // when no matching cached tuple exists.
+    device.connection_cache.update_process_id(&key, process_id);
 }
 
 pub fn ale_resource_monitor(data: CalloutData) {

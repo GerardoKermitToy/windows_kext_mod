@@ -45,6 +45,14 @@ If another indication arrives while the cache entry is still `Undecided`, it is 
 - Permanent cached verdicts are applied directly on later ALE classifications.
 - Updating a cached verdict resets the resettable ALE filters so existing ALE-authorized flows are reauthorized against the new value.
 
+### Flow-established attribution
+
+The inspection callouts at `ALE_FLOW_ESTABLISHED_V4/V6` refresh the process ID of an existing TCP or UDP cache entry. TCP reaches this layer after its three-way handshake; UDP reaches it immediately after `ALE_AUTH_CONNECT` or `ALE_AUTH_RECV_ACCEPT` authorizes the first packet for a remote tuple. Required fixed fields are type-checked before the five-tuple is read, because the filters also see non-TCP/UDP protocols and generic flows that cannot be matched safely to an exact cache key.
+
+The cache's PID precedence rules ignore PID 0, prevent System (PID 4) from replacing a concrete application, and allow a concrete application PID to replace less reliable attribution. This repairs packet-layer fallback entries and refreshes the UDP owner without changing the cached verdict.
+
+`ALE_FLOW_ESTABLISHED` is not emitted again for successful reauthorization, so this monitor cannot attribute a flow that was already active when the driver loaded.
+
 `ALE_AUTH_RECV_ACCEPT` is a connection/remote-tuple authorization layer, not a per-packet layer. Consequently, inbound TCP/UDP verdicts apply to the ALE connection or UDP remote tuple. Per-packet temporary verdict processing remains only for flows owned by the outbound packet path.
 
 ## IP packet layer

@@ -42,12 +42,12 @@ impl ConnectionCache {
     /// replace a concrete application PID. Any other PID takes precedence and
     /// replaces the currently stored value, including 0 or 4.
     ///
-    /// The connections this does fix are the ones the inbound packet layer
-    /// created: no socket is associated with a packet at that layer, so WFP
-    /// supplies no process ID and the entry starts out at 0. Without this the
-    /// entry keeps that 0 for the life of the connection and every later packet
-    /// repeats the endpoint lookup - roughly 200 times for a single loopback
-    /// connection in the capture above.
+    /// Flow-established attribution uses this when an inbound packet-layer fallback
+    /// starts with PID 0 because no socket is associated at that layer, or when ALE
+    /// later supplies a concrete application PID that takes precedence over earlier
+    /// attribution. Without the PID-0 repair, every later packet repeats the endpoint
+    /// lookup - roughly 200 times for a single loopback connection in the capture
+    /// that motivated it.
     pub fn update_process_id(&mut self, key: &Key, process_id: u64) -> bool {
         // PID 0 carries no attribution and must never replace a stored value.
         if process_id == 0 {
