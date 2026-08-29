@@ -39,7 +39,7 @@ struct EchoKey {
 #[derive(Clone, Copy)]
 struct EchoEntry {
     process_id: u64,
-    /// Milliseconds since boot, from `get_system_timestamp_ms`.
+    /// Milliseconds since boot, from `get_monotonic_timestamp_ms`.
     inserted_at_ms: u64,
 }
 
@@ -93,7 +93,7 @@ impl IcmpEchoCache {
             return;
         }
 
-        let now = wdk::utils::get_system_timestamp_ms();
+        let now = wdk::utils::get_monotonic_timestamp_ms();
         let key = EchoKey {
             remote_address,
             identifier,
@@ -144,7 +144,7 @@ impl IcmpEchoCache {
 
         // Expiry is checked on read as well as on insert: an entry can sit here
         // long after its TTL if no insert forced a cleanup in between.
-        let now = wdk::utils::get_system_timestamp_ms();
+        let now = wdk::utils::get_monotonic_timestamp_ms();
         if now.saturating_sub(entry.inserted_at_ms) > ENTRY_TTL_MS {
             return None;
         }
@@ -165,7 +165,7 @@ impl IcmpEchoCache {
     /// Only expired entries go. A full clear would discard requests still in
     /// flight, and their replies would then be reported as PID 0.
     pub fn clean_expired_entries(&mut self) {
-        let now = wdk::utils::get_system_timestamp_ms();
+        let now = wdk::utils::get_monotonic_timestamp_ms();
 
         let _guard = self.lock.write_lock();
         self.entries

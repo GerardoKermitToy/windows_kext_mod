@@ -1,7 +1,8 @@
 use alloc::string::{String, ToString};
 use ntstatus::ntstatus::NtStatus;
 use windows_sys::{
-    Wdk::System::SystemServices::KeDelayExecutionThread, Win32::Foundation::STATUS_SUCCESS,
+    Wdk::System::SystemServices::{KeDelayExecutionThread, KeQueryInterruptTimePrecise},
+    Win32::Foundation::STATUS_SUCCESS,
 };
 
 use crate::ffi;
@@ -18,9 +19,19 @@ pub fn check_ntstatus(status: i32) -> Result<(), String> {
     return Err(status.to_string());
 }
 
-pub fn get_system_timestamp_ms() -> u64 {
-    // 100 nano seconds units -> device by 10 -> micro seconds -> divide by 1000 -> milliseconds
-    unsafe { ffi::pm_QuerySystemTime() / 10_000 }
+/// Returns monotonic elapsed time in milliseconds.
+///
+/// `KeQueryInterruptTimePrecise` is based on interrupt time rather than system
+/// time. It is not changed when the wall clock is adjusted and it includes time
+/// spent in low-power states, which makes it suitable for connection and cache
+/// expiry deadlines. The returned value is measured from system boot and is
+/// safe to query at any IRQL at which the driver runs.
+///
+/// The timestamp is one-based because connection state reserves zero to mean
+/// that no end time has been recorded.
+pub fn get_monotonic_timestamp_ms() -> u64 {
+    let mut qpc_timestamp = 0;
+    (unsafe { KeQueryInterruptTimePrecise(&mut qpc_timestamp) } / 10_000).saturating_add(1)
 }
 
 /// Delays the current kernel thread by a relative interval.

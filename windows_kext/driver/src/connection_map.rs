@@ -124,10 +124,10 @@ where
 }
 
 #[inline]
-fn get_system_timestamp_ms() -> u64 {
+fn get_monotonic_timestamp_ms() -> u64 {
     #[cfg(not(test))]
     {
-        wdk::utils::get_system_timestamp_ms()
+        wdk::utils::get_monotonic_timestamp_ms()
     }
 
     #[cfg(test)]
@@ -169,7 +169,7 @@ impl<T: Connection + Clone> ConnectionMap<T> {
             let range = equal_range(connections, (key.remote_address, key.remote_port));
             for conn in &mut connections[range] {
                 if conn.remote_equals(key) && !conn.has_ended() {
-                    conn.set_last_accessed_time(get_system_timestamp_ms());
+                    conn.set_last_accessed_time(get_monotonic_timestamp_ms());
                     return Some(conn);
                 }
             }
@@ -213,7 +213,7 @@ impl<T: Connection + Clone> ConnectionMap<T> {
                 live_and_ended_match(&connections[range], |conn| conn.remote_equals(key));
 
             if let Some(conn) = live_exact {
-                conn.set_last_accessed_time(get_system_timestamp_ms());
+                conn.set_last_accessed_time(get_monotonic_timestamp_ms());
                 return read_connection(conn);
             }
 
@@ -242,7 +242,7 @@ impl<T: Connection + Clone> ConnectionMap<T> {
                 None
             };
             if let Some(conn) = live_redirect.or(ended_match) {
-                conn.set_last_accessed_time(get_system_timestamp_ms());
+                conn.set_last_accessed_time(get_monotonic_timestamp_ms());
                 return read_connection(conn);
             }
         }
@@ -259,7 +259,7 @@ impl<T: Connection + Clone> ConnectionMap<T> {
                     && conn.get_instance_id() == instance_id
                     && !conn.has_ended()
                 {
-                    conn.set_last_accessed_time(get_system_timestamp_ms());
+                    conn.set_last_accessed_time(get_monotonic_timestamp_ms());
                     return true;
                 }
             }
@@ -288,7 +288,7 @@ impl<T: Connection + Clone> ConnectionMap<T> {
             let range = equal_range(connections, (key.remote_address, key.remote_port));
             for conn in &mut connections[range] {
                 if conn.remote_equals(&key) && !conn.has_ended() {
-                    conn.end(get_system_timestamp_ms());
+                    conn.end(get_monotonic_timestamp_ms());
                     return Some(conn.clone());
                 }
             }
@@ -309,7 +309,7 @@ impl<T: Connection + Clone> ConnectionMap<T> {
                     && conn.get_instance_id() == instance_id
                     && !conn.has_ended()
                 {
-                    conn.end(get_system_timestamp_ms());
+                    conn.end(get_monotonic_timestamp_ms());
                     return Some(conn.clone());
                 }
             }
@@ -346,7 +346,7 @@ impl<T: Connection + Clone> ConnectionMap<T> {
                     .unwrap_or(true);
 
                 if !conn.has_ended() && address_matches && process_matches {
-                    conn.end(get_system_timestamp_ms());
+                    conn.end(get_monotonic_timestamp_ms());
                     vec.push(conn.clone());
                 }
             }
@@ -368,7 +368,7 @@ impl<T: Connection + Clone> ConnectionMap<T> {
     /// user space cannot retain it indefinitely. This is bookkeeping only: removing
     /// a cache entry does not abort the WFP flow or close the application's socket.
     pub fn clean_ended_connections(&mut self) -> Vec<T> {
-        let now = get_system_timestamp_ms();
+        let now = get_monotonic_timestamp_ms();
         const TEN_MINUTES: u64 = Duration::from_secs(60 * 10).as_millis() as u64;
         let before_one_minute = now.saturating_sub(Duration::from_secs(60).as_millis() as u64);
         let mut inactive = Vec::new();
