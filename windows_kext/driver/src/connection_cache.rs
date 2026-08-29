@@ -7,31 +7,31 @@ use alloc::vec::Vec;
 use smoltcp::wire::{IpAddress, IpProtocol};
 use wdk::rw_spin_lock::RwSpinLock;
 
+/// Connection cache with a lock owning each map it protects.
+///
+/// This lets callers use the cache through a shared `Device` reference. A
+/// mutable reference to either map exists only while its write guard is alive.
 pub struct ConnectionCache {
-    connections_v4: ConnectionMap<ConnectionV4>,
-    connections_v6: ConnectionMap<ConnectionV6>,
-    lock_v4: RwSpinLock,
-    lock_v6: RwSpinLock,
+    connections_v4: RwSpinLock<ConnectionMap<ConnectionV4>>,
+    connections_v6: RwSpinLock<ConnectionMap<ConnectionV6>>,
 }
 
 impl ConnectionCache {
     pub fn new() -> Self {
         Self {
-            connections_v4: ConnectionMap::new(),
-            connections_v6: ConnectionMap::new(),
-            lock_v4: RwSpinLock::default(),
-            lock_v6: RwSpinLock::default(),
+            connections_v4: RwSpinLock::new(ConnectionMap::new()),
+            connections_v6: RwSpinLock::new(ConnectionMap::new()),
         }
     }
 
-    pub fn add_connection_v4(&mut self, connection: ConnectionV4) {
-        let _guard = self.lock_v4.write_lock();
-        self.connections_v4.add(connection);
+    pub fn add_connection_v4(&self, connection: ConnectionV4) {
+        let mut connections = self.connections_v4.write_lock();
+        connections.add(connection);
     }
 
-    pub fn add_connection_v6(&mut self, connection: ConnectionV6) {
-        let _guard = self.lock_v6.write_lock();
-        self.connections_v6.add(connection);
+    pub fn add_connection_v6(&self, connection: ConnectionV6) {
+        let mut connections = self.connections_v6.write_lock();
+        connections.add(connection);
     }
 
     /// Updates the owning process of a connection when the incoming PID is usable.
@@ -48,15 +48,15 @@ impl ConnectionCache {
     /// attribution. Without the PID-0 repair, every later packet repeats the endpoint
     /// lookup - roughly 200 times for a single loopback connection in the capture
     /// that motivated it.
-    pub fn update_process_id(&mut self, key: &Key, process_id: u64) -> bool {
+    pub fn update_process_id(&self, key: &Key, process_id: u64) -> bool {
         // PID 0 carries no attribution and must never replace a stored value.
         if process_id == 0 {
             return false;
         }
 
         if key.is_ipv6() {
-            let _guard = self.lock_v6.write_lock();
-            if let Some(conn) = self.connections_v6.get_mut(key) {
+            let mut connections = self.connections_v6.write_lock();
+            if let Some(conn) = connections.get_mut(key) {
                 // PID 4 may fill an unknown entry, while every other PID may
                 // replace the current value. A PID 4 must not replace a
                 // concrete application PID.
@@ -66,8 +66,8 @@ impl ConnectionCache {
                 }
             }
         } else {
-            let _guard = self.lock_v4.write_lock();
-            if let Some(conn) = self.connections_v4.get_mut(key) {
+            let mut connections = self.connections_v4.write_lock();
+            if let Some(conn) = connections.get_mut(key) {
                 if conn.process_id == 0 || process_id != 4 {
                     conn.process_id = process_id;
                     return true;
@@ -87,26 +87,26 @@ impl ConnectionCache {
     }
 
     /// Refreshes one exact live cache instance.
-    pub fn touch_connection_instance(&mut self, key: &Key, instance_id: u64) -> bool {
+    pub fn touch_connection_instance(&self, key: &Key, instance_id: u64) -> bool {
         if key.is_ipv6() {
-            let _guard = self.lock_v6.write_lock();
-            self.connections_v6.touch_instance(key, instance_id)
+            let mut connections = self.connections_v6.write_lock();
+            connections.touch_instance(key, instance_id)
         } else {
-            let _guard = self.lock_v4.write_lock();
-            self.connections_v4.touch_instance(key, instance_id)
+            let mut connections = self.connections_v4.write_lock();
+            connections.touch_instance(key, instance_id)
         }
     }
 
-    pub fn update_connection(&mut self, key: Key, verdict: Verdict) -> Option<RedirectInfo> {
+    pub fn update_connection(&self, key: Key, verdict: Verdict) -> Option<RedirectInfo> {
         if key.is_ipv6() {
-            let _guard = self.lock_v6.write_lock();
-            if let Some(conn) = self.connections_v6.get_mut(&key) {
+            let mut connections = self.connections_v6.write_lock();
+            if let Some(conn) = connections.get_mut(&key) {
                 conn.verdict = verdict;
                 return conn.redirect_info();
             }
         } else {
-            let _guard = self.lock_v4.write_lock();
-            if let Some(conn) = self.connections_v4.get_mut(&key) {
+            let mut connections = self.connections_v4.write_lock();
+            if let Some(conn) = connections.get_mut(&key) {
                 conn.verdict = verdict;
                 return conn.redirect_info();
             }
@@ -121,8 +121,8 @@ impl ConnectionCache {
         key: &Key,
         process_connection: fn(&ConnectionV4) -> Option<T>,
     ) -> Option<T> {
-        let _guard = self.lock_v4.read_lock();
-        self.connections_v4.read(key, process_connection)
+        let connections = self.connections_v4.read_lock();
+        connections.read(key, process_connection)
     }
 
     /// Reads a live IPv6 connection. Ended entries are not current connection
@@ -132,8 +132,8 @@ impl ConnectionCache {
         key: &Key,
         process_connection: fn(&ConnectionV6) -> Option<T>,
     ) -> Option<T> {
-        let _guard = self.lock_v6.read_lock();
-        self.connections_v6.read(key, process_connection)
+        let connections = self.connections_v6.read_lock();
+        connections.read(key, process_connection)
     }
 
     /// Reads current IPv4 state, falling back to an ended entry only for a late
@@ -143,9 +143,8 @@ impl ConnectionCache {
         key: &Key,
         process_connection: fn(&ConnectionV4) -> Option<T>,
     ) -> Option<T> {
-        let _guard = self.lock_v4.read_lock();
-        self.connections_v4
-            .read_with_ended_fallback(key, process_connection)
+        let connections = self.connections_v4.read_lock();
+        connections.read_with_ended_fallback(key, process_connection)
     }
 
     /// Reads current IPv6 state, falling back to an ended entry only for a late
@@ -155,71 +154,68 @@ impl ConnectionCache {
         key: &Key,
         process_connection: fn(&ConnectionV6) -> Option<T>,
     ) -> Option<T> {
-        let _guard = self.lock_v6.read_lock();
-        self.connections_v6
-            .read_with_ended_fallback(key, process_connection)
+        let connections = self.connections_v6.read_lock();
+        connections.read_with_ended_fallback(key, process_connection)
     }
 
     pub fn end_connection_instance_v4(
-        &mut self,
+        &self,
         key: Key,
         instance_id: u64,
     ) -> Option<ConnectionV4> {
-        let _guard = self.lock_v4.write_lock();
-        self.connections_v4.end_instance(key, instance_id)
+        let mut connections = self.connections_v4.write_lock();
+        connections.end_instance(key, instance_id)
     }
 
     pub fn end_connection_instance_v6(
-        &mut self,
+        &self,
         key: Key,
         instance_id: u64,
     ) -> Option<ConnectionV6> {
-        let _guard = self.lock_v6.write_lock();
-        self.connections_v6.end_instance(key, instance_id)
+        let mut connections = self.connections_v6.write_lock();
+        connections.end_instance(key, instance_id)
     }
 
-    pub fn end_connection_v4(&mut self, key: Key) -> Option<ConnectionV4> {
-        let _guard = self.lock_v4.write_lock();
-        self.connections_v4.end(key)
+    pub fn end_connection_v4(&self, key: Key) -> Option<ConnectionV4> {
+        let mut connections = self.connections_v4.write_lock();
+        connections.end(key)
     }
 
-    pub fn end_connection_v6(&mut self, key: Key) -> Option<ConnectionV6> {
-        let _guard = self.lock_v6.write_lock();
-        self.connections_v6.end(key)
+    pub fn end_connection_v6(&self, key: Key) -> Option<ConnectionV6> {
+        let mut connections = self.connections_v6.write_lock();
+        connections.end(key)
     }
 
     pub fn end_all_on_endpoint_v4(
-        &mut self,
+        &self,
         key: (IpProtocol, u16),
         local_address: Option<IpAddress>,
         process_id: Option<u64>,
     ) -> Option<Vec<ConnectionV4>> {
-        let _guard = self.lock_v4.write_lock();
-        self.connections_v4
-            .end_all_on_endpoint(key, local_address, process_id)
+        let mut connections = self.connections_v4.write_lock();
+        connections.end_all_on_endpoint(key, local_address, process_id)
     }
 
     pub fn end_all_on_endpoint_v6(
-        &mut self,
+        &self,
         key: (IpProtocol, u16),
         local_address: Option<IpAddress>,
         process_id: Option<u64>,
     ) -> Option<Vec<ConnectionV6>> {
-        let _guard = self.lock_v6.write_lock();
-        self.connections_v6
-            .end_all_on_endpoint(key, local_address, process_id)
+        let mut connections = self.connections_v6.write_lock();
+        connections.end_all_on_endpoint(key, local_address, process_id)
     }
 
     /// Cleans retained history and returns UDP entries expired by the fallback
     /// inactivity watchdog. The caller must publish END for each returned entry.
-    pub fn clean_ended_connections(&mut self) -> (Vec<ConnectionV4>, Vec<ConnectionV6>) {
+    pub fn clean_ended_connections(&self) -> (Vec<ConnectionV4>, Vec<ConnectionV6>) {
         let inactive_v4 = {
-            let _guard = self.lock_v4.write_lock();
-            self.connections_v4.clean_ended_connections()
+            let mut connections = self.connections_v4.write_lock();
+            connections.clean_ended_connections()
         };
         let inactive_v6 = {
-            let _guard = self.lock_v6.write_lock();
-            self.connections_v6.clean_ended_connections()
+            let mut connections = self.connections_v6.write_lock();
+            connections.clean_ended_connections()
         };
         (inactive_v4, inactive_v6)
     }
@@ -229,27 +225,25 @@ impl ConnectionCache {
     pub fn live_udp_instance_ids(&self) -> Vec<u64> {
         let mut instance_ids = Vec::new();
         {
-            let _guard = self.lock_v4.read_lock();
-            self.connections_v4
-                .append_live_udp_instance_ids(&mut instance_ids);
+            let connections = self.connections_v4.read_lock();
+            connections.append_live_udp_instance_ids(&mut instance_ids);
         }
         {
-            let _guard = self.lock_v6.read_lock();
-            self.connections_v6
-                .append_live_udp_instance_ids(&mut instance_ids);
+            let connections = self.connections_v6.read_lock();
+            connections.append_live_udp_instance_ids(&mut instance_ids);
         }
         instance_ids.sort_unstable();
         instance_ids
     }
 
-    pub fn clear(&mut self) {
+    pub fn clear(&self) {
         {
-            let _guard = self.lock_v4.write_lock();
-            self.connections_v4.clear();
+            let mut connections = self.connections_v4.write_lock();
+            connections.clear();
         }
         {
-            let _guard = self.lock_v6.write_lock();
-            self.connections_v6.clear();
+            let mut connections = self.connections_v6.write_lock();
+            connections.clear();
         }
     }
 
@@ -257,15 +251,17 @@ impl ConnectionCache {
     pub fn get_entries_count(&self) -> usize {
         let mut size = 0;
         {
-            let _guard = self.lock_v4.read_lock();
-            size += self.connections_v4.get_count();
+            let connections = self.connections_v4.read_lock();
+            size += connections.get_count();
         }
 
         {
-            let _guard = self.lock_v6.read_lock();
-            size += self.connections_v6.get_count();
+            let connections = self.connections_v6.read_lock();
+            size += connections.get_count();
         }
 
-        return size;
+        size
     }
 }
+
+// End of connection cache.

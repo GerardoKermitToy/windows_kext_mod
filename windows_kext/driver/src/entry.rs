@@ -109,9 +109,9 @@ impl Drop for DispatchGuard<'_> {
 
 static DISPATCH_GATE: DispatchGate = DispatchGate::new();
 
-pub fn get_device() -> Option<&'static mut device::Device> {
+pub fn get_device() -> Option<&'static device::Device> {
     // Acquire pairs with the Release store in driver_entry and the AcqRel swap in driver_unload.
-    unsafe { DEVICE.load(Ordering::Acquire).as_mut() }
+    unsafe { DEVICE.load(Ordering::Acquire).as_ref() }
 }
 
 // DriverEntry is the entry point of the driver (main function). Will be called when driver is loaded.

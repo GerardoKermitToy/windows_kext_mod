@@ -16,6 +16,7 @@ use wdk::{
     },
     ioqueue::{self, IOQueue},
     irp_helpers::{ReadRequest, WriteRequest},
+    rw_spin_lock::RwSpinLock,
 };
 
 use crate::{
@@ -40,23 +41,23 @@ pub enum Packet {
 
 // Device Context
 pub struct Device {
-    pub(crate) filter_engine: FilterEngine,
-    pub(crate) read_leftover: ArrayHolder,
+    pub(crate) filter_engine: RwSpinLock<FilterEngine>,
+    pub(crate) read_leftover: RwSpinLock<ArrayHolder>,
     pub(crate) event_queue: IOQueue<Info>, // Queue for events to user-space
-    pub(crate) packet_cache: IdCache,      // Cache of pending packets waiting for verdict
+    pub(crate) packet_cache: RwSpinLock<IdCache>, // Cache of pending packets waiting for verdict
     pub(crate) connection_cache: ConnectionCache, // Cache of connections and their verdicts
     /// UDP remote tuples grouped by WFP transport endpoint handle. A UDP socket
     /// receives one endpoint-closure indication regardless of its remote peers.
-    pub(crate) udp_endpoint_cache: UdpEndpointCache,
+    pub(crate) udp_endpoint_cache: RwSpinLock<UdpEndpointCache>,
     /// Contexts currently owned by WFP for per-peer UDP ALE flows.
     pub(crate) udp_flow_cache: UdpFlowCache,
     /// (remote address, echo identifier) -> PID that sent the request.
     /// An inbound echo reply has no process of its own to read, so it is matched
     /// against the outbound request that caused it.
-    pub(crate) icmp_echo_cache: IcmpEchoCache,
+    pub(crate) icmp_echo_cache: RwSpinLock<IcmpEchoCache>,
     pub(crate) injector: Injector,
     pub(crate) network_allocator: NetworkAllocator,
-    pub(crate) bandwidth_stats: Bandwidth,
+    pub(crate) bandwidth_stats: RwSpinLock<Bandwidth>,
     /// File object for the one accepted user-mode device open. The pointer is an
     /// opaque identity token; it is never dereferenced. A rejected CREATE gets a
     /// different file object, so its CLEANUP cannot release the active owner.
@@ -65,6 +66,10 @@ pub struct Device {
     /// current Portmaster process. Zero means that no device open is accepted.
     pub(crate) owner_pid: AtomicU32,
 }
+
+// All mutable/non-Sync state is accessed through its owning lock. The remaining
+// members either provide their own synchronization or are immutable after init.
+unsafe impl Sync for Device {}
 
 impl Device {
     /// Initialize all members of the device. Memory is handled by windows.
@@ -79,17 +84,17 @@ impl Device {
         filter_engine.commit(callouts::get_callout_vec())?;
 
         Ok(Self {
-            filter_engine,
-            read_leftover: ArrayHolder::default(),
-            event_queue: IOQueue::new(),
-            packet_cache: IdCache::new(),
+            filter_engine: RwSpinLock::new(filter_engine),
+            read_leftover: RwSpinLock::new(ArrayHolder::default()),
+            event_queue: IOQueue::new(), // Queue for events to user-space
+            packet_cache: RwSpinLock::new(IdCache::new()), // Cache of pending packets waiting for verdict
             connection_cache: ConnectionCache::new(),
-            udp_endpoint_cache: UdpEndpointCache::new(),
+            udp_endpoint_cache: RwSpinLock::new(UdpEndpointCache::new()),
             udp_flow_cache: UdpFlowCache::new(),
-            icmp_echo_cache: IcmpEchoCache::new(),
+            icmp_echo_cache: RwSpinLock::new(IcmpEchoCache::new()),
             injector: Injector::new(),
             network_allocator: NetworkAllocator::new(),
-            bandwidth_stats: Bandwidth::new(),
+            bandwidth_stats: RwSpinLock::new(Bandwidth::new()),
             owner_file_object: AtomicPtr::new(core::ptr::null_mut()),
             owner_pid: AtomicU32::new(0),
         })
@@ -101,27 +106,33 @@ impl Device {
         p != 0 && p == pid
     }
 
-    fn write_buffer(&mut self, read_request: &mut ReadRequest, info: Info) {
+    fn write_buffer(&self, read_request: &mut ReadRequest, info: Info) {
         let bytes = info.as_bytes();
         let count = read_request.write(bytes);
 
         // Check if the full buffer was written.
         if count < bytes.len() {
             // Save the leftovers for later.
-            self.read_leftover.save(&bytes[count..]);
+            let leftover = self.read_leftover.write_lock();
+            leftover.save(&bytes[count..]);
         }
     }
 
     /// Called when handle. Read is called from user-space.
-    pub fn read(&mut self, read_request: &mut ReadRequest) {
-        if let Some(data) = self.read_leftover.load() {
+    pub fn read(&self, read_request: &mut ReadRequest) {
+        let leftover_data = {
+            let leftover = self.read_leftover.write_lock();
+            leftover.load()
+        };
+        if let Some(data) = leftover_data {
             // There are leftovers from previous request.
             let count = read_request.write(&data);
 
             // Check if full command was written.
             if count < data.len() {
                 // Save the leftovers for later.
-                self.read_leftover.save(&data[count..]);
+                let leftover = self.read_leftover.write_lock();
+                leftover.save(&data[count..]);
             }
         } else {
             // Noting left from before. Wait for next commands.
@@ -158,7 +169,7 @@ impl Device {
     }
 
     // Called when handle.Write is called from user-space.
-    pub fn write(&mut self, write_request: &mut WriteRequest) {
+    pub fn write(&self, write_request: &mut WriteRequest) {
         // Try parsing the command.
         let mut buffer = write_request.get_buffer();
         let command = protocol::command::parse_type(buffer);
@@ -177,7 +188,11 @@ impl Device {
                 let verdict = protocol::command::parse_verdict(buffer);
                 wdk::dbg!("Verdict command");
                 // Received verdict decision for a specific connection.
-                if let Some((key, mut packet)) = self.packet_cache.pop_id(verdict.id) {
+                let packet = {
+                    let mut packet_cache = self.packet_cache.write_lock();
+                    packet_cache.pop_id(verdict.id)
+                };
+                if let Some((key, mut packet)) = packet {
                     if let Some(verdict) = FromPrimitive::from_u8(verdict.verdict) {
                         dbg!("Verdict received {}: {}", key, verdict);
                         // Add verdict in the cache.
@@ -260,7 +275,8 @@ impl Device {
                     );
                     // Packet-layer lookups observe cache updates on the next packet.
                     // ALE-authorized flows need an explicit policy reauthorization.
-                    if let Err(err) = self.filter_engine.reset_all_filters() {
+                    let mut filter_engine = self.filter_engine.write_lock();
+                    if let Err(err) = filter_engine.reset_all_filters() {
                         err!("failed to reauthorize connections: {}", err);
                     }
                 } else {
@@ -289,7 +305,8 @@ impl Device {
                     );
                     // Packet-layer lookups observe cache updates on the next packet.
                     // ALE-authorized flows need an explicit policy reauthorization.
-                    if let Err(err) = self.filter_engine.reset_all_filters() {
+                    let mut filter_engine = self.filter_engine.write_lock();
+                    if let Err(err) = filter_engine.reset_all_filters() {
                         err!("failed to reauthorize connections: {}", err);
                     }
                 } else {
@@ -299,9 +316,13 @@ impl Device {
             CommandType::ClearCache => {
                 wdk::dbg!("ClearCache command");
                 self.connection_cache.clear();
-                self.udp_endpoint_cache.clear();
+                {
+                    let mut endpoint_cache = self.udp_endpoint_cache.write_lock();
+                    endpoint_cache.clear();
+                }
                 self.clean_udp_lifecycle_state();
-                if let Err(err) = self.filter_engine.reset_all_filters() {
+                let mut filter_engine = self.filter_engine.write_lock();
+                if let Err(err) = filter_engine.reset_all_filters() {
                     err!("failed to reset filters: {}", err);
                 }
             }
@@ -314,22 +335,34 @@ impl Device {
             }
             CommandType::GetBandwidthStats => {
                 wdk::dbg!("GetBandwidthStats command");
-                let stats = self.bandwidth_stats.get_all_updates_tcp_v4();
+                let stats = {
+                    let mut bandwidth_stats = self.bandwidth_stats.write_lock();
+                    bandwidth_stats.get_all_updates_tcp_v4()
+                };
                 if let Some(stats) = stats {
                     _ = self.event_queue.push(stats);
                 }
 
-                let stats = self.bandwidth_stats.get_all_updates_tcp_v6();
+                let stats = {
+                    let mut bandwidth_stats = self.bandwidth_stats.write_lock();
+                    bandwidth_stats.get_all_updates_tcp_v6()
+                };
                 if let Some(stats) = stats {
                     _ = self.event_queue.push(stats);
                 }
 
-                let stats = self.bandwidth_stats.get_all_updates_udp_v4();
+                let stats = {
+                    let mut bandwidth_stats = self.bandwidth_stats.write_lock();
+                    bandwidth_stats.get_all_updates_udp_v4()
+                };
                 if let Some(stats) = stats {
                     _ = self.event_queue.push(stats);
                 }
 
-                let stats = self.bandwidth_stats.get_all_updates_udp_v6();
+                let stats = {
+                    let mut bandwidth_stats = self.bandwidth_stats.write_lock();
+                    bandwidth_stats.get_all_updates_udp_v6()
+                };
                 if let Some(stats) = stats {
                     _ = self.event_queue.push(stats);
                 }
@@ -377,7 +410,8 @@ impl Device {
                 //
                 // Doing it here also keeps the sweep off the packet path - the
                 // only other one runs inside a callout at DISPATCH_LEVEL.
-                self.icmp_echo_cache.clean_expired_entries();
+                let mut icmp_echo_cache = self.icmp_echo_cache.write_lock();
+                icmp_echo_cache.clean_expired_entries();
             }
         }
     }
@@ -422,8 +456,8 @@ impl Device {
     /// Snapshot order is intentional: endpoint and flow state are captured before
     /// live connections. Any association created concurrently is therefore visible
     /// in the later live snapshot or remains untouched until the next pass.
-    fn clean_udp_lifecycle_state(&mut self) {
-        let endpoint_instances = self.udp_endpoint_cache.instance_ids();
+    fn clean_udp_lifecycle_state(&self) {
+        let endpoint_instances = self.udp_endpoint_cache.write_lock().instance_ids();
         let flow_candidates = self.udp_flow_cache.removal_candidates();
         let live_instances = self.connection_cache.live_udp_instance_ids();
 
@@ -431,9 +465,10 @@ impl Device {
             .into_iter()
             .filter(|instance_id| live_instances.binary_search(instance_id).is_err())
             .collect();
-        let _ = self
-            .udp_endpoint_cache
-            .remove_instances(stale_endpoint_instances);
+        {
+            let mut endpoint_cache = self.udp_endpoint_cache.write_lock();
+            let _ = endpoint_cache.remove_instances(stale_endpoint_instances);
+        }
 
         for (flow_context, connection_instance_id) in flow_candidates {
             if live_instances
@@ -456,7 +491,7 @@ impl Device {
     /// `FwpsCalloutUnregisterById0` returns STATUS_DEVICE_BUSY while any context
     /// remains associated. Keep the global Device pointer valid until the resulting
     /// flowDeleteFn callbacks have drained this cache.
-    pub fn prepare_unload(&mut self) {
+    pub fn prepare_unload(&self) {
         self.udp_flow_cache.start_shutdown();
         while !self.udp_flow_cache.is_drained() {
             for registration in self.udp_flow_cache.pending_removals() {
@@ -472,12 +507,15 @@ impl Device {
         }
     }
 
-    pub fn shutdown(&mut self) {
+    pub fn shutdown(&self) {
         // End blocking operations from the queue. This will end pending read requests.
         self.event_queue.rundown();
 
         // Resolve all pending packets. This is important for proper driver unload.
-        let pending_packets = self.packet_cache.pop_all();
+        let pending_packets = {
+            let mut packet_cache = self.packet_cache.write_lock();
+            packet_cache.pop_all()
+        };
         for el in pending_packets {
             let key = el.value.0;
             let packet = el.value.1;
@@ -488,10 +526,11 @@ impl Device {
             _ = self.inject_packet(packet, true); // Complete ALE pends and discard all packet clones.
         }
 
-        self.udp_endpoint_cache.clear();
+        let mut endpoint_cache = self.udp_endpoint_cache.write_lock();
+        endpoint_cache.clear();
     }
 
-    pub fn inject_packet(&mut self, packet: Packet, blocked: bool) -> Result<(), String> {
+    pub fn inject_packet(&self, packet: Packet, blocked: bool) -> Result<(), String> {
         match packet {
             Packet::PacketLayer(nbls, inject_info) => {
                 if !blocked {
@@ -502,7 +541,10 @@ impl Device {
                 Ok(())
             }
             Packet::AleLayer(defer) => {
-                let packet_list = defer.complete(&mut self.filter_engine, !blocked)?;
+                let packet_list = {
+                    let mut filter_engine = self.filter_engine.write_lock();
+                    defer.complete(&mut filter_engine, !blocked)?
+                };
                 if !blocked {
                     if let Some(packet_list) = packet_list {
                         self.injector.inject_packet_list_transport(packet_list)?;

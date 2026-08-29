@@ -192,16 +192,15 @@ fn udp_endpoint_handle(data: &CalloutData) -> Option<u64> {
 /// Associates an endpoint only after a concrete live connection-cache instance
 /// exists. This avoids unbound peers that no flow callback or periodic cleanup can
 /// identify precisely.
-fn track_udp_endpoint_instance(device: &mut Device, endpoint_handle: Option<u64>, key: Key) {
+fn track_udp_endpoint_instance(device: &Device, endpoint_handle: Option<u64>, key: Key) {
     let (Some(endpoint_handle), Some(instance_id)) = (
         endpoint_handle,
         device.connection_cache.get_connection_instance_id(&key),
     ) else {
         return;
     };
-    let _ = device
-        .udp_endpoint_cache
-        .associate_instance(endpoint_handle, key, instance_id);
+    let mut endpoint_cache = device.udp_endpoint_cache.write_lock();
+    let _ = endpoint_cache.associate_instance(endpoint_handle, key, instance_id);
 }
 
 fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
@@ -346,12 +345,15 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
                 // Connection is already pended. Save packet and wait for verdict.
                 match save_packet(device, &mut data, &ale_data, false) {
                     Ok(packet) => {
-                        let info = device.packet_cache.push(
-                            (key, packet),
-                            ale_data.process_id,
-                            ale_data.direction,
-                            true,
-                        );
+                        let info = {
+                            let mut packet_cache = device.packet_cache.write_lock();
+                            packet_cache.push(
+                                (key, packet),
+                                ale_data.process_id,
+                                ale_data.direction,
+                                true,
+                            )
+                        };
                         if let Some(info) = info {
                             let _ = device.event_queue.push(info);
                         }
@@ -459,10 +461,10 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
         }
 
         track_udp_endpoint_instance(device, endpoint_handle, key);
-        let info =
-            device
-                .packet_cache
-                .push((key, packet), ale_data.process_id, ale_data.direction, true);
+        let info = {
+            let mut packet_cache = device.packet_cache.write_lock();
+            packet_cache.push((key, packet), ale_data.process_id, ale_data.direction, true)
+        };
         if let Some(info) = info {
             let _ = device.event_queue.push(info);
         }
@@ -578,7 +580,7 @@ fn create_packet_list(
     )))
 }
 
-pub(crate) fn emit_connection_end_v4(device: &mut Device, conn: ConnectionV4, process_id: u64) {
+pub(crate) fn emit_connection_end_v4(device: &Device, conn: ConnectionV4, process_id: u64) {
     let info = protocol::info::connection_end_event_v4_info(
         if conn.process_id == 0 {
             process_id
@@ -595,7 +597,7 @@ pub(crate) fn emit_connection_end_v4(device: &mut Device, conn: ConnectionV4, pr
     let _ = device.event_queue.push(info);
 }
 
-pub(crate) fn emit_connection_end_v6(device: &mut Device, conn: ConnectionV6, process_id: u64) {
+pub(crate) fn emit_connection_end_v6(device: &Device, conn: ConnectionV6, process_id: u64) {
     let info = protocol::info::connection_end_event_v6_info(
         if conn.process_id == 0 {
             process_id
@@ -642,7 +644,7 @@ pub(crate) fn reclaim_udp_flow_context(
 /// WFP owns `flow_context` after association succeeds and returns it exactly once
 /// through `udp_flow_delete` when the peer flow expires or its socket closes.
 fn associate_udp_flow_context(
-    device: &mut Device,
+    device: &Device,
     data: &CalloutData,
     key: Key,
     endpoint_handle: Option<u64>,
@@ -661,11 +663,8 @@ fn associate_udp_flow_context(
     };
     let endpoint_association_added = endpoint_handle
         .map(|endpoint_handle| {
-            device.udp_endpoint_cache.associate_instance(
-                endpoint_handle,
-                key,
-                connection_instance_id,
-            )
+            let mut endpoint_cache = device.udp_endpoint_cache.write_lock();
+            endpoint_cache.associate_instance(endpoint_handle, key, connection_instance_id)
         })
         .unwrap_or(false);
     let registration = UdpFlowRegistration::new(
@@ -688,7 +687,8 @@ fn associate_udp_flow_context(
         }
         if endpoint_association_added {
             if let Some(endpoint_handle) = endpoint_handle {
-                let _ = device.udp_endpoint_cache.dissociate(
+                let mut endpoint_cache = device.udp_endpoint_cache.write_lock();
+                let _ = endpoint_cache.dissociate(
                     endpoint_handle,
                     key,
                     connection_instance_id,
@@ -705,7 +705,8 @@ fn associate_udp_flow_context(
         reclaim_udp_flow_context(device, flow_context, connection_instance_id);
         if endpoint_association_added {
             if let Some(endpoint_handle) = endpoint_handle {
-                let _ = device.udp_endpoint_cache.dissociate(
+                let mut endpoint_cache = device.udp_endpoint_cache.write_lock();
+                let _ = endpoint_cache.dissociate(
                     endpoint_handle,
                     key,
                     connection_instance_id,
@@ -770,7 +771,8 @@ pub(crate) unsafe extern "C" fn udp_flow_delete(
     };
 
     if let Some(endpoint_handle) = context.endpoint_handle {
-        device.udp_endpoint_cache.dissociate(
+        let mut endpoint_cache = device.udp_endpoint_cache.write_lock();
+        let _ = endpoint_cache.dissociate(
             endpoint_handle,
             context.key,
             context.connection_instance_id,
@@ -795,8 +797,12 @@ pub(crate) unsafe extern "C" fn udp_flow_delete(
     flow_cache.finish_callback();
 }
 
-fn end_udp_endpoint(device: &mut Device, endpoint_handle: u64, process_id: u64) {
-    let Some(endpoint) = device.udp_endpoint_cache.take(endpoint_handle) else {
+fn end_udp_endpoint(device: &Device, endpoint_handle: u64, process_id: u64) {
+    let endpoint = {
+        let mut endpoint_cache = device.udp_endpoint_cache.write_lock();
+        endpoint_cache.take(endpoint_handle)
+    };
+    let Some(endpoint) = endpoint else {
         return;
     };
 
@@ -819,7 +825,7 @@ fn end_udp_endpoint(device: &mut Device, endpoint_handle: u64, process_id: u64) 
 }
 
 fn end_local_endpoint_v4(
-    device: &mut Device,
+    device: &Device,
     protocol: IpProtocol,
     local_port: u16,
     local_address: Option<IpAddress>,
@@ -837,7 +843,7 @@ fn end_local_endpoint_v4(
 }
 
 fn end_local_endpoint_v6(
-    device: &mut Device,
+    device: &Device,
     protocol: IpProtocol,
     local_port: u16,
     local_address: Option<IpAddress>,

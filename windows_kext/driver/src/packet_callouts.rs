@@ -268,7 +268,7 @@ fn ip_packet_layer(
         if matches!(direction, Direction::Outbound)
             && key.protocol == smoltcp::wire::IpProtocol::Tcp
             && is_tcp_reset_from_nbl(&nbl, ipv6)
-            && get_connection_info(&mut device.connection_cache, &key, ipv6).is_none()
+            && get_connection_info(&device.connection_cache, &key, ipv6).is_none()
         {
             data.action_permit();
             return;
@@ -323,9 +323,11 @@ fn ip_packet_layer(
                             //    reports it as OUTBOUND, and we have no cached request.
                             //
                             // Distinguish by checking if we have a cached request.
-                            let request_pid = device
-                                .icmp_echo_cache
-                                .take_request_pid(key.remote_address, echo.identifier);
+                            let request_pid = {
+                                let mut icmp_echo_cache = device.icmp_echo_cache.write_lock();
+                                icmp_echo_cache
+                                    .take_request_pid(key.remote_address, echo.identifier)
+                            };
 
                             if let Some(pid) = request_pid {
                                 // Case 1: Found our request > this is a reply to us.
@@ -344,11 +346,14 @@ fn ip_packet_layer(
                             process_id = wdk::utils::current_process_id();
 
                             // Remember the request so its reply can be attributed.
-                            device.icmp_echo_cache.insert_request(
-                                key.remote_address,
-                                echo.identifier,
-                                process_id,
-                            );
+                            {
+                                let mut icmp_echo_cache = device.icmp_echo_cache.write_lock();
+                                icmp_echo_cache.insert_request(
+                                    key.remote_address,
+                                    echo.identifier,
+                                    process_id,
+                                );
+                            }
                         }
                     } else {
                         // Not an ICMP echo (request or reply), but still outbound
@@ -365,10 +370,12 @@ fn ip_packet_layer(
                     // it to their original request if we cached it.
                     if let Some(echo) = get_icmp_echo_from_nbl(&nbl, ipv6) {
                         if !echo.is_request {
-                            process_id = device
-                                .icmp_echo_cache
-                                .take_request_pid(key.remote_address, echo.identifier)
-                                .unwrap_or(0);
+                            process_id = {
+                                let mut icmp_echo_cache = device.icmp_echo_cache.write_lock();
+                                icmp_echo_cache
+                                    .take_request_pid(key.remote_address, echo.identifier)
+                                    .unwrap_or(0)
+                            };
                         }
                     }
                 }
@@ -380,7 +387,7 @@ fn ip_packet_layer(
             smoltcp::wire::IpProtocol::Tcp | smoltcp::wire::IpProtocol::Udp
         ) {
             if let Some(mut conn_info) =
-                get_connection_info(&mut device.connection_cache, &key, ipv6)
+                get_connection_info(&device.connection_cache, &key, ipv6)
             {
                 // A connection authorized by ALE_AUTH_RECV_ACCEPT is enforced at
                 // that layer for its lifetime. Do not classify either direction of
@@ -495,9 +502,10 @@ fn ip_packet_layer(
                 }
             };
 
-            let info = device
-                .packet_cache
-                .push((key, packet), process_id, effective_direction, false);
+            let info = {
+                let mut packet_cache = device.packet_cache.write_lock();
+                packet_cache.push((key, packet), process_id, effective_direction, false)
+            };
 
             // Send to Portmaster
             if let Some(info) = info {
@@ -509,7 +517,7 @@ fn ip_packet_layer(
 }
 
 fn clone_packet(
-    device: &mut Device,
+    device: &Device,
     nbl: NetBufferList,
     direction: Direction,
     ipv6: bool,
@@ -548,7 +556,7 @@ fn clone_packet(
 }
 
 fn get_connection_info(
-    connection_cache: &mut ConnectionCache,
+    connection_cache: &ConnectionCache,
     key: &Key,
     ipv6: bool,
 ) -> Option<ConnectionInfo> {

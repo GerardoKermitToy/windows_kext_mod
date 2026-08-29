@@ -32,7 +32,7 @@ pub fn stream_layer_tcp_v4(data: CalloutData) {
     let remote_port = data.get_value_u16(Fields::IpRemotePort as usize);
     match direction {
         Direction::Outbound => {
-            device.bandwidth_stats.update_tcp_v4_tx(
+            device.bandwidth_stats.write_lock().update_tcp_v4_tx(
                 bandwidth::Key {
                     local_ip,
                     local_port,
@@ -43,7 +43,7 @@ pub fn stream_layer_tcp_v4(data: CalloutData) {
             );
         }
         Direction::Inbound => {
-            device.bandwidth_stats.update_tcp_v4_rx(
+            device.bandwidth_stats.write_lock().update_tcp_v4_rx(
                 bandwidth::Key {
                     local_ip,
                     local_port,
@@ -85,7 +85,7 @@ pub fn stream_layer_tcp_v6(data: CalloutData) {
 
     match direction {
         Direction::Outbound => {
-            device.bandwidth_stats.update_tcp_v6_tx(
+            device.bandwidth_stats.write_lock().update_tcp_v6_tx(
                 bandwidth::Key {
                     local_ip,
                     local_port,
@@ -96,7 +96,7 @@ pub fn stream_layer_tcp_v6(data: CalloutData) {
             );
         }
         Direction::Inbound => {
-            device.bandwidth_stats.update_tcp_v6_rx(
+            device.bandwidth_stats.write_lock().update_tcp_v6_rx(
                 bandwidth::Key {
                     local_ip,
                     local_port,
@@ -205,7 +205,7 @@ pub fn stream_layer_udp_v4(data: CalloutData) {
     let remote_port = data.get_value_u16(Fields::IpRemotePort as usize);
     match direction {
         Direction::Outbound => {
-            device.bandwidth_stats.update_udp_v4_tx(
+            device.bandwidth_stats.write_lock().update_udp_v4_tx(
                 bandwidth::Key {
                     local_ip,
                     local_port,
@@ -216,7 +216,7 @@ pub fn stream_layer_udp_v4(data: CalloutData) {
             );
         }
         Direction::Inbound => {
-            device.bandwidth_stats.update_udp_v4_rx(
+            device.bandwidth_stats.write_lock().update_udp_v4_rx(
                 bandwidth::Key {
                     local_ip,
                     local_port,
@@ -268,7 +268,7 @@ pub fn stream_layer_udp_v6(data: CalloutData) {
     let remote_port = data.get_value_u16(Fields::IpRemotePort as usize);
     match direction {
         Direction::Outbound => {
-            device.bandwidth_stats.update_udp_v6_tx(
+            device.bandwidth_stats.write_lock().update_udp_v6_tx(
                 bandwidth::Key {
                     local_ip,
                     local_port,
@@ -279,7 +279,7 @@ pub fn stream_layer_udp_v6(data: CalloutData) {
             );
         }
         Direction::Inbound => {
-            device.bandwidth_stats.update_udp_v6_rx(
+            device.bandwidth_stats.write_lock().update_udp_v6_rx(
                 bandwidth::Key {
                     local_ip,
                     local_port,
