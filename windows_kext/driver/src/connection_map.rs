@@ -359,8 +359,12 @@ impl<T: Connection + Clone> ConnectionMap<T> {
         self.0.clear();
     }
 
-    /// Removes ended history and returns UDP entries that have been idle for ten
-    /// minutes.
+    /// Removes ended history and returns live UDP entries that have been idle for
+    /// ten minutes.
+    ///
+    /// Live TCP entries are not expired by inactivity. They remain cached until a
+    /// native lifecycle indication ends them, the cache is cleared, or the driver
+    /// unloads.
     ///
     /// WFP's documented UDP idle lifetime is not a reliable callback deadline on
     /// current Windows versions. Native flow deletion can end a connection earlier,
@@ -381,10 +385,10 @@ impl<T: Connection + Clone> ConnectionMap<T> {
                     return c.get_end_time() >= before_one_minute;
                 }
 
-                if now.saturating_sub(c.get_last_accessed_time()) >= TEN_MINUTES {
-                    if c.get_protocol() == IpProtocol::Udp {
-                        inactive.push(c.clone());
-                    }
+                if c.get_protocol() == IpProtocol::Udp
+                    && now.saturating_sub(c.get_last_accessed_time()) >= TEN_MINUTES
+                {
+                    inactive.push(c.clone());
                     return false;
                 }
 
@@ -585,14 +589,17 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_silently_discards_untracked_tcp_as_before() {
+    fn cleanup_keeps_inactive_live_tcp_until_lifecycle_end() {
         let mut tuple = key([203, 0, 113, 4], 443);
         tuple.protocol = IpProtocol::Tcp;
+        let conn = live(&tuple, 10);
+        conn.set_last_accessed_time(Duration::from_secs(50 * 60).as_millis() as u64);
         let mut map = ConnectionMap::new();
-        map.add(live(&tuple, 10));
+        map.add(conn);
 
         assert!(map.clean_ended_connections().is_empty());
-        assert_eq!(map.get_count(), 0);
+        assert_eq!(map.get_count(), 1);
+        assert_eq!(map.read(&tuple, read_process_id), Some(10));
     }
 
     #[test]
