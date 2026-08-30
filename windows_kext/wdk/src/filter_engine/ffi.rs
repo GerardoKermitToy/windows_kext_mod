@@ -3,6 +3,7 @@ use crate::ffi::FwpsCalloutClassifyFn;
 use crate::ffi::{FwpsCalloutRegister3, FwpsCalloutUnregisterById0, FWPS_CALLOUT3, FWPS_FILTER2};
 use crate::utils::check_ntstatus;
 use alloc::string::String;
+use ntstatus::ntstatus::NtStatus;
 
 use core::mem::MaybeUninit;
 use core::ptr;
@@ -24,6 +25,12 @@ use windows_sys::{
 };
 
 use super::layer::Layer;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UnregisterCalloutResult {
+    Removed,
+    Busy,
+}
 
 pub(crate) fn create_filter_engine() -> Result<HANDLE, String> {
     unsafe {
@@ -88,13 +95,9 @@ unsafe extern "C" fn generic_notify(
     return STATUS_SUCCESS;
 }
 
-pub(crate) fn register_callout(
+pub(crate) fn register_runtime_callout(
     device_object: *mut DEVICE_OBJECT,
-    filter_engine_handle: HANDLE,
-    name: &str,
-    description: &str,
     guid: u128,
-    layer: Layer,
     callout_fn: FwpsCalloutClassifyFn,
     flow_delete_fn: Option<crate::ffi::FwpsCalloutFlowDeleteNotifyFn>,
 ) -> Result<u32, String> {
@@ -109,13 +112,19 @@ pub(crate) fn register_callout(
     unsafe {
         let mut callout_id: u32 = 0;
         let status = FwpsCalloutRegister3(device_object as _, &s_callout, &mut callout_id);
-
         check_ntstatus(status)?;
-
-        callout_add(filter_engine_handle, guid, layer, name, description)?;
-
-        return Ok(callout_id);
+        Ok(callout_id)
     }
+}
+
+pub(crate) fn register_management_callout(
+    filter_engine_handle: HANDLE,
+    guid: u128,
+    layer: Layer,
+    name: &str,
+    description: &str,
+) -> Result<(), String> {
+    callout_add(filter_engine_handle, guid, layer, name, description)
 }
 
 fn callout_add(
@@ -153,12 +162,16 @@ fn callout_add(
     return Ok(());
 }
 
-pub(crate) fn unregister_callout(callout_id: u32) -> Result<(), String> {
+pub(crate) fn unregister_callout(callout_id: u32) -> Result<UnregisterCalloutResult, String> {
     unsafe {
         let status = FwpsCalloutUnregisterById0(callout_id);
-
-        check_ntstatus(status as i32)?;
-        return Ok(());
+        match NtStatus::try_from(status as u32) {
+            Ok(NtStatus::STATUS_SUCCESS) | Ok(NtStatus::STATUS_FWP_CALLOUT_NOT_FOUND) => {
+                Ok(UnregisterCalloutResult::Removed)
+            }
+            Ok(NtStatus::STATUS_DEVICE_BUSY) => Ok(UnregisterCalloutResult::Busy),
+            _ => check_ntstatus(status).map(|()| UnregisterCalloutResult::Removed),
+        }
     }
 }
 

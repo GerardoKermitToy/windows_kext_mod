@@ -287,10 +287,10 @@ unsafe extern "system" fn driver_unload(_object: *const DRIVER_OBJECT) {
     DISPATCH_GATE.wait_for_reads();
 
     if let Some(device) = get_device() {
-        // Stop new flow callbacks and drain contexts while the event queue and
-        // the rest of Device are still usable.  Flow-delete callbacks are the
-        // only WFP callbacks still admitted in this phase and are counted by
-        // the second half of the common callback barrier.
+        // Drain flow contexts and unregister every runtime callout while the
+        // event queue and the rest of Device are still usable. Flow-delete
+        // callbacks are the only WFP callbacks still admitted in this phase and
+        // are counted by the second half of the common callback barrier.
         device.prepare_unload();
 
         // No flow context or callback may remain before any Device field is
@@ -305,9 +305,9 @@ unsafe extern "system" fn driver_unload(_object: *const DRIVER_OBJECT) {
     }
 
     // Null the global pointer only after every user dispatch and WFP callback
-    // has drained.  FilterEngine::drop then unregisters callouts and deletes
-    // WFP state while the callback barrier rejects any late callback before it
-    // can inspect a Callout or Device pointer.
+    // has drained. prepare_unload already removed all runtime callouts and
+    // closed their dynamic FWPM session; FilterEngine::drop is an idempotent
+    // last-resort cleanup path.
     let ptr = DEVICE.swap(core::ptr::null_mut(), Ordering::AcqRel);
     if !ptr.is_null() {
         unsafe {

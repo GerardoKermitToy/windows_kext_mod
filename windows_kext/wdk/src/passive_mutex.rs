@@ -3,7 +3,7 @@ use core::{
     cell::UnsafeCell,
     fmt,
     marker::PhantomData,
-    mem::{ManuallyDrop, MaybeUninit},
+    mem::ManuallyDrop,
     ops::{Deref, DerefMut},
 };
 
@@ -44,6 +44,21 @@ impl fmt::Display for PassiveMutexError {
     }
 }
 
+/// Opaque, correctly sized backing storage for the x64 WDK `ERESOURCE` ABI.
+///
+/// The pinned windows-rs revision omits the x64-only `MiscFlags`, `Reserved1`,
+/// and `ResourceTimeoutCount` fields and therefore declares `ERESOURCE` as
+/// 0x60 bytes. Current WDK headers and Windows 11 use 0x68 bytes. Allocating the
+/// generated type lets `ExInitializeResourceLite` write past the allocation;
+/// the overflow corrupts the following pool block and later crashes release.
+#[repr(C, align(8))]
+struct ExecutiveResourceStorage([u8; 0x68]);
+
+const _: () = {
+    assert!(core::mem::size_of::<ExecutiveResourceStorage>() == 0x68);
+    assert!(core::mem::align_of::<ExecutiveResourceStorage>() >= 8);
+};
+
 /// An exclusive mutex for state that may call APIs restricted to PASSIVE_LEVEL.
 ///
 /// Unlike a spin lock, an executive resource does not raise the current IRQL
@@ -52,20 +67,17 @@ impl fmt::Display for PassiveMutexError {
 /// call PASSIVE_LEVEL-only kernel APIs.
 pub struct PassiveMutex<T> {
     value: UnsafeCell<ManuallyDrop<T>>,
-    // ERESOURCE must remain at a stable address for its entire initialized
-    // lifetime. Keeping it in a nonpaged Box prevents moving the initialized
-    // kernel object when this wrapper itself is moved. UnsafeCell documents
-    // that the kernel mutates the resource through shared wrapper references.
-    resource: Box<UnsafeCell<ERESOURCE>>,
+    // Keep the opaque x64 WDK object in nonpaged storage at a stable address.
+    // Do not allocate `windows_sys::ERESOURCE` directly: that generated type is
+    // shorter than the kernel ABI used by the supported Windows builds.
+    resource: Box<UnsafeCell<ExecutiveResourceStorage>>,
     initialized: bool,
 }
 
 impl<T> PassiveMutex<T> {
     /// Creates and initializes a passive-level mutex containing `value`.
     pub fn new(value: T) -> Result<Self, PassiveMutexError> {
-        let resource = Box::new(UnsafeCell::new(unsafe {
-            MaybeUninit::zeroed().assume_init()
-        }));
+        let resource = Box::new(UnsafeCell::new(ExecutiveResourceStorage([0; 0x68])));
         let mut mutex = Self {
             value: UnsafeCell::new(ManuallyDrop::new(value)),
             resource,
@@ -83,7 +95,7 @@ impl<T> PassiveMutex<T> {
 
     #[inline]
     fn resource_ptr(&self) -> *mut ERESOURCE {
-        self.resource.get()
+        self.resource.get().cast::<ERESOURCE>()
     }
 
     /// Acquires the mutex without changing the caller's IRQL.

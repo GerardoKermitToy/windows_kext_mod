@@ -12,7 +12,7 @@ use wdk::{
         callout_data::ClassifyDefer,
         net_buffer::{NetBufferList, NetworkAllocator},
         packet::{InjectInfo, Injector},
-        FilterEngine,
+        FilterEngine, UnregisterCalloutsResult,
     },
     ioqueue::{self, IOQueue},
     irp_helpers::{ReadRequest, WriteRequest},
@@ -558,13 +558,20 @@ impl Device {
         }
     }
 
-    /// Removes every context still owned by WFP before callout unregistration.
+    /// Drains every context still owned by WFP and then unregisters all runtime
+    /// callouts before the Device or its Callout allocations can be released.
     ///
     /// `FwpsCalloutUnregisterById0` returns STATUS_DEVICE_BUSY while any context
     /// remains associated. Keep the global Device pointer valid until the resulting
-    /// flowDeleteFn callbacks have drained this cache.
+    /// flowDeleteFn callbacks have drained this cache and WFP confirms that every
+    /// runtime registration is gone.
     pub fn prepare_unload(&self) {
         self.udp_flow_cache.start_shutdown();
+        self.drain_udp_flow_contexts();
+        self.unregister_wfp_state();
+    }
+
+    fn drain_udp_flow_contexts(&self) {
         while !self.udp_flow_cache.is_drained() {
             for registration in self.udp_flow_cache.pending_removals() {
                 self.remove_udp_flow_context(registration);
@@ -576,6 +583,29 @@ impl Device {
                 // the WFP removal call itself failed.
                 wdk::utils::sleep_ms(1);
             }
+        }
+    }
+
+    fn unregister_wfp_state(&self) {
+        loop {
+            let result = match self.filter_engine.lock() {
+                Ok(mut filter_engine) => filter_engine.unregister_all(),
+                Err(err) => Err(format!("failed to acquire filter engine: {}", err)),
+            };
+
+            match result {
+                Ok(UnregisterCalloutsResult::Complete) => return,
+                Ok(UnregisterCalloutsResult::Busy) => {
+                    self.drain_udp_flow_contexts();
+                    crate::err!(
+                        "WFP callout unregister is busy; retrying after flow-context removal"
+                    );
+                }
+                Err(err) => {
+                    crate::err!("failed to tear down WFP state: {}", err);
+                }
+            }
+            wdk::utils::sleep_ms(1);
         }
     }
 

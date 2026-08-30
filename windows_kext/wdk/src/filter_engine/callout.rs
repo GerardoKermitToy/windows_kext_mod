@@ -82,30 +82,40 @@ impl Callout {
         return Ok(());
     }
 
-    pub(crate) fn register_callout(
+    /// Registers the runtime FWPS callout and records its ID immediately.
+    /// Runtime registration is not covered by the FWPM transaction.
+    pub(crate) fn register_runtime_callout(
         &mut self,
-        filter_engine_handle: HANDLE,
         device_object: *mut DEVICE_OBJECT,
         callout_fn: FwpsCalloutClassifyFn,
     ) -> Result<(), String> {
-        match ffi::register_callout(
+        match ffi::register_runtime_callout(
             device_object,
-            filter_engine_handle,
-            &self.name,
-            &self.description,
             self.guid,
-            self.layer,
             callout_fn,
             self.flow_delete_fn,
         ) {
             Ok(id) => {
                 self.registered = true;
                 self.id = id;
+                Ok(())
             }
-            Err(code) => {
-                return Err(format!("failed to register callout: {}", code));
-            }
-        };
-        return Ok(());
+            Err(code) => Err(format!("failed to register callout: {}", code)),
+        }
+    }
+
+    /// Adds the FWPM callout object to the current management transaction.
+    pub(crate) fn register_management_callout(
+        &self,
+        filter_engine_handle: HANDLE,
+    ) -> Result<(), String> {
+        ffi::register_management_callout(
+            filter_engine_handle,
+            self.guid,
+            self.layer,
+            &self.name,
+            &self.description,
+        )
+        .map_err(|error| format!("failed to register management callout: {}", error))
     }
 }

@@ -40,6 +40,14 @@ pub struct FilterEngine {
     callouts: Option<Vec<Box<Callout>>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UnregisterCalloutsResult {
+    /// All runtime callouts are gone and the dynamic FWPM session is closed.
+    Complete,
+    /// At least one callout still owns a WFP flow context.
+    Busy,
+}
+
 impl FilterEngine {
     pub fn new(driver: &Driver, layer_guid: u128) -> Result<Self, String> {
         let filter_engine_handle: HANDLE;
@@ -61,59 +69,68 @@ impl FilterEngine {
     }
 
     pub fn commit(&mut self, callouts: Vec<Callout>) -> Result<(), String> {
-        {
-            // Begin write transaction. This is also a lock guard.
-            let mut filter_engine = match Transaction::begin_write(self) {
-                Ok(transaction) => transaction,
-                Err(err) => {
-                    return Err(err);
-                }
-            };
-
-            if let Err(err) = filter_engine.register_sublayer() {
-                return Err(format!("filter_engine: {}", err));
-            }
-
-            dbg!("Callouts count: {}", callouts.len());
-            let mut boxed_callouts = Vec::new();
-            // Register all callouts
-            for callout in callouts {
-                let mut callout = Box::new(callout);
-                callout.address = callout.as_ref() as *const Callout as u64;
-
-                if let Err(err) = callout.register_callout(
-                    filter_engine.handle,
-                    filter_engine.device_object,
-                    catch_all_callout,
-                ) {
-                    // This will destroy the callout structs.
-                    return Err(err);
-                }
-                if let Err(err) =
-                    callout.register_filter(filter_engine.handle, filter_engine.sublayer_guid)
-                {
-                    // This will destroy the callout structs.
-                    return Err(err);
-                }
-                dbg!(
-                    "registering callout: {} -> {}",
-                    callout.name,
-                    callout.filter_id
-                );
-                boxed_callouts.push(callout)
-            }
-            if let Some(callouts) = &mut filter_engine.callouts {
-                callouts.append(&mut boxed_callouts);
-            } else {
-                filter_engine.callouts = Some(boxed_callouts);
-            }
-
-            filter_engine.commit()?
+        if self.committed || self.callouts.is_some() {
+            return Err("filter engine is already initialized".to_owned());
         }
+        if self.handle.is_null() || self.handle == INVALID_HANDLE_VALUE {
+            return Err("filter engine session is closed".to_owned());
+        }
+
+        // Runtime FWPS registrations are outside the FWPM transaction. Publish
+        // each Box before its first fallible registration so rollback always has
+        // both the runtime ID and the callback's backing allocation.
+        self.callouts = Some(Vec::new());
+        let result = self.commit_inner(callouts);
+        if let Err(err) = result {
+            // commit_inner has returned, so its Transaction guard has already
+            // aborted the FWPM transaction. Runtime registrations must be
+            // removed separately before their Boxes can be released.
+            self.rollback_until_clean();
+            self.callouts = None;
+            return Err(err);
+        }
+
         self.committed = true;
         info!("transaction committed");
+        Ok(())
+    }
 
-        return Ok(());
+    fn commit_inner(&mut self, callouts: Vec<Callout>) -> Result<(), String> {
+        let mut filter_engine = Transaction::begin_write(self)?;
+        filter_engine
+            .register_sublayer()
+            .map_err(|err| format!("filter_engine: {}", err))?;
+
+        dbg!("Callouts count: {}", callouts.len());
+        let device_object = filter_engine.device_object;
+        let filter_engine_handle = filter_engine.handle;
+        let sublayer_guid = filter_engine.sublayer_guid;
+
+        for callout in callouts {
+            let mut callout = Box::new(callout);
+            callout.address = callout.as_ref() as *const Callout as u64;
+
+            let callouts = filter_engine
+                .callouts
+                .as_mut()
+                .ok_or_else(|| "callout storage was not initialized".to_owned())?;
+            callouts.push(callout);
+            let callout = callouts
+                .last_mut()
+                .ok_or_else(|| "newly inserted callout is missing".to_owned())?;
+
+            callout.register_runtime_callout(device_object, catch_all_callout)?;
+            callout.register_management_callout(filter_engine_handle)?;
+            callout.register_filter(filter_engine_handle, sublayer_guid)?;
+
+            dbg!(
+                "registering callout: {} -> {}",
+                callout.name,
+                callout.filter_id
+            );
+        }
+
+        filter_engine.commit()
     }
 
     /// Recreates resettable filters and forces WFP to reauthorize existing flows.
@@ -165,37 +182,97 @@ impl FilterEngine {
             return Err(format!("failed to register sublayer: {}", code));
         }
 
-        return Ok(());
+        Ok(())
+    }
+
+    fn unregister_runtime_callouts(&mut self) -> Result<UnregisterCalloutsResult, String> {
+        let Some(callouts) = self.callouts.as_mut() else {
+            return Ok(UnregisterCalloutsResult::Complete);
+        };
+
+        for callout in callouts.iter_mut() {
+            if !callout.registered {
+                continue;
+            }
+
+            match ffi::unregister_callout(callout.id)
+                .map_err(|err| format!("failed to unregister callout {}: {}", callout.name, err))?
+            {
+                ffi::UnregisterCalloutResult::Removed => {
+                    // Retain the ID and Box after every failure. Clear them only
+                    // once WFP confirms that this runtime registration is gone.
+                    callout.registered = false;
+                    callout.id = 0;
+                }
+                ffi::UnregisterCalloutResult::Busy => {
+                    return Ok(UnregisterCalloutsResult::Busy);
+                }
+            }
+        }
+
+        Ok(UnregisterCalloutsResult::Complete)
+    }
+
+    fn close_dynamic_session(&mut self) -> Result<(), String> {
+        if self.handle.is_null() || self.handle == INVALID_HANDLE_VALUE {
+            return Ok(());
+        }
+
+        // The session is dynamic, so a successful close synchronously removes
+        // its filters, management callouts, and sublayer. Runtime FWPS callouts
+        // were removed above because they are not owned by this session.
+        ffi::filter_engine_close(self.handle)
+            .map_err(|err| format!("failed to close filter engine: {}", err))?;
+        self.handle = INVALID_HANDLE_VALUE;
+        self.committed = false;
+
+        if let Some(callouts) = self.callouts.as_mut() {
+            for callout in callouts {
+                callout.filter_id = 0;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Unregisters all runtime callouts and closes the dynamic FWPM session.
+    ///
+    /// `STATUS_DEVICE_BUSY` is retryable after the owner removes all associated
+    /// flow contexts. Until WFP confirms removal, every runtime ID and backing
+    /// Callout Box remains live. The caller must run at PASSIVE_LEVEL.
+    pub fn unregister_all(&mut self) -> Result<UnregisterCalloutsResult, String> {
+        let result = self.unregister_runtime_callouts()?;
+        if result == UnregisterCalloutsResult::Busy {
+            return Ok(result);
+        }
+
+        self.close_dynamic_session()?;
+        Ok(UnregisterCalloutsResult::Complete)
+    }
+
+    /// Last-resort cleanup for construction failures and destructor paths.
+    /// Returning while a runtime callout still points into this driver would be
+    /// unsafe, so retry rather than freeing its ID or backing allocation.
+    fn rollback_until_clean(&mut self) {
+        loop {
+            match self.unregister_all() {
+                Ok(UnregisterCalloutsResult::Complete) => return,
+                Ok(UnregisterCalloutsResult::Busy) => {
+                    dbg!("callout cleanup is waiting for WFP flow contexts");
+                }
+                Err(err) => {
+                    dbg!("callout cleanup failed: {}", err);
+                }
+            }
+            crate::utils::sleep_ms(1);
+        }
     }
 }
 
 impl Drop for FilterEngine {
     fn drop(&mut self) {
         dbg!("Unregistering callouts");
-        if let Some(callouts) = &self.callouts {
-            for callout in callouts {
-                if callout.registered {
-                    if let Err(code) = ffi::unregister_callout(callout.id) {
-                        dbg!("failed to unregister callout: {}", code);
-                    }
-                    if callout.filter_id != 0 {
-                        if let Err(code) = ffi::unregister_filter(self.handle, callout.filter_id) {
-                            dbg!("failed to unregister filter: {}", code)
-                        }
-                    }
-                }
-            }
-        }
-
-        if self.committed {
-            if let Err(code) = ffi::unregister_sublayer(self.handle, self.sublayer_guid) {
-                dbg!("Failed to unregister sublayer: {}", code);
-            }
-        }
-
-        if !self.handle.is_null() && self.handle != INVALID_HANDLE_VALUE {
-            _ = ffi::filter_engine_close(self.handle);
-        }
+        self.rollback_until_clean();
     }
 }
 
