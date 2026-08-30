@@ -89,17 +89,31 @@ impl Device {
     /// Initialize all members of the device. Memory is handled by windows.
     /// Make sure everything is initialized here.
     pub fn new(driver: &Driver) -> Result<Self, String> {
-        let mut filter_engine =
-            match FilterEngine::new(driver, 0x7dab1057_8e2b_40c4_9b85_693e381d7896) {
-                Ok(fe) => fe,
-                Err(err) => return Err(alloc::format!("filter engine error: {}", err)),
-            };
+        let filter_engine = FilterEngine::new(driver, 0x7dab1057_8e2b_40c4_9b85_693e381d7896)
+            .map_err(|err| alloc::format!("filter engine error: {}", err))?;
+        // Initialize the passive-level lock before registering any WFP state.
+        // If lock initialization fails, the unregistered FilterEngine can be
+        // dropped without a callback/Device lifetime race.
+        let filter_engine = PassiveMutex::new(filter_engine)
+            .map_err(|err| format!("filter engine lock error: {}", err))?;
 
-        filter_engine.commit(callouts::get_callout_vec())?;
+        {
+            let mut filter_engine_guard = filter_engine
+                .lock()
+                .map_err(|err| format!("failed to acquire filter engine: {}", err))?;
+            if let Err(err) = filter_engine_guard.commit(callouts::get_callout_vec()) {
+                // FilterEngine owns runtime WFP callback targets even while this
+                // Device is still being constructed.  Close callback admission
+                // before the lock and FilterEngine are dropped on this error
+                // path.
+                drop(filter_engine_guard);
+                wdk::callback_barrier::CALLBACK_BARRIER.close_all_and_wait();
+                return Err(err);
+            }
+        }
 
         Ok(Self {
-            filter_engine: PassiveMutex::new(filter_engine)
-                .map_err(|err| format!("filter engine lock error: {}", err))?,
+            filter_engine,
             read_leftover: RwSpinLock::new(ArrayHolder::default()),
             event_queue: IOQueue::new(), // Queue for events to user-space
             packet_cache: RwSpinLock::new(IdCache::new()), // Cache of pending packets waiting for verdict
@@ -619,6 +633,10 @@ impl Device {
 
 impl Drop for Device {
     fn drop(&mut self) {
+        // Normal unload closes this barrier before reaching Drop.  Keep the
+        // guard here as a last line of defense for an initialization/error path
+        // that destroys Device through a different route.
+        wdk::callback_barrier::CALLBACK_BARRIER.close_all_and_wait();
         _ = logger::flush();
         // dbg!("Device Context drop called.");
     }

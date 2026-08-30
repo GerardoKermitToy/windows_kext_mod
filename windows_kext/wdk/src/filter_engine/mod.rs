@@ -209,6 +209,15 @@ unsafe extern "C" fn catch_all_callout(
     flow_context: u64,
     classify_out: *mut ClassifyOut,
 ) {
+    // This must be acquired before touching `filter.context`: the Callout box
+    // containing that context is owned by Device and is freed during unload.
+    // A callback that arrives after admission closes is from a WFP teardown race;
+    // leave the classify result untouched and, most importantly, do not
+    // dereference memory owned by the retiring Device.
+    let Some(_callback_guard) = crate::callback_barrier::CALLBACK_BARRIER.enter_classify() else {
+        return;
+    };
+
     let filter = &(*filter);
     // Filter context is the address of the callout.
     let callout = filter.context as *mut Callout;

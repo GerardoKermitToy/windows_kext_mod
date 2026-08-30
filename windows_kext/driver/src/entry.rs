@@ -191,6 +191,14 @@ impl Drop for SessionGuard<'_> {
 
 static DISPATCH_GATE: DispatchGate = DispatchGate::new();
 
+/// Loads the published Device pointer.
+///
+/// This is only a publication/load operation; it does not keep the allocation
+/// alive. WFP classify callers must hold the callback barrier guard acquired by
+/// the common trampoline, and user-mode dispatch callers must hold a
+/// DispatchGate guard, for the entire duration of their Device access. Unload
+/// closes both admission paths and waits for their guards before swapping and
+/// dropping the pointer.
 pub fn get_device() -> Option<&'static device::Device> {
     // Acquire pairs with the Release store in driver_entry and the AcqRel swap in driver_unload.
     unsafe { DEVICE.load(Ordering::Acquire).as_ref() }
@@ -204,6 +212,10 @@ pub extern "system" fn driver_entry(
     registry_path: *mut windows_sys::Win32::Foundation::UNICODE_STRING,
 ) -> windows_sys::Win32::Foundation::NTSTATUS {
     info!("Starting initialization...");
+    if !wdk::callback_barrier::CALLBACK_BARRIER.start() {
+        err!("driver_entry: callback barrier is still in use");
+        return windows_sys::Win32::Foundation::STATUS_FAILED_DRIVER_ENTRY;
+    }
     DISPATCH_GATE.reopen();
 
     // Initialize driver object.
@@ -215,6 +227,9 @@ pub extern "system" fn driver_entry(
     ) {
         Ok(driver) => driver,
         Err(status) => {
+            // No WFP callbacks should remain admitted if initialization aborts
+            // before the DriverUnload pointer is installed.
+            wdk::callback_barrier::CALLBACK_BARRIER.close_all_and_wait();
             err!("driver_entry: failed to initialize driver: {}", status);
             return windows_sys::Win32::Foundation::STATUS_FAILED_DRIVER_ENTRY;
         }
@@ -233,6 +248,10 @@ pub extern "system" fn driver_entry(
     let device = match device::Device::new(&driver) {
         Ok(device) => Box::new(device),
         Err(err) => {
+            // Device::new may have registered WFP callbacks before a later
+            // initialization step failed.  Close admission even on this error
+            // path so no callback can outlive the temporary FilterEngine state.
+            wdk::callback_barrier::CALLBACK_BARRIER.close_all_and_wait();
             wdk::err!("filed to initialize device: {}", err);
             return -1;
         }
@@ -248,9 +267,12 @@ pub extern "system" fn driver_entry(
 unsafe extern "system" fn driver_unload(_object: *const DRIVER_OBJECT) {
     info!("Unloading driver");
 
-    // Close admission before touching Device so no new dispatch can acquire a
-    // reference while teardown is being prepared.
+    // Close user-mode dispatch and WFP classify admission before touching
+    // Device.  The classify barrier is closed first, but flow-delete admission
+    // remains open while prepare_unload asks WFP to remove the contexts that
+    // invoke flowDeleteFn.
     DISPATCH_GATE.close();
+    wdk::callback_barrier::CALLBACK_BARRIER.close_classify_and_wait();
 
     // Signal the queue before waiting for non-read dispatches. CLEANUP itself
     // can be one of those dispatches and may be waiting for an admitted read;
@@ -266,18 +288,26 @@ unsafe extern "system" fn driver_unload(_object: *const DRIVER_OBJECT) {
 
     if let Some(device) = get_device() {
         // Stop new flow callbacks and drain contexts while the event queue and
-        // the rest of Device are still usable. Callbacks that arrive after this
-        // point only reclaim their opaque WFP allocation.
+        // the rest of Device are still usable.  Flow-delete callbacks are the
+        // only WFP callbacks still admitted in this phase and are counted by
+        // the second half of the common callback barrier.
         device.prepare_unload();
+
+        // No flow context or callback may remain before any Device field is
+        // reclaimed.  This also closes the defensive late-callback path before
+        // FilterEngine/Injector teardown starts.
+        wdk::callback_barrier::CALLBACK_BARRIER.close_all_and_wait();
         device.shutdown();
         DISPATCH_GATE.wait_for_all();
     } else {
+        wdk::callback_barrier::CALLBACK_BARRIER.close_all_and_wait();
         DISPATCH_GATE.wait_for_all();
     }
 
-    // Null the global pointer only after every user dispatch and flow context has
-    // drained. FilterEngine::drop then unregisters callouts and deletes WFP state
-    // while no routine can still access Device.
+    // Null the global pointer only after every user dispatch and WFP callback
+    // has drained.  FilterEngine::drop then unregisters callouts and deletes
+    // WFP state while the callback barrier rejects any late callback before it
+    // can inspect a Callout or Device pointer.
     let ptr = DEVICE.swap(core::ptr::null_mut(), Ordering::AcqRel);
     if !ptr.is_null() {
         unsafe {

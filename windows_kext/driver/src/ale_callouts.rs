@@ -619,7 +619,6 @@ struct UdpFlowContext {
     process_id: u64,
     connection_instance_id: u64,
     endpoint_handle: Option<u64>,
-    flow_cache: *const crate::udp_flow_cache::UdpFlowCache,
 }
 
 pub(crate) fn reclaim_udp_flow_context(
@@ -678,7 +677,6 @@ fn associate_udp_flow_context(
         process_id: data.get_process_id().unwrap_or(0),
         connection_instance_id,
         endpoint_handle,
-        flow_cache: &device.udp_flow_cache,
     })) as u64;
 
     if !device.udp_flow_cache.register(flow_context, registration) {
@@ -734,41 +732,58 @@ fn associate_udp_flow_context(
 }
 
 /// WFP invokes this after a UDP ALE flow reaches its native idle timeout or its
-/// socket closes. The context is driver-owned again on entry and must be freed
-/// even when the Device has already stopped accepting events.
+/// socket closes.  The context is driver-owned again on entry; the normal path
+/// claims and frees it while the callback barrier keeps Device alive.
 pub(crate) unsafe extern "C" fn udp_flow_delete(
     _layer_id: u16,
     _callout_id: u32,
     flow_context: u64,
 ) {
+    // Acquire the flow-delete half of the common callback barrier before
+    // dereferencing either Device or the opaque flow context.  During unload
+    // classify admission is closed first, but this half remains open while
+    // prepare_unload removes WFP contexts and receives their callbacks.
+    let Some(_callback_guard) = wdk::callback_barrier::CALLBACK_BARRIER.enter_flow_delete()
+    else {
+        // A valid context should not arrive after prepare_unload has drained
+        // the flow registry.  Do not guess at ownership here: dereferencing a
+        // stale context after Device destruction would turn a late WFP callback
+        // into a use-after-free.  The normal WFP lifecycle guarantees that all
+        // owned contexts are delivered before the barrier is closed.
+        return;
+    };
+
     if flow_context == 0 {
         return;
     }
 
-    // Claim the callback before reconstructing the Box. This both rejects a
-    // duplicate notification and keeps unload from freeing Device while this
-    // callback is still executing. `flow_cache` remains valid until unload has
-    // drained every registration and in-flight callback.
-    let context_pointer = flow_context as *const UdpFlowContext;
-    let flow_cache = unsafe { &*(*context_pointer).flow_cache };
-    let Some(reclaim_only) = flow_cache.begin_callback(flow_context) else {
+    // The flow cache is part of Device.  Resolve Device while the barrier
+    // reference is held, then validate/claim the context through that cache.
+    // This intentionally avoids reading a flow-cache pointer out of an
+    // untrusted raw context before the registry has accepted the callback.
+    let Some(device) = crate::entry::get_device() else {
+        // Flow contexts are created only after Device has been published.  A
+        // missing pointer is therefore an abnormal teardown/init race; leaking
+        // the opaque allocation is safer than touching memory whose owner may
+        // already have been destroyed.
+        return;
+    };
+
+    let Some(reclaim_only) = device.udp_flow_cache.begin_callback(flow_context) else {
+        // A duplicate or already-reclaimed callback has no ownership left to
+        // release.  In particular, never reconstruct a Box for an unknown ID.
         return;
     };
     let context = unsafe { Box::from_raw(flow_context as *mut UdpFlowContext) };
 
     // Periodic cleanup and unload have already retired (or are discarding) the
-    // corresponding cache state. Their callbacks only reclaim the WFP allocation;
-    // this also avoids re-entering Device while FwpsFlowRemoveContext0 completes
-    // synchronously inside the cleanup path.
+    // corresponding cache state.  Their callbacks only reclaim the WFP
+    // allocation; this also avoids re-entering Device while
+    // FwpsFlowRemoveContext0 completes synchronously inside the cleanup path.
     if reclaim_only {
-        flow_cache.finish_callback();
+        device.udp_flow_cache.finish_callback();
         return;
     }
-
-    let Some(device) = crate::entry::get_device() else {
-        flow_cache.finish_callback();
-        return;
-    };
 
     if let Some(endpoint_handle) = context.endpoint_handle {
         let mut endpoint_cache = device.udp_endpoint_cache.write_lock();
@@ -794,7 +809,7 @@ pub(crate) unsafe extern "C" fn udp_flow_delete(
         emit_connection_end_v4(device, conn, context.process_id);
     }
 
-    flow_cache.finish_callback();
+    device.udp_flow_cache.finish_callback();
 }
 
 fn end_udp_endpoint(device: &Device, endpoint_handle: u64, process_id: u64) {
