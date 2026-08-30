@@ -19,6 +19,8 @@ use wdk::{
     rw_spin_lock::RwSpinLock,
 };
 
+use windows_sys::Win32::Foundation::NTSTATUS;
+
 use crate::{
     array_holder::ArrayHolder,
     bandwidth::Bandwidth,
@@ -106,6 +108,18 @@ impl Device {
         p != 0 && p == pid
     }
 
+    /// Marks reads waiting for an event so the owning handle's cleanup can
+    /// finish. The queue observes this state at its next bounded wait check.
+    pub fn cancel_read_waiters(&self) {
+        self.event_queue.cancel_waiters();
+    }
+
+    /// Clears the read cancellation state after all reads from the previous
+    /// owner have returned and a new owner has been installed.
+    pub fn reset_read_cancellation(&self) {
+        self.event_queue.reset_cancellation();
+    }
+
     fn write_buffer(&self, read_request: &mut ReadRequest, info: Info) {
         let bytes = info.as_bytes();
         let count = read_request.write(bytes);
@@ -119,7 +133,7 @@ impl Device {
     }
 
     /// Called when handle. Read is called from user-space.
-    pub fn read(&self, read_request: &mut ReadRequest) {
+    pub fn read(&self, read_request: &mut ReadRequest) -> NTSTATUS {
         let leftover_data = {
             let leftover = self.read_leftover.write_lock();
             leftover.load()
@@ -136,20 +150,23 @@ impl Device {
             }
         } else {
             // Noting left from before. Wait for next commands.
-            match self.event_queue.wait_and_pop() {
+            match self.event_queue.wait_and_pop_cancellable() {
                 Ok(info) => {
                     self.write_buffer(read_request, info);
                 }
                 Err(ioqueue::Status::Timeout) => {
                     // Timeout. This will only trigger if pop function is called with timeout.
-                    read_request.timeout();
-                    return;
+                    return read_request.timeout();
+                }
+                Err(ioqueue::Status::Cancelled) => {
+                    // The owning file object was cleaned up while this
+                    // synchronous wait was blocked.
+                    return read_request.cancelled();
                 }
                 Err(err) => {
                     // Queue failed. Send EOF, to notify user-space. Usually happens on rundown.
                     err!("failed to pop value: {}", err);
-                    read_request.end_of_file();
-                    return;
+                    return read_request.end_of_file();
                 }
             }
         }
@@ -165,7 +182,7 @@ impl Device {
                 }
             }
         }
-        read_request.complete();
+        read_request.complete()
     }
 
     // Called when handle.Write is called from user-space.
@@ -508,7 +525,9 @@ impl Device {
     }
 
     pub fn shutdown(&self) {
-        // End blocking operations from the queue. This will end pending read requests.
+        // End blocking operations from the queue. This also sets the
+        // cancellation flag so reads that are in a bounded wait leave before
+        // the queue is reclaimed.
         self.event_queue.rundown();
 
         // Resolve all pending packets. This is important for proper driver unload.

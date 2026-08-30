@@ -198,13 +198,9 @@ public:
 
     // Reads events until Stop() is called, dispatching to handlers.
     //
-    // Reads run on a dedicated thread. The driver's read dispatch blocks inside
-    // KeRemoveQueue in the caller's thread context (device.rs:102 ->
-    // ioqueue.rs:160, null timeout) and never calls IoMarkIrpPending, so the
-    // read cannot be cancelled from user space: CancelIoEx has no effect
-    // because the driver registers no IRP cancel routine. The only way to
-    // release it is to make the driver's own wait return, which the Shutdown
-    // command does by running down the event queue. Stop() sends it.
+    // Reads run on a dedicated thread. The driver's read dispatch uses a short
+    // bounded wait and observes IRP_MJ_CLEANUP cancellation, so closing the
+    // handle releases a blocked read before this thread is joined.
     //
     // on_poll fires on a fixed cadence from Run()'s thread, independently of
     // event traffic. Other handlers are invoked from the reader thread unless
@@ -212,9 +208,10 @@ public:
     // client instead.
     void Run(const Handlers& handlers, unsigned poll_interval_ms = 1000);
 
-    // Signals Run() to return, then unblocks the reader by sending Shutdown to
-    // the driver (which runs down the event queue and makes the blocked read
-    // return EOF). Safe to call from a Ctrl+C handler.
+    // Signals Run() to return, then asks the driver to release the blocked
+    // reader. A normal stop runs down the event queue and completes the read
+    // as EOF; a handle cleanup completes it as operation-aborted. Safe to call
+    // from a Ctrl+C handler.
     void Stop();
 
     // IOCTL_VERSION: returns the 4-byte driver version.

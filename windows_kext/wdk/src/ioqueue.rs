@@ -19,6 +19,7 @@ pub enum Status {
     Timeout,
     UserAPC,
     Abandoned,
+    Cancelled,
 }
 
 impl Display for Status {
@@ -28,6 +29,7 @@ impl Display for Status {
             Status::Timeout => write!(f, "Timeout"),
             Status::UserAPC => write!(f, "UserAPC"),
             Status::Abandoned => write!(f, "Abandoned"),
+            Status::Cancelled => write!(f, "Cancelled"),
         }
     }
 }
@@ -79,6 +81,9 @@ struct Entry<T> {
 pub struct IOQueue<T> {
     // The address of the value should not change.
     kernel_queue: Pin<Box<UnsafeCell<KQUEUE>>>,
+    // Set while a handle cleanup or driver unload is releasing blocked reads.
+    // Reads poll the KQUEUE with a short timeout and observe this flag.
+    cancelled: AtomicBool,
     initialized: AtomicBool,
     _type: PhantomData<T>, // 0 size variable. Required for the generic to work properly. Compiler limitation.
 }
@@ -94,6 +99,7 @@ impl<T> IOQueue<T> {
 
             Self {
                 kernel_queue,
+                cancelled: AtomicBool::new(false),
                 initialized: AtomicBool::new(true),
                 _type: PhantomData,
             }
@@ -129,6 +135,20 @@ impl<T> IOQueue<T> {
         return Err(Status::Uninitialized);
     }
 
+    /// Marks all current and future waits as canceled. The flag remains set
+    /// until a new owner calls `reset_cancellation`.
+    pub fn cancel_waiters(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    /// Clears the cancellation state for a new owner session.
+    ///
+    /// The caller must first close read admission and wait until all readers
+    /// have returned. This method must run at PASSIVE_LEVEL.
+    pub fn reset_cancellation(&self) {
+        self.cancelled.store(false, Ordering::Release);
+    }
+
     /// Returns an Element or a status.
     fn pop_internal(&self, timeout: *const i64) -> Result<T, Status> {
         unsafe {
@@ -162,6 +182,40 @@ impl<T> IOQueue<T> {
         self.pop_internal(core::ptr::null())
     }
 
+    /// Waits for an entry while remaining responsive to the owning handle's
+    /// cleanup. `KeRemoveQueue` has no cancellation object, so use a bounded
+    /// relative wait and check the cancellation flag between waits. This queue
+    /// remains synchronous; handle cleanup, rather than `CancelIoEx`, owns the
+    /// cancellation transition.
+    pub fn wait_and_pop_cancellable(&self) -> Result<T, Status> {
+        // Ten milliseconds bounds the time spent in the dispatch routine after
+        // IRP_MJ_CLEANUP signals cancellation without creating a permanent
+        // polling event or a cancel-routine race for this active IRP.
+        const WAIT_SLICE_MS: i64 = 10;
+
+        loop {
+            if self.cancelled.load(Ordering::Acquire) {
+                return Err(Status::Cancelled);
+            }
+            if !self.initialized.load(Ordering::Acquire) {
+                return Err(Status::Uninitialized);
+            }
+
+            match self.pop_timeout(WAIT_SLICE_MS) {
+                Ok(entry) => {
+                    // Cleanup may race the dequeue. Do not deliver an entry to
+                    // a handle after its cancellation has been observed.
+                    if self.cancelled.load(Ordering::Acquire) {
+                        return Err(Status::Cancelled);
+                    }
+                    return Ok(entry);
+                }
+                Err(Status::Timeout) => continue,
+                Err(status) => return Err(status),
+            }
+        }
+    }
+
     /// Returns element or a status. Does not wait.
     pub fn pop(&self) -> Result<T, Status> {
         let timeout: i64 = 0;
@@ -176,6 +230,7 @@ impl<T> IOQueue<T> {
 
     /// Removes all elements and frees all the memory. The object can't be used after this function is called.
     pub fn rundown(&self) {
+        self.cancel_waiters();
         unsafe {
             let kqueue = self.kernel_queue.get();
             if kqueue.is_null() {
@@ -183,7 +238,7 @@ impl<T> IOQueue<T> {
             }
 
             // Check if initialized.
-            if self.initialized.swap(false, Ordering::Acquire) {
+            if self.initialized.swap(false, Ordering::AcqRel) {
                 // Remove and free all elements from the queue.
                 let list_entries: *mut LIST_ENTRY = KeRundownQueue(kqueue);
                 if !list_entries.is_null() {

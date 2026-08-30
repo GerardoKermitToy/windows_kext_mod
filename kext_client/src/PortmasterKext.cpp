@@ -449,11 +449,9 @@ void Driver::Stop() {
         SetEvent(static_cast<HANDLE>(stop_event_));
     }
 
-    // Then unblock the reader. The Shutdown command makes the driver run down
-    // its event queue (device.rs:313), which makes the blocked KeRemoveQueue
-    // return STATUS_ABANDONED; the driver then completes the read as EOF
-    // (device.rs:114). This is the only mechanism that releases the read, since
-    // the IRP is never pending and has no cancel routine.
+    // Then ask the driver to release the read. A normal Stop sends Shutdown,
+    // which runs down the event queue and completes the read with EOF. If the
+    // handle is already being closed, IRP_MJ_CLEANUP completes it as canceled.
     std::string ignored;
     SendShutdown(ignored);
 }
@@ -660,10 +658,11 @@ void Driver::ReaderLoop(const Handlers& handlers) {
 
         if (ok == 0) {
             const DWORD err = GetLastError();
-            // ERROR_HANDLE_EOF is the normal end of a run, not a failure: the
-            // Shutdown command runs down the driver's event queue, which makes
-            // the blocked read complete as EOF (device.rs:114). Reporting it as a
-            // warning made every clean stop look like an error.
+            // ERROR_HANDLE_EOF is the normal end of a run: the Shutdown
+            // command runs down the driver's event queue and completes the
+            // blocked read as EOF. A handle cleanup reports
+            // ERROR_OPERATION_ABORTED and is handled below as another normal
+            // stop path.
             if (err == ERROR_OPERATION_ABORTED || err == ERROR_INVALID_HANDLE ||
                 err == ERROR_HANDLE_EOF) {
                 break;
@@ -676,8 +675,8 @@ void Driver::ReaderLoop(const Handlers& handlers) {
             }
 
             // Pending: wait for completion or for Stop(). Stop() sends the
-            // Shutdown command, which makes the driver complete this read with
-            // EOF, so in practice the read event signals shortly after.
+            // Shutdown command, while handle cleanup can complete the read as
+            // ERROR_OPERATION_ABORTED. Both paths signal the OVERLAPPED event.
             HANDLE waits[2] = {ov.get()->hEvent, stop_event};
             const DWORD result = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
             if (result == WAIT_OBJECT_0 + 1) {
@@ -712,8 +711,9 @@ void Driver::ReaderLoop(const Handlers& handlers) {
         }
 
         if (read == 0) {
-            // EOF: the driver ran down the event queue (device.rs:114). This is
-            // what Stop() induces via the Shutdown command.
+            // EOF: the driver ran down the event queue (for example after
+            // Stop() sends Shutdown). Cleanup cancellation normally takes the
+            // error path above instead.
             break;
         }
 
@@ -728,9 +728,8 @@ void Driver::ReaderLoop(const Handlers& handlers) {
 void Driver::Run(const Handlers& handlers, unsigned poll_interval_ms) {
     HANDLE stop_event = static_cast<HANDLE>(stop_event_);
 
-    // Reads must live on their own thread: they block inside the driver and
-    // cannot be cancelled, so the polling cadence and the Ctrl+C response
-    // cannot share that thread.
+    // Reads must live on their own thread: they block inside the driver, while
+    // Stop() and the polling cadence continue independently on this thread.
     std::thread reader([this, &handlers]() { ReaderLoop(handlers); });
 
     // Poll immediately, then on a fixed cadence. WaitForSingleObject on the

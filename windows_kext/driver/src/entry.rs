@@ -6,7 +6,7 @@ use num_traits::FromPrimitive;
 use wdk::irp_helpers::{
     CleanupRequest, CloseRequest, CreateRequest, DeviceControlRequest, ReadRequest, WriteRequest,
 };
-use wdk::{err, info, interface};
+use wdk::{err, info, interface, rw_spin_lock::RwSpinLock};
 use windows_sys::Wdk::Foundation::{DEVICE_OBJECT, DRIVER_OBJECT, IRP};
 use windows_sys::Win32::Foundation::{
     NTSTATUS, STATUS_DEVICE_NOT_READY, STATUS_SHARING_VIOLATION, STATUS_SUCCESS,
@@ -31,17 +31,28 @@ static DEVICE: AtomicPtr<device::Device> = AtomicPtr::new(core::ptr::null_mut())
 /// runs the existing shutdown path to wake blocked reads, and then waits for those
 /// reads before destroying the WDFDEVICE-backed Device allocation.
 struct DispatchGate {
+    /// Serializes the short admission/closure transition. It is held only
+    /// while counters and admission flags are updated; readers never wait for
+    /// Device work while holding it.
+    admission_lock: RwSpinLock<()>,
     unloading: AtomicBool,
     active: core::sync::atomic::AtomicU32,
     non_read: core::sync::atomic::AtomicU32,
+    reads_closed: AtomicBool,
+    reads: core::sync::atomic::AtomicU32,
+    session_busy: AtomicBool,
 }
 
 impl DispatchGate {
     const fn new() -> Self {
         Self {
+            admission_lock: RwSpinLock::new(()),
             unloading: AtomicBool::new(false),
             active: core::sync::atomic::AtomicU32::new(0),
             non_read: core::sync::atomic::AtomicU32::new(0),
+            reads_closed: AtomicBool::new(false),
+            reads: core::sync::atomic::AtomicU32::new(0),
+            session_busy: AtomicBool::new(false),
         }
     }
 
@@ -49,26 +60,31 @@ impl DispatchGate {
     /// dispatch routines may outlive the stack frame of DriverEntry, so it must
     /// be explicitly reset after a previous unload before a service restart.
     fn reopen(&self) {
+        let _admission_guard = self.acquire_admission();
         debug_assert_eq!(self.active.load(Ordering::Acquire), 0);
         debug_assert_eq!(self.non_read.load(Ordering::Acquire), 0);
+        debug_assert_eq!(self.reads.load(Ordering::Acquire), 0);
+        debug_assert!(!self.session_busy.load(Ordering::Acquire));
+        self.reads_closed.store(false, Ordering::Release);
         self.unloading.store(false, Ordering::Release);
     }
 
     fn enter(&self, is_read: bool) -> Option<DispatchGuard<'_>> {
-        if self.unloading.load(Ordering::Acquire) {
+        // Admission and closure use the same short lock. This makes the
+        // counter a reliable snapshot for cleanup: a read that observed an open
+        // gate is counted before cleanup can close it.
+        let _admission_guard = self.acquire_admission();
+        if self.unloading.load(Ordering::Acquire)
+            || (is_read && self.reads_closed.load(Ordering::Acquire))
+        {
             return None;
         }
 
         self.active.fetch_add(1, Ordering::AcqRel);
-        if !is_read {
+        if is_read {
+            self.reads.fetch_add(1, Ordering::AcqRel);
+        } else {
             self.non_read.fetch_add(1, Ordering::AcqRel);
-        }
-        if self.unloading.load(Ordering::Acquire) {
-            if !is_read {
-                self.non_read.fetch_sub(1, Ordering::AcqRel);
-            }
-            self.active.fetch_sub(1, Ordering::AcqRel);
-            return None;
         }
 
         Some(DispatchGuard {
@@ -77,13 +93,67 @@ impl DispatchGate {
         })
     }
 
-    /// Closes admission and waits until no ordinary dispatch can mutate Device.
-    /// A read may remain blocked in KeRemoveQueue; `Device::shutdown` wakes it.
-    fn close_and_wait_non_read(&self) {
+    /// Acquires the short admission lock used to serialize dispatch entry with
+    /// cleanup and unload closure. The lock is never held during Device work.
+    fn acquire_admission(&self) -> wdk::rw_spin_lock::RwLockWriteGuard<'_, ()> {
+        self.admission_lock.write_lock()
+    }
+
+    /// Closes admission for all new dispatches.
+    fn close(&self) {
+        let _admission_guard = self.acquire_admission();
+        self.reads_closed.store(true, Ordering::Release);
         self.unloading.store(true, Ordering::Release);
+    }
+
+    /// Waits until no ordinary dispatch can mutate Device.
+    ///
+    /// Reads are deliberately excluded here: a read may be blocked in the
+    /// cancellable queue wait and must be released before the final all-dispatch
+    /// drain below.
+    fn wait_for_non_read(&self) {
         while self.non_read.load(Ordering::Acquire) != 0 {
             wdk::utils::sleep_ms(1);
         }
+    }
+
+    /// Returns whether the driver is closing admission for unload.
+    fn is_unloading(&self) -> bool {
+        let _admission_guard = self.acquire_admission();
+        self.unloading.load(Ordering::Acquire)
+    }
+
+    /// Prevents a new read from racing session cancellation/reset.
+    fn close_reads(&self) {
+        let _admission_guard = self.acquire_admission();
+        self.reads_closed.store(true, Ordering::Release);
+    }
+
+    /// Allows reads for the newly accepted file object.
+    fn open_reads(&self) {
+        let _admission_guard = self.acquire_admission();
+        self.reads_closed.store(false, Ordering::Release);
+    }
+
+    fn wait_for_reads(&self) {
+        while self.reads.load(Ordering::Acquire) != 0 {
+            wdk::utils::sleep_ms(1);
+        }
+    }
+
+    /// Serializes CREATE/CLEANUP session transitions. These routines run at
+    /// PASSIVE_LEVEL, so sleeping is preferable to holding a spin lock while
+    /// another dispatch routine drains the active readers.
+    fn acquire_session(&self) -> SessionGuard<'_> {
+        while self
+            .session_busy
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            wdk::utils::sleep_ms(1);
+        }
+
+        SessionGuard { gate: self }
     }
 
     fn wait_for_all(&self) {
@@ -100,10 +170,22 @@ struct DispatchGuard<'a> {
 
 impl Drop for DispatchGuard<'_> {
     fn drop(&mut self) {
-        if !self.is_read {
+        if self.is_read {
+            self.gate.reads.fetch_sub(1, Ordering::AcqRel);
+        } else {
             self.gate.non_read.fetch_sub(1, Ordering::AcqRel);
         }
         self.gate.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct SessionGuard<'a> {
+    gate: &'a DispatchGate,
+}
+
+impl Drop for SessionGuard<'_> {
+    fn drop(&mut self) {
+        self.gate.session_busy.store(false, Ordering::Release);
     }
 }
 
@@ -166,20 +248,27 @@ pub extern "system" fn driver_entry(
 unsafe extern "system" fn driver_unload(_object: *const DRIVER_OBJECT) {
     info!("Unloading driver");
 
-    // Stop new user-mode dispatches first. A read may remain blocked in
-    // KeRemoveQueue, but ordinary writes/cleanup/create handlers must be out of
-    // the way before any Device-owned teardown begins.
-    DISPATCH_GATE.close_and_wait_non_read();
+    // Close admission before touching Device so no new dispatch can acquire a
+    // reference while teardown is being prepared.
+    DISPATCH_GATE.close();
+
+    // Signal the queue before waiting for non-read dispatches. CLEANUP itself
+    // can be one of those dispatches and may be waiting for an admitted read;
+    // delaying cancellation until after that wait would deadlock unload.
+    if let Some(device) = get_device() {
+        device.cancel_read_waiters();
+    }
+    DISPATCH_GATE.wait_for_non_read();
+    // The cancellation flag is already set. Drain admitted reads before any
+    // Device teardown so no user dispatch can touch the object while its WFP
+    // state or queue is being reclaimed.
+    DISPATCH_GATE.wait_for_reads();
 
     if let Some(device) = get_device() {
         // Stop new flow callbacks and drain contexts while the event queue and
         // the rest of Device are still usable. Callbacks that arrive after this
         // point only reclaim their opaque WFP allocation.
         device.prepare_unload();
-
-        // Wake a read blocked in KeRemoveQueue. The read guard then drops, and we
-        // can wait for every user dispatch before destroying the WDFDEVICE-backed
-        // Device allocation.
         device.shutdown();
         DISPATCH_GATE.wait_for_all();
     } else {
@@ -204,13 +293,16 @@ unsafe extern "system" fn driver_create(
 ) -> NTSTATUS {
     let mut create_request = CreateRequest::new(irp.as_mut().unwrap());
     let Some(_dispatch_guard) = DISPATCH_GATE.enter(false) else {
-        create_request.fail(STATUS_DEVICE_NOT_READY);
-        return create_request.get_status();
+        return create_request.fail(STATUS_DEVICE_NOT_READY);
     };
     let Some(device) = get_device() else {
-        create_request.fail(STATUS_DEVICE_NOT_READY);
-        return create_request.get_status();
+        return create_request.fail(STATUS_DEVICE_NOT_READY);
     };
+    let _session_guard = DISPATCH_GATE.acquire_session();
+
+    if DISPATCH_GATE.is_unloading() {
+        return create_request.fail(STATUS_DEVICE_NOT_READY);
+    }
 
     let pid = create_request.get_requestor_pid();
     let file_object = create_request.get_file_object();
@@ -226,14 +318,16 @@ unsafe extern "system" fn driver_create(
             .is_err()
     {
         crate::warn!("Rejecting additional device open from PID {}", pid);
-        create_request.fail(STATUS_SHARING_VIOLATION);
-        return create_request.get_status();
+        return create_request.fail(STATUS_SHARING_VIOLATION);
     }
 
     device.owner_pid.store(pid, Ordering::Release);
+    // A previous owner may have canceled the shared read wait. Reset it only
+    // after the new file object owns the session, then reopen read admission.
+    device.reset_read_cancellation();
+    DISPATCH_GATE.open_reads();
     info!("Device opened by PID {}", pid);
-    create_request.complete();
-    create_request.get_status()
+    create_request.complete()
 }
 
 /// driver_cleanup is triggered when user-space closes the last handle to the device.
@@ -243,13 +337,27 @@ unsafe extern "system" fn driver_cleanup(
 ) -> NTSTATUS {
     let mut cleanup_request = CleanupRequest::new(irp.as_mut().unwrap());
     let Some(_dispatch_guard) = DISPATCH_GATE.enter(false) else {
-        cleanup_request.complete();
-        return cleanup_request.get_status();
+        return cleanup_request.complete();
     };
-    if let Some(device) = get_device() {
+    let Some(device) = get_device() else {
+        return cleanup_request.complete();
+    };
+
+    {
+        let _session_guard = DISPATCH_GATE.acquire_session();
         let file_object = cleanup_request.get_file_object();
-        if !file_object.is_null()
-            && device
+        if !file_object.is_null() && device.owner_file_object.load(Ordering::Acquire) == file_object
+        {
+            // Stop new reads before signaling the wait. Reads that passed the
+            // admission check are counted by DispatchGate and are drained below.
+            DISPATCH_GATE.close_reads();
+            device.cancel_read_waiters();
+            DISPATCH_GATE.wait_for_reads();
+
+            // Keep the owner pointer published until every old read has left;
+            // this prevents a replacement CREATE from resetting the event too
+            // early. The session gate serializes this transition with CREATE.
+            if device
                 .owner_file_object
                 .compare_exchange(
                     file_object,
@@ -258,13 +366,14 @@ unsafe extern "system" fn driver_cleanup(
                     Ordering::Acquire,
                 )
                 .is_ok()
-        {
-            let old_pid = device.owner_pid.swap(0, Ordering::AcqRel);
-            info!("Device closed by PID {}", old_pid);
+            {
+                let old_pid = device.owner_pid.swap(0, Ordering::AcqRel);
+                info!("Device closed by PID {}", old_pid);
+            }
         }
     }
-    cleanup_request.complete();
-    cleanup_request.get_status()
+
+    cleanup_request.complete()
 }
 
 /// IRP_MJ_CLOSE is a separate lifetime phase from CLEANUP. Complete it through
@@ -276,8 +385,7 @@ unsafe extern "system" fn driver_close(
 ) -> NTSTATUS {
     let mut close_request = CloseRequest::new(irp.as_mut().unwrap());
     let _dispatch_guard = DISPATCH_GATE.enter(false);
-    close_request.complete();
-    close_request.get_status()
+    close_request.complete()
 }
 
 // driver_read event triggered from user-space on file.Read.
@@ -287,17 +395,13 @@ unsafe extern "system" fn driver_read(
 ) -> NTSTATUS {
     let mut read_request = ReadRequest::new(irp.as_mut().unwrap());
     let Some(_dispatch_guard) = DISPATCH_GATE.enter(true) else {
-        read_request.end_of_file();
-        return read_request.get_status();
+        return read_request.end_of_file();
     };
     let Some(device) = get_device() else {
-        read_request.complete();
-
-        return read_request.get_status();
+        return read_request.complete();
     };
 
-    device.read(&mut read_request);
-    read_request.get_status()
+    device.read(&mut read_request)
 }
 
 /// driver_write event triggered from user-space on file.Write.
@@ -307,19 +411,16 @@ unsafe extern "system" fn driver_write(
 ) -> NTSTATUS {
     let mut write_request = WriteRequest::new(irp.as_mut().unwrap());
     let Some(_dispatch_guard) = DISPATCH_GATE.enter(false) else {
-        write_request.complete();
-        return write_request.get_status();
+        return write_request.complete();
     };
     let Some(device) = get_device() else {
-        write_request.complete();
-        return write_request.get_status();
+        return write_request.complete();
     };
 
     device.write(&mut write_request);
 
     write_request.mark_all_as_read();
-    write_request.complete();
-    write_request.get_status()
+    write_request.complete()
 }
 
 /// device_control event triggered from user-space on file.deviceIOControl.
@@ -329,20 +430,17 @@ unsafe extern "system" fn device_control(
 ) -> NTSTATUS {
     let mut control_request = DeviceControlRequest::new(irp.as_mut().unwrap());
     let Some(_dispatch_guard) = DISPATCH_GATE.enter(false) else {
-        control_request.not_implemented();
-        return control_request.get_status();
+        return control_request.not_implemented();
     };
     let Some(device) = get_device() else {
-        control_request.complete();
-        return control_request.get_status();
+        return control_request.complete();
     };
 
     let Some(control_code): Option<ControlCode> =
         FromPrimitive::from_u32(control_request.get_control_code())
     else {
         wdk::info!("Unknown IOCTL code: {}", control_request.get_control_code());
-        control_request.not_implemented();
-        return control_request.get_status();
+        return control_request.not_implemented();
     };
 
     wdk::info!("IOCTL: {}", control_code);
@@ -354,6 +452,5 @@ unsafe extern "system" fn device_control(
         ControlCode::ShutdownRequest => device.shutdown(),
     };
 
-    control_request.complete();
-    control_request.get_status()
+    control_request.complete()
 }

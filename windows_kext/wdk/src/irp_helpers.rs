@@ -7,7 +7,8 @@ use windows_sys::{
         System::SystemServices::IofCompleteRequest,
     },
     Win32::Foundation::{
-        NTSTATUS, STATUS_END_OF_FILE, STATUS_NOT_IMPLEMENTED, STATUS_SUCCESS, STATUS_TIMEOUT,
+        NTSTATUS, STATUS_CANCELLED, STATUS_END_OF_FILE, STATUS_NOT_IMPLEMENTED, STATUS_SUCCESS,
+        STATUS_TIMEOUT,
     },
 };
 
@@ -43,18 +44,23 @@ impl CreateRequest<'_> {
         }
     }
 
-    pub fn complete(&mut self) {
-        // FILE_OPENED (1): indicates the device was opened (not created/superseded).
+    pub fn complete(&mut self) -> NTSTATUS {
+        // Capture the result before completing the IRP. After IofCompleteRequest
+        // returns, ownership of the IRP belongs to the I/O manager and this
+        // driver must not dereference it again.
         const FILE_OPENED: usize = 1;
+        let status = STATUS_SUCCESS;
         self.irp.IoStatus.Information = FILE_OPENED;
-        self.irp.IoStatus.Anonymous.Status = STATUS_SUCCESS;
+        self.irp.IoStatus.Anonymous.Status = status;
         unsafe { IofCompleteRequest(self.irp, IO_NO_INCREMENT as i8) };
+        status
     }
 
-    pub fn fail(&mut self, status: NTSTATUS) {
+    pub fn fail(&mut self, status: NTSTATUS) -> NTSTATUS {
         self.irp.IoStatus.Information = 0;
         self.irp.IoStatus.Anonymous.Status = status;
         unsafe { IofCompleteRequest(self.irp, IO_NO_INCREMENT as i8) };
+        status
     }
 
     pub fn get_status(&self) -> NTSTATUS {
@@ -85,10 +91,12 @@ impl CleanupRequest<'_> {
         }
     }
 
-    pub fn complete(&mut self) {
+    pub fn complete(&mut self) -> NTSTATUS {
+        let status = STATUS_SUCCESS;
         self.irp.IoStatus.Information = 0;
-        self.irp.IoStatus.Anonymous.Status = STATUS_SUCCESS;
+        self.irp.IoStatus.Anonymous.Status = status;
         unsafe { IofCompleteRequest(self.irp, IO_NO_INCREMENT as i8) };
+        status
     }
 
     pub fn get_status(&self) -> NTSTATUS {
@@ -110,10 +118,12 @@ impl CloseRequest<'_> {
         CloseRequest { irp }
     }
 
-    pub fn complete(&mut self) {
+    pub fn complete(&mut self) -> NTSTATUS {
+        let status = STATUS_SUCCESS;
         self.irp.IoStatus.Information = 0;
-        self.irp.IoStatus.Anonymous.Status = STATUS_SUCCESS;
+        self.irp.IoStatus.Anonymous.Status = status;
         unsafe { IofCompleteRequest(self.irp, IO_NO_INCREMENT as i8) };
+        status
     }
 
     pub fn get_status(&self) -> NTSTATUS {
@@ -150,18 +160,38 @@ impl ReadRequest<'_> {
         self.buffer.len() - self.fill_index
     }
 
-    pub fn complete(&mut self) {
+    pub fn complete(&mut self) -> NTSTATUS {
+        // Publish the final status and byte count before completing the IRP.
+        // The I/O manager owns the IRP after IofCompleteRequest returns.
         self.irp.IoStatus.Information = self.fill_index;
-        self.irp.IoStatus.Anonymous.Status = STATUS_SUCCESS;
+        let status = STATUS_SUCCESS;
+        self.irp.IoStatus.Anonymous.Status = status;
+        unsafe { IofCompleteRequest(self.irp, IO_NO_INCREMENT as i8) };
+        status
     }
 
-    pub fn end_of_file(&mut self) {
+    pub fn end_of_file(&mut self) -> NTSTATUS {
         self.irp.IoStatus.Information = self.fill_index;
-        self.irp.IoStatus.Anonymous.Status = STATUS_END_OF_FILE;
+        let status = STATUS_END_OF_FILE;
+        self.irp.IoStatus.Anonymous.Status = status;
+        unsafe { IofCompleteRequest(self.irp, IO_NO_INCREMENT as i8) };
+        status
     }
 
-    pub fn timeout(&mut self) {
-        self.irp.IoStatus.Anonymous.Status = STATUS_TIMEOUT;
+    pub fn timeout(&mut self) -> NTSTATUS {
+        let status = STATUS_TIMEOUT;
+        self.irp.IoStatus.Information = 0;
+        self.irp.IoStatus.Anonymous.Status = status;
+        unsafe { IofCompleteRequest(self.irp, IO_NO_INCREMENT as i8) };
+        status
+    }
+
+    pub fn cancelled(&mut self) -> NTSTATUS {
+        let status = STATUS_CANCELLED;
+        self.irp.IoStatus.Information = 0;
+        self.irp.IoStatus.Anonymous.Status = status;
+        unsafe { IofCompleteRequest(self.irp, IO_NO_INCREMENT as i8) };
+        status
     }
 
     pub fn get_status(&self) -> NTSTATUS {
@@ -213,8 +243,11 @@ impl WriteRequest<'_> {
         self.irp.IoStatus.Information = self.buffer.len();
     }
 
-    pub fn complete(&mut self) {
-        self.irp.IoStatus.Anonymous.Status = STATUS_SUCCESS;
+    pub fn complete(&mut self) -> NTSTATUS {
+        let status = STATUS_SUCCESS;
+        self.irp.IoStatus.Anonymous.Status = status;
+        unsafe { IofCompleteRequest(self.irp, IO_NO_INCREMENT as i8) };
+        status
     }
 
     pub fn get_status(&self) -> NTSTATUS {
@@ -285,15 +318,20 @@ impl DeviceControlRequest<'_> {
         bytes_to_write
     }
 
-    pub fn complete(&mut self) {
+    pub fn complete(&mut self) -> NTSTATUS {
+        let status = STATUS_SUCCESS;
         self.irp.IoStatus.Information = self.buffer.len();
-        self.irp.IoStatus.Anonymous.Status = STATUS_SUCCESS;
+        self.irp.IoStatus.Anonymous.Status = status;
         unsafe { IofCompleteRequest(self.irp, IO_NO_INCREMENT as i8) };
+        status
     }
 
-    pub fn not_implemented(&mut self) {
-        self.irp.IoStatus.Anonymous.Status = STATUS_NOT_IMPLEMENTED;
+    pub fn not_implemented(&mut self) -> NTSTATUS {
+        let status = STATUS_NOT_IMPLEMENTED;
+        self.irp.IoStatus.Information = 0;
+        self.irp.IoStatus.Anonymous.Status = status;
         unsafe { IofCompleteRequest(self.irp, IO_NO_INCREMENT as i8) };
+        status
     }
 
     pub fn get_status(&self) -> NTSTATUS {
