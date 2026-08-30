@@ -1,4 +1,4 @@
-use alloc::{string::String, vec::Vec};
+use alloc::{format, string::String, vec::Vec};
 use core::{
     ffi::c_void,
     sync::atomic::{AtomicPtr, AtomicU32, Ordering},
@@ -16,6 +16,7 @@ use wdk::{
     },
     ioqueue::{self, IOQueue},
     irp_helpers::{ReadRequest, WriteRequest},
+    passive_mutex::PassiveMutex,
     rw_spin_lock::RwSpinLock,
 };
 
@@ -41,9 +42,20 @@ pub enum Packet {
     AleLayer(ClassifyDefer),
 }
 
+impl Packet {
+    /// Returns whether applying a verdict requires a passive-level WFP
+    /// management transaction before the saved packet can be reinjected.
+    fn requires_reauthorization(&self) -> bool {
+        matches!(
+            self,
+            Self::AleLayer(defer) if defer.is_reauthorization()
+        )
+    }
+}
+
 // Device Context
 pub struct Device {
-    pub(crate) filter_engine: RwSpinLock<FilterEngine>,
+    pub(crate) filter_engine: PassiveMutex<FilterEngine>,
     pub(crate) read_leftover: RwSpinLock<ArrayHolder>,
     pub(crate) event_queue: IOQueue<Info>, // Queue for events to user-space
     pub(crate) packet_cache: RwSpinLock<IdCache>, // Cache of pending packets waiting for verdict
@@ -86,7 +98,8 @@ impl Device {
         filter_engine.commit(callouts::get_callout_vec())?;
 
         Ok(Self {
-            filter_engine: RwSpinLock::new(filter_engine),
+            filter_engine: PassiveMutex::new(filter_engine)
+                .map_err(|err| format!("filter engine lock error: {}", err))?,
             read_leftover: RwSpinLock::new(ArrayHolder::default()),
             event_queue: IOQueue::new(), // Queue for events to user-space
             packet_cache: RwSpinLock::new(IdCache::new()), // Cache of pending packets waiting for verdict
@@ -118,6 +131,42 @@ impl Device {
     /// owner have returned and a new owner has been installed.
     pub fn reset_read_cancellation(&self) {
         self.event_queue.reset_cancellation();
+    }
+
+    /// Reauthorizes existing ALE flows after a cache policy change.
+    ///
+    /// WFP management APIs require PASSIVE_LEVEL. Keep this operation behind a
+    /// passive-level mutex rather than the spin lock used by packet-path state;
+    /// the caller must be a PASSIVE_LEVEL dispatch path (normally a user write).
+    fn reset_filters(&self) -> Result<(), String> {
+        let mut filter_engine = self
+            .filter_engine
+            .lock()
+            .map_err(|err| format!("failed to acquire filter engine: {}", err))?;
+        filter_engine.reset_all_filters()
+    }
+
+    /// Reauthorization is already covered when another passive worker owns the
+    /// WFP transaction. Preserve the old behavior for a deferred ALE verdict:
+    /// the cached verdict is visible to the next classification even when this
+    /// particular reset loses the transaction race.
+    fn reset_filters_for_defer(&self) -> Result<(), String> {
+        match self.reset_filters() {
+            Err(err) if err.contains("STATUS_FWP_TXN_IN_PROGRESS") => Ok(()),
+            result => result,
+        }
+    }
+
+    /// Applies a user-space verdict to a saved packet.
+    ///
+    /// A reauthorization marker is created only for an ALE indication that could
+    /// not be pended. Reset the filters before consuming that marker so an IRQL
+    /// failure cannot strand its packet after ownership has left the cache.
+    fn inject_verdict_packet(&self, packet: Packet, blocked: bool) -> Result<(), String> {
+        if packet.requires_reauthorization() {
+            self.reset_filters_for_defer()?;
+        }
+        self.inject_packet(packet, blocked)
     }
 
     fn write_buffer(&self, read_request: &mut ReadRequest, info: Info) {
@@ -215,15 +264,10 @@ impl Device {
                         // Add verdict in the cache.
                         let redirect_info = self.connection_cache.update_connection(key, verdict);
 
-                        // if verdict.is_permanent() {
-                        //     dbg!(self.logger, "resetting filters {}: {}", key, verdict);
-                        //     _ = self.filter_engine.reset_all_filters();
-                        // }
-
                         match verdict {
                             crate::connection::Verdict::Accept
                             | crate::connection::Verdict::PermanentAccept => {
-                                if let Err(err) = self.inject_packet(packet, false) {
+                                if let Err(err) = self.inject_verdict_packet(packet, false) {
                                     err!("failed to inject packet: {}", err);
                                 } else {
                                     dbg!("packet injected: {}", key);
@@ -237,14 +281,14 @@ impl Device {
                                     if let Err(err) = packet.redirect(redirect_info) {
                                         err!("failed to redirect packet: {}", err);
                                     }
-                                    if let Err(err) = self.inject_packet(packet, false) {
+                                    if let Err(err) = self.inject_verdict_packet(packet, false) {
                                         err!("failed to inject packet: {}", err);
                                     }
                                 } else {
                                     // The connection disappeared before its verdict was
                                     // applied. Complete an ALE pend, if this is one, but
                                     // do not inject a packet with no redirect state.
-                                    if let Err(err) = self.inject_packet(packet, true) {
+                                    if let Err(err) = self.inject_verdict_packet(packet, true) {
                                         err!("failed to complete packet: {}", err);
                                     }
                                 }
@@ -252,7 +296,7 @@ impl Device {
                             _ => {
                                 // Complete ALE operations without injecting their
                                 // packet clone. Packet-layer clones are discarded.
-                                if let Err(err) = self.inject_packet(packet, true) {
+                                if let Err(err) = self.inject_verdict_packet(packet, true) {
                                     err!("failed to inject packet: {}", err);
                                 }
                             }
@@ -260,7 +304,7 @@ impl Device {
                     } else {
                         let invalid_verdict = verdict.verdict;
                         err!("invalid verdict value: {}", invalid_verdict);
-                        if let Err(err) = self.inject_packet(packet, true) {
+                        if let Err(err) = self.inject_verdict_packet(packet, true) {
                             err!("failed to complete packet: {}", err);
                         }
                     }
@@ -292,8 +336,7 @@ impl Device {
                     );
                     // Packet-layer lookups observe cache updates on the next packet.
                     // ALE-authorized flows need an explicit policy reauthorization.
-                    let mut filter_engine = self.filter_engine.write_lock();
-                    if let Err(err) = filter_engine.reset_all_filters() {
+                    if let Err(err) = self.reset_filters() {
                         err!("failed to reauthorize connections: {}", err);
                     }
                 } else {
@@ -322,8 +365,7 @@ impl Device {
                     );
                     // Packet-layer lookups observe cache updates on the next packet.
                     // ALE-authorized flows need an explicit policy reauthorization.
-                    let mut filter_engine = self.filter_engine.write_lock();
-                    if let Err(err) = filter_engine.reset_all_filters() {
+                    if let Err(err) = self.reset_filters() {
                         err!("failed to reauthorize connections: {}", err);
                     }
                 } else {
@@ -338,8 +380,7 @@ impl Device {
                     endpoint_cache.clear();
                 }
                 self.clean_udp_lifecycle_state();
-                let mut filter_engine = self.filter_engine.write_lock();
-                if let Err(err) = filter_engine.reset_all_filters() {
+                if let Err(err) = self.reset_filters() {
                     err!("failed to reset filters: {}", err);
                 }
             }
@@ -560,10 +601,10 @@ impl Device {
                 Ok(())
             }
             Packet::AleLayer(defer) => {
-                let packet_list = {
-                    let mut filter_engine = self.filter_engine.write_lock();
-                    defer.complete(&mut filter_engine, !blocked)?
-                };
+                // Initial ALE pends can be completed at the callback's IRQL and
+                // do not need the FilterEngine. Reauthorization is performed by
+                // the PASSIVE_LEVEL verdict path before this packet reaches here.
+                let packet_list = defer.complete(!blocked)?;
                 if !blocked {
                     if let Some(packet_list) = packet_list {
                         self.injector.inject_packet_list_transport(packet_list)?;

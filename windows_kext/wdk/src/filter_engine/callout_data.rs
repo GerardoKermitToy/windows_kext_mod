@@ -9,7 +9,6 @@ use super::{
     metadata::FwpsIncomingMetadataValues,
     packet::TransportPacketList,
     stream_data::StreamCalloutIoPacket,
-    FilterEngine,
 };
 use crate::consts::FWP_CONDITION_FLAG_IS_REASSEMBLED;
 use alloc::string::{String, ToString};
@@ -26,11 +25,13 @@ pub enum ClassifyDefer {
 }
 
 impl ClassifyDefer {
-    pub fn complete(
-        self,
-        filter_engine: &mut FilterEngine,
-        inject_packet: bool,
-    ) -> Result<Option<TransportPacketList>, String> {
+    /// Completes an ALE operation or returns a saved reauthorization packet.
+    ///
+    /// This method is callable from a classify callback, including at
+    /// DISPATCH_LEVEL. Reauthorization is deliberately only represented here;
+    /// the caller must invoke the WFP management operation from a
+    /// PASSIVE_LEVEL path after this method returns.
+    pub fn complete(self, inject_packet: bool) -> Result<Option<TransportPacketList>, String> {
         unsafe {
             match self {
                 ClassifyDefer::Initial(context, packet_list) => {
@@ -49,27 +50,17 @@ impl ClassifyDefer {
                     FwpsCompleteOperation0(context, nbl);
                     return Ok(packet_list);
                 }
-                ClassifyDefer::Reauthorization(_callout_id, packet_list) => {
-                    // There is no way to reset single filter. If another request for filter reset is trigger at the same time it will fail.
-                    //
-                    // Resetting all filters forces WFP to re-evaluate (reauthorize) all existing connections
-                    // using the updated verdict cache.
-                    // If STATUS_FWP_TXN_IN_PROGRESS is returned, another reset_all_filters() call is
-                    // already running concurrently, which will trigger the same WFP reauthorization.
-                    // It is safe to ignore this specific error and proceed with injecting the packet:
-                    // the verdict for this connection is already in the connection_cache, so the callout
-                    // will apply the correct verdict when the injected packet passes through.
-                    match filter_engine.reset_all_filters() {
-                        Ok(_) => {}
-                        Err(err) if err.contains("STATUS_FWP_TXN_IN_PROGRESS") => {
-                            // Another transaction is already in progress and will handle reauthorization.
-                        }
-                        Err(err) => return Err(err),
-                    }
+                ClassifyDefer::Reauthorization(_, packet_list) => {
                     return Ok(packet_list);
                 }
             }
         }
+    }
+
+    /// Returns whether completing this value requires a PASSIVE_LEVEL WFP
+    /// management operation to reauthorize existing flows.
+    pub fn is_reauthorization(&self) -> bool {
+        matches!(self, ClassifyDefer::Reauthorization(_, _))
     }
 
     // pub fn add_net_buffer(&mut self, nbl: NetBufferList) {

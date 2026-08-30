@@ -116,6 +116,10 @@ impl FilterEngine {
         return Ok(());
     }
 
+    /// Recreates resettable filters and forces WFP to reauthorize existing flows.
+    ///
+    /// This calls the WFP management API and must run at PASSIVE_LEVEL. Callers
+    /// must also serialize mutable access without using a lock that raises IRQL.
     pub fn reset_all_filters(&mut self) -> Result<(), String> {
         // Begin to write transaction. This is also a lock guard. It will abort if transaction is not committed.
         let mut filter_engine = match Transaction::begin_write(self) {
