@@ -81,36 +81,28 @@ pub struct Device {
     pub(crate) owner_pid: AtomicU32,
 }
 
-// All mutable/non-Sync state is accessed through its owning lock. The remaining
-// members either provide their own synchronization or are immutable after init.
-unsafe impl Sync for Device {}
+// Every mutable field is owned by its synchronization primitive. The resource
+// wrappers in wdk expose their cross-thread contracts individually, so Device's
+// auto-traits are checked field by field rather than bypassed with a blanket impl.
 
 impl Device {
     /// Initialize all members of the device. Memory is handled by windows.
     /// Make sure everything is initialized here.
     pub fn new(driver: &Driver) -> Result<Self, String> {
+        // Complete every fallible standalone allocation before registering WFP
+        // callbacks. If either resource is unavailable, DriverEntry fails without
+        // ever exposing a callback that depends on a partially built Device.
+        let injector = Injector::new().map_err(|err| format!("injector error: {}", err))?;
+        let network_allocator = NetworkAllocator::new()
+            .map_err(|err| format!("network allocator error: {}", err))?;
+
         let filter_engine = FilterEngine::new(driver, 0x7dab1057_8e2b_40c4_9b85_693e381d7896)
             .map_err(|err| alloc::format!("filter engine error: {}", err))?;
-        // Initialize the passive-level lock before registering any WFP state.
-        // If lock initialization fails, the unregistered FilterEngine can be
-        // dropped without a callback/Device lifetime race.
+        // Initialize the passive-level lock before publishing the Device. WFP
+        // filters are committed separately, after the complete Device has been
+        // stored in the global pointer.
         let filter_engine = PassiveMutex::new(filter_engine)
             .map_err(|err| format!("filter engine lock error: {}", err))?;
-
-        {
-            let mut filter_engine_guard = filter_engine
-                .lock()
-                .map_err(|err| format!("failed to acquire filter engine: {}", err))?;
-            if let Err(err) = filter_engine_guard.commit(callouts::get_callout_vec()) {
-                // FilterEngine owns runtime WFP callback targets even while this
-                // Device is still being constructed.  Close callback admission
-                // before the lock and FilterEngine are dropped on this error
-                // path.
-                drop(filter_engine_guard);
-                wdk::callback_barrier::CALLBACK_BARRIER.close_all_and_wait();
-                return Err(err);
-            }
-        }
 
         Ok(Self {
             filter_engine,
@@ -121,12 +113,23 @@ impl Device {
             udp_endpoint_cache: RwSpinLock::new(UdpEndpointCache::new()),
             udp_flow_cache: UdpFlowCache::new(),
             icmp_echo_cache: RwSpinLock::new(IcmpEchoCache::new()),
-            injector: Injector::new(),
-            network_allocator: NetworkAllocator::new(),
+            injector,
+            network_allocator,
             bandwidth_stats: RwSpinLock::new(Bandwidth::new()),
             owner_file_object: AtomicPtr::new(core::ptr::null_mut()),
             owner_pid: AtomicU32::new(0),
         })
+    }
+
+    /// Registers and activates all WFP state after the complete Device has been
+    /// published. Runtime callbacks can begin as soon as the FWPM transaction is
+    /// committed, so publication must precede this call.
+    pub fn start_filtering(&self) -> Result<(), String> {
+        let mut filter_engine = self
+            .filter_engine
+            .lock()
+            .map_err(|err| format!("failed to acquire filter engine: {}", err))?;
+        filter_engine.commit(callouts::get_callout_vec())
     }
 
     /// Returns the PID of the process that currently has the device handle open, or 0 if none.
@@ -190,7 +193,7 @@ impl Device {
         // Check if the full buffer was written.
         if count < bytes.len() {
             // Save the leftovers for later.
-            let leftover = self.read_leftover.write_lock();
+            let mut leftover = self.read_leftover.write_lock();
             leftover.save(&bytes[count..]);
         }
     }
@@ -198,7 +201,7 @@ impl Device {
     /// Called when handle. Read is called from user-space.
     pub fn read(&self, read_request: &mut ReadRequest) -> NTSTATUS {
         let leftover_data = {
-            let leftover = self.read_leftover.write_lock();
+            let mut leftover = self.read_leftover.write_lock();
             leftover.load()
         };
         if let Some(data) = leftover_data {
@@ -208,7 +211,7 @@ impl Device {
             // Check if full command was written.
             if count < data.len() {
                 // Save the leftovers for later.
-                let leftover = self.read_leftover.write_lock();
+                let mut leftover = self.read_leftover.write_lock();
                 leftover.save(&data[count..]);
             }
         } else {
@@ -250,14 +253,25 @@ impl Device {
 
     // Called when handle.Write is called from user-space.
     pub fn write(&self, write_request: &mut WriteRequest) {
-        // Try parsing the command.
-        let mut buffer = write_request.get_buffer();
-        let command = protocol::command::parse_type(buffer);
-        let Some(command) = command else {
-            err!("Unknown command number: {}", buffer[0]);
+        // Every WriteFile contains exactly one command. Validate the command byte
+        // and complete payload before reading any field from user-controlled data.
+        let buffer = write_request.get_buffer();
+        let Some(command) = protocol::command::parse_type(buffer) else {
+            match buffer.first() {
+                Some(command) => err!("Unknown command number: {}", command),
+                None => err!("Ignoring empty command write"),
+            }
             return;
         };
-        buffer = &buffer[1..];
+        let payload = &buffer[1..];
+        if !protocol::command::has_valid_payload_length(command, payload) {
+            err!(
+                "Invalid command payload length: expected {}, received {}",
+                command.payload_size(),
+                payload.len()
+            );
+            return;
+        }
 
         match command {
             CommandType::Shutdown => {
@@ -265,7 +279,12 @@ impl Device {
                 self.shutdown();
             }
             CommandType::Verdict => {
-                let verdict = protocol::command::parse_verdict(buffer);
+                let Some(verdict) = protocol::command::parse_verdict(payload) else {
+                    // The length was checked above; keep this guard in case the
+                    // parser and command table ever diverge.
+                    err!("Failed to decode Verdict command");
+                    return;
+                };
                 wdk::dbg!("Verdict command");
                 // Received verdict decision for a specific connection.
                 let packet = {
@@ -329,7 +348,10 @@ impl Device {
                 }
             }
             CommandType::UpdateV4 => {
-                let update = protocol::command::parse_update_v4(buffer);
+                let Some(update) = protocol::command::parse_update_v4(payload) else {
+                    err!("Failed to decode UpdateV4 command");
+                    return;
+                };
                 // Build the new action.
                 if let Some(verdict) = FromPrimitive::from_u8(update.verdict) {
                     // Update with new action.
@@ -358,7 +380,10 @@ impl Device {
                 }
             }
             CommandType::UpdateV6 => {
-                let update = protocol::command::parse_update_v6(buffer);
+                let Some(update) = protocol::command::parse_update_v6(payload) else {
+                    err!("Failed to decode UpdateV6 command");
+                    return;
+                };
                 // Build the new action.
                 if let Some(verdict) = FromPrimitive::from_u8(update.verdict) {
                     // Update with new action.
@@ -558,17 +583,41 @@ impl Device {
         }
     }
 
-    /// Drains every context still owned by WFP and then unregisters all runtime
-    /// callouts before the Device or its Callout allocations can be released.
+    /// Stops new flow-context associations before the remaining asynchronous ALE
+    /// operations are completed. Classify admission must already be closed and
+    /// drained by the caller.
+    pub fn begin_unload(&self) {
+        self.udp_flow_cache.start_shutdown();
+    }
+
+    /// Drains every context still owned by WFP, unregisters all runtime callouts,
+    /// and destroys injection handles before the Device or its Callout allocations
+    /// can be released.
     ///
     /// `FwpsCalloutUnregisterById0` returns STATUS_DEVICE_BUSY while any context
     /// remains associated. Keep the global Device pointer valid until the resulting
     /// flowDeleteFn callbacks have drained this cache and WFP confirms that every
-    /// runtime registration is gone.
+    /// runtime registration is gone. Injection-handle destruction is last because
+    /// WFP waits for all pending injections before each handle is destroyed.
     pub fn prepare_unload(&self) {
-        self.udp_flow_cache.start_shutdown();
         self.drain_udp_flow_contexts();
         self.unregister_wfp_state();
+        self.destroy_injection_handles();
+    }
+
+    fn destroy_injection_handles(&self) {
+        loop {
+            match self.injector.destroy() {
+                Ok(()) => return,
+                Err(err) => {
+                    // Keep the Injector alive and retry. A failed destroy leaves
+                    // its handle published so unload cannot accidentally release
+                    // the Device while WFP may still reference it.
+                    crate::err!("failed to destroy WFP injection handles: {}", err);
+                }
+            }
+            wdk::utils::sleep_ms(1);
+        }
     }
 
     fn drain_udp_flow_contexts(&self) {
@@ -609,11 +658,24 @@ impl Device {
         }
     }
 
+    /// Permanently stops classification for this driver instance and resolves all
+    /// pending user-space decisions. This runs from PASSIVE_LEVEL dispatch or
+    /// DriverUnload and is idempotent.
     pub fn shutdown(&self) {
-        // End blocking operations from the queue. This also sets the
-        // cancellation flag so reads that are in a bounded wait leave before
-        // the queue is reclaimed.
-        self.event_queue.rundown();
+        // A user-mode shutdown command can arrive before service-driven unload.
+        // Close callback admission here as well as in DriverUnload so no classify
+        // can enqueue a new packet after the cache and event queue are drained.
+        wdk::callback_barrier::CALLBACK_BARRIER.close_classify_and_wait();
+        self.begin_unload();
+
+        // KeRundownQueue cannot race a thread blocked in KeRemoveQueue. Close
+        // read admission, wake the bounded waits, and drain their dispatch guards
+        // before reclaiming queued entries. The queue itself is reclaimed by
+        // Device::drop after DriverUnload has closed all dispatch admission. Do
+        // not run it down here: a user-issued shutdown can race CLEANUP followed
+        // by a new CREATE, and that new session may reopen read admission while
+        // this dispatch is still finishing.
+        crate::entry::close_and_wait_for_reads(self);
 
         // Resolve all pending packets. This is important for proper driver unload.
         let pending_packets = {

@@ -577,7 +577,7 @@ fn create_packet_list(
         inbound,
         ale_data.interface_index,
         ale_data.sub_interface_index,
-    )))
+    )?))
 }
 
 pub(crate) fn emit_connection_end_v4(device: &Device, conn: ConnectionV4, process_id: u64) {
@@ -734,24 +734,25 @@ fn associate_udp_flow_context(
 /// WFP invokes this after a UDP ALE flow reaches its native idle timeout or its
 /// socket closes.  The context is driver-owned again on entry; the normal path
 /// claims and frees it while the callback barrier keeps Device alive.
-pub(crate) unsafe extern "C" fn udp_flow_delete(
-    _layer_id: u16,
-    _callout_id: u32,
+pub(crate) unsafe extern "system" fn udp_flow_delete(
+    layer_id: u16,
+    callout_id: u32,
     flow_context: u64,
 ) {
     // Acquire the flow-delete half of the common callback barrier before
     // dereferencing either Device or the opaque flow context.  During unload
     // classify admission is closed first, but this half remains open while
     // prepare_unload removes WFP contexts and receives their callbacks.
-    let Some(_callback_guard) = wdk::callback_barrier::CALLBACK_BARRIER.enter_flow_delete()
+    let Some(callback_admission) =
+        wdk::callback_barrier::CALLBACK_BARRIER.enter_flow_delete()
     else {
-        // A valid context should not arrive after prepare_unload has drained
-        // the flow registry.  Do not guess at ownership here: dereferencing a
-        // stale context after Device destruction would turn a late WFP callback
-        // into a use-after-free.  The normal WFP lifecycle guarantees that all
-        // owned contexts are delivered before the barrier is closed.
         return;
     };
+    if !callback_admission.is_active() {
+        // PREPARED and final-drain callbacks are counted for code lifetime but
+        // cannot safely resolve Device or interpret an opaque context.
+        return;
+    }
 
     if flow_context == 0 {
         return;
@@ -769,9 +770,13 @@ pub(crate) unsafe extern "C" fn udp_flow_delete(
         return;
     };
 
-    let Some(reclaim_only) = device.udp_flow_cache.begin_callback(flow_context) else {
-        // A duplicate or already-reclaimed callback has no ownership left to
-        // release.  In particular, never reconstruct a Box for an unknown ID.
+    let Some(reclaim_only) = device
+        .udp_flow_cache
+        .begin_callback(flow_context, layer_id, callout_id)
+    else {
+        // A duplicate, mismatched, or already-reclaimed callback has no
+        // ownership left to release. In particular, never reconstruct a Box for
+        // an unknown ID or for a reused address belonging to another callout.
         return;
     };
     let context = unsafe { Box::from_raw(flow_context as *mut UdpFlowContext) };

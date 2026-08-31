@@ -1,7 +1,9 @@
+use core::ffi::c_void;
+
 use super::{callout_data::CalloutData, ffi, layer::Layer};
 use crate::ffi::{FwpsCalloutClassifyFn, FwpsCalloutFlowDeleteNotifyFn};
 use alloc::{borrow::ToOwned, format, string::String};
-use windows_sys::{Wdk::Foundation::DEVICE_OBJECT, Win32::Foundation::HANDLE};
+use windows_sys::Win32::Foundation::HANDLE;
 
 pub enum FilterType {
     Resettable,
@@ -86,7 +88,7 @@ impl Callout {
     /// Runtime registration is not covered by the FWPM transaction.
     pub(crate) fn register_runtime_callout(
         &mut self,
-        device_object: *mut DEVICE_OBJECT,
+        device_object: *mut c_void,
         callout_fn: FwpsCalloutClassifyFn,
     ) -> Result<(), String> {
         match ffi::register_runtime_callout(

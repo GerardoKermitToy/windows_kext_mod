@@ -46,7 +46,7 @@ impl IdCache {
     pub fn pop_id(&mut self, id: u64) -> Option<(Key, Packet)> {
         let _guard = self.lock.write_lock();
         if let Ok(index) = self.values.binary_search_by_key(&id, |val| val.id) {
-            return Some(self.values.remove(index).unwrap().value);
+            return self.values.remove(index).map(|entry| entry.value);
         }
         None
     }

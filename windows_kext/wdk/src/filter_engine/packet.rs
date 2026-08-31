@@ -1,11 +1,15 @@
 use alloc::{
     boxed::Box,
+    format,
     string::{String, ToString},
 };
-use core::{ffi::c_void, mem::MaybeUninit};
+use core::{
+    ffi::c_void,
+    sync::atomic::{AtomicPtr, Ordering},
+};
 use windows_sys::Win32::{
-    Foundation::{HANDLE, INVALID_HANDLE_VALUE},
-    Networking::WinSock::{AF_INET, AF_INET6, AF_UNSPEC, SCOPE_ID},
+    Foundation::{BOOLEAN, INVALID_HANDLE_VALUE, STATUS_SUCCESS},
+    Networking::WinSock::{AF_INET, AF_INET6, AF_UNSPEC, SCOPE_ID, SCOPE_ID_0},
     System::Kernel::{COMPARTMENT_ID, UNSPECIFIED_COMPARTMENT_ID},
 };
 
@@ -43,6 +47,12 @@ pub struct TransportPacketList {
     send_params: FWPS_TRANSPORT_SEND_PARAMS1,
 }
 
+// The list is moved from classify to the verdict path and then reclaimed by a
+// potentially different CPU in the WFP injection completion callback. All raw
+// pointers either target fields in the same pinned Box or native NBL state whose
+// ownership moves with this value.
+unsafe impl Send for TransportPacketList {}
+
 #[derive(Clone, Copy)]
 pub struct InjectInfo {
     pub ipv6: bool,
@@ -63,53 +73,127 @@ impl TransportPacketList {
 }
 
 pub struct Injector {
-    transport_inject_handle: HANDLE,
-    packet_inject_handle_v4: HANDLE,
-    packet_inject_handle_v6: HANDLE,
+    transport_inject_handle: AtomicPtr<c_void>,
+    packet_inject_handle_v4: AtomicPtr<c_void>,
+    packet_inject_handle_v6: AtomicPtr<c_void>,
 }
+
+// Injection handles are atomically published and are destroyed only after both
+// callback and dispatch admission have drained. The atomics make the handle
+// storage safe to access through `&Device` during the final teardown phase.
 
 // TODO: Implement custom allocator for the packet buffers for reusing memory and reducing allocations. This should improve latency.
 impl Injector {
-    pub fn new() -> Self {
-        let mut transport_inject_handle: HANDLE = INVALID_HANDLE_VALUE;
-        let mut packet_inject_handle_v4: HANDLE = INVALID_HANDLE_VALUE;
-        let mut packet_inject_handle_v6: HANDLE = INVALID_HANDLE_VALUE;
+    pub fn new() -> Result<Self, String> {
+        // Commit each output only after WFP reports success and returns a usable
+        // handle. A failed native call owns the contents of its output parameter;
+        // leaving that value in `self` would make Drop attempt to destroy an
+        // uninitialized or otherwise invalid handle.
+        let injector = Self {
+            transport_inject_handle: AtomicPtr::new(INVALID_HANDLE_VALUE),
+            packet_inject_handle_v4: AtomicPtr::new(INVALID_HANDLE_VALUE),
+            packet_inject_handle_v6: AtomicPtr::new(INVALID_HANDLE_VALUE),
+        };
+
         unsafe {
+            let mut handle = INVALID_HANDLE_VALUE;
             let status = FwpsInjectionHandleCreate0(
                 AF_UNSPEC,
                 FWPS_INJECTION_TYPE_TRANSPORT,
-                &mut transport_inject_handle,
+                &mut handle,
             );
-            if let Err(err) = check_ntstatus(status) {
-                crate::err!("error allocating transport inject handle: {}", err);
+            check_ntstatus(status)
+                .map_err(|err| format!("failed to create transport injection handle: {}", err))?;
+            if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+                return Err("WFP returned an invalid transport injection handle".to_string());
             }
+            injector
+                .transport_inject_handle
+                .store(handle, Ordering::Release);
+
+            handle = INVALID_HANDLE_VALUE;
             let status = FwpsInjectionHandleCreate0(
                 AF_INET,
                 FWPS_INJECTION_TYPE_NETWORK,
-                &mut packet_inject_handle_v4,
+                &mut handle,
             );
-
-            if let Err(err) = check_ntstatus(status) {
-                crate::err!("error allocating network inject handle: {}", err);
+            check_ntstatus(status)
+                .map_err(|err| format!("failed to create IPv4 injection handle: {}", err))?;
+            if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+                return Err("WFP returned an invalid IPv4 injection handle".to_string());
             }
+            injector
+                .packet_inject_handle_v4
+                .store(handle, Ordering::Release);
+
+            handle = INVALID_HANDLE_VALUE;
             let status = FwpsInjectionHandleCreate0(
                 AF_INET6,
                 FWPS_INJECTION_TYPE_NETWORK,
-                &mut packet_inject_handle_v6,
+                &mut handle,
             );
+            check_ntstatus(status)
+                .map_err(|err| format!("failed to create IPv6 injection handle: {}", err))?;
+            if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+                return Err("WFP returned an invalid IPv6 injection handle".to_string());
+            }
+            injector
+                .packet_inject_handle_v6
+                .store(handle, Ordering::Release);
+        }
 
-            if let Err(err) = check_ntstatus(status) {
-                crate::err!("error allocating network inject handle: {}", err);
+        Ok(injector)
+    }
+
+    /// Destroys every injection handle owned by this object.
+    ///
+    /// WFP waits for pending injections before returning from each destroy call.
+    /// A handle is cleared only after the API reports `STATUS_SUCCESS`, so a
+    /// caller can retry a failed teardown without losing track of a possibly
+    /// live handle. This method must run at PASSIVE_LEVEL.
+    pub fn destroy(&self) -> Result<(), String> {
+        if !crate::utils::is_passive_level() {
+            return Err("WFP injection handles must be destroyed at PASSIVE_LEVEL".to_string());
+        }
+
+        fn destroy_one(handle: &AtomicPtr<c_void>, name: &str) -> Result<(), String> {
+            let value = handle.load(Ordering::Acquire);
+            if value == INVALID_HANDLE_VALUE || value.is_null() {
+                return Ok(());
+            }
+
+            let status = unsafe { FwpsInjectionHandleDestroy0(value) };
+            if status == STATUS_SUCCESS {
+                handle.store(INVALID_HANDLE_VALUE, Ordering::Release);
+                return Ok(());
+            }
+
+            Err(format!(
+                "failed to destroy {} injection handle: NTSTATUS({:#010x})",
+                name, status as u32
+            ))
+        }
+
+        let mut first_error = None;
+        for (handle, name) in [
+            (&self.transport_inject_handle, "transport"),
+            (&self.packet_inject_handle_v4, "IPv4 network"),
+            (&self.packet_inject_handle_v6, "IPv6 network"),
+        ] {
+            if let Err(err) = destroy_one(handle, name) {
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
             }
         }
-        Self {
-            transport_inject_handle,
-            packet_inject_handle_v4,
-            packet_inject_handle_v6,
+
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(()),
         }
     }
 
-    // TODO: pick a better name
+    /// Creates the packet list used to replay an ALE indication.
     pub fn from_ale_callout(
         ipv6: bool,
         callout_data: &CalloutData,
@@ -119,28 +203,39 @@ impl Injector {
         inbound: bool,
         interface_index: u32,
         sub_interface_index: u32,
-    ) -> TransportPacketList {
-        let mut control_data: Option<Box<[u8]>> = None;
-        if let Some(cd) = callout_data.get_control_data() {
-            // Copy the bytes while the WFP pointer is still valid (we are inside the callout).
-            control_data = Some(unsafe { cd.as_ref() }.to_vec().into_boxed_slice());
-        }
-        let mut remote_ip: [u8; 16] = [0; 16];
-        if ipv6 {
-            remote_ip[0..16].copy_from_slice(remote_ip_slice);
-        } else {
-            remote_ip[0..4].copy_from_slice(remote_ip_slice);
-        }
+    ) -> Result<TransportPacketList, String> {
+        let control_data = callout_data
+            .get_control_data()
+            .map(|cd| cd.to_vec().into_boxed_slice());
 
-        TransportPacketList {
+        let address_length = if ipv6 { 16 } else { 4 };
+        if remote_ip_slice.len() != address_length {
+            return Err("invalid remote address length".to_string());
+        }
+        let mut remote_ip = [0; 16];
+        remote_ip[..address_length].copy_from_slice(remote_ip_slice);
+
+        let remote_scope_id = callout_data
+            .get_remote_scope_id()
+            .unwrap_or(SCOPE_ID {
+                Anonymous: SCOPE_ID_0 { Value: 0 },
+            });
+        let send_params = FWPS_TRANSPORT_SEND_PARAMS1 {
+            remote_address: core::ptr::null(),
+            remote_scope_id,
+            control_data: core::ptr::null_mut(),
+            control_data_length: 0,
+            header_include_header: core::ptr::null_mut(),
+            header_include_header_length: 0,
+        };
+
+        Ok(TransportPacketList {
             ipv6,
             net_buffer_list,
             event_data_offset,
             remote_ip,
             endpoint_handle: callout_data.get_transport_endpoint_handle().unwrap_or(0),
-            remote_scope_id: callout_data
-                .get_remote_scope_id()
-                .unwrap_or(unsafe { MaybeUninit::zeroed().assume_init() }),
+            remote_scope_id,
             control_data,
             inbound,
             compartment_id: callout_data
@@ -149,9 +244,9 @@ impl Injector {
                 .unwrap_or(UNSPECIFIED_COMPARTMENT_ID),
             interface_index,
             sub_interface_index,
-            // Populated with valid pointers in inject_packet_list_transport after boxing.
-            send_params: unsafe { MaybeUninit::zeroed().assume_init() },
-        }
+            // Pointers are populated after this object has a stable Box address.
+            send_params,
+        })
     }
 
     // TODO: pick a better name. This is not transport
@@ -159,7 +254,10 @@ impl Injector {
         &self,
         packet_list: TransportPacketList,
     ) -> Result<(), String> {
-        if self.transport_inject_handle == INVALID_HANDLE_VALUE {
+        let transport_inject_handle = self
+            .transport_inject_handle
+            .load(Ordering::Acquire);
+        if transport_inject_handle == INVALID_HANDLE_VALUE || transport_inject_handle.is_null() {
             return Err("failed to inject packet: invalid handle value".to_string());
         }
         // Box the entire packet_list so that remote_ip and send_params
@@ -194,7 +292,7 @@ impl Injector {
             // Inject. Context is *mut TransportPacketList; freed by free_transport_packet.
             let status = if (*raw_ptr).inbound {
                 FwpsInjectTransportReceiveAsync0(
-                    self.transport_inject_handle,
+                    transport_inject_handle,
                     core::ptr::null_mut(),
                     core::ptr::null_mut(),
                     0,
@@ -208,7 +306,7 @@ impl Injector {
                 )
             } else {
                 FwpsInjectTransportSendAsync1(
-                    self.transport_inject_handle,
+                    transport_inject_handle,
                     core::ptr::null_mut(),
                     (*raw_ptr).endpoint_handle,
                     0,
@@ -235,19 +333,19 @@ impl Injector {
         net_buffer_list: NetBufferList,
         inject_info: InjectInfo,
     ) -> Result<(), String> {
-        if self.packet_inject_handle_v4 == INVALID_HANDLE_VALUE {
+        let inject_handle = if inject_info.ipv6 {
+            self.packet_inject_handle_v6.load(Ordering::Acquire)
+        } else {
+            self.packet_inject_handle_v4.load(Ordering::Acquire)
+        };
+        if inject_handle == INVALID_HANDLE_VALUE || inject_handle.is_null() {
             return Err("failed to inject packet: invalid handle value".to_string());
         }
+
         // Escape the stack, so the data can be freed after inject is complete.
         let packet_boxed = Box::new(net_buffer_list);
         let nbl = packet_boxed.nbl;
         let packet_pointer = Box::into_raw(packet_boxed);
-
-        let inject_handle = if inject_info.ipv6 {
-            self.packet_inject_handle_v6
-        } else {
-            self.packet_inject_handle_v4
-        };
 
         let status = if inject_info.inbound && !inject_info.loopback {
             // Inject inbound.
@@ -297,11 +395,11 @@ impl Injector {
         ipv6: bool,
     ) -> bool {
         let inject_handle = if ipv6 {
-            self.packet_inject_handle_v6
+            self.packet_inject_handle_v6.load(Ordering::Acquire)
         } else {
-            self.packet_inject_handle_v4
+            self.packet_inject_handle_v4.load(Ordering::Acquire)
         };
-        if inject_handle == INVALID_HANDLE_VALUE || inject_handle.is_null() {
+        if inject_handle == INVALID_HANDLE_VALUE || inject_handle.is_null() || nbl.is_null() {
             return false;
         }
 
@@ -314,13 +412,17 @@ impl Injector {
                 FWPS_PACKET_INJECTION_STATE::FWPS_PACKET_INJECTED_BY_OTHER => false,
                 FWPS_PACKET_INJECTION_STATE::FWPS_PACKET_PREVIOUSLY_INJECTED_BY_SELF => true,
                 FWPS_PACKET_INJECTION_STATE::FWPS_PACKET_INJECTION_STATE_MAX => false,
+                _ => false,
             }
         }
     }
 
     pub fn was_transport_packet_injected_by_self(&self, nbl: *const NET_BUFFER_LIST) -> bool {
-        if self.transport_inject_handle == INVALID_HANDLE_VALUE
-            || self.transport_inject_handle.is_null()
+        let transport_inject_handle = self
+            .transport_inject_handle
+            .load(Ordering::Acquire);
+        if transport_inject_handle == INVALID_HANDLE_VALUE
+            || transport_inject_handle.is_null()
             || nbl.is_null()
         {
             return false;
@@ -328,7 +430,7 @@ impl Injector {
 
         unsafe {
             let state = FwpsQueryPacketInjectionState0(
-                self.transport_inject_handle,
+                transport_inject_handle,
                 nbl,
                 core::ptr::null_mut(),
             );
@@ -339,6 +441,7 @@ impl Injector {
                 FWPS_PACKET_INJECTION_STATE::FWPS_PACKET_INJECTED_BY_OTHER => false,
                 FWPS_PACKET_INJECTION_STATE::FWPS_PACKET_PREVIOUSLY_INJECTED_BY_SELF => true,
                 FWPS_PACKET_INJECTION_STATE::FWPS_PACKET_INJECTION_STATE_MAX => false,
+                _ => false,
             }
         }
     }
@@ -346,33 +449,34 @@ impl Injector {
 
 impl Drop for Injector {
     fn drop(&mut self) {
-        unsafe {
-            if self.transport_inject_handle != INVALID_HANDLE_VALUE
-                && !self.transport_inject_handle.is_null()
-            {
-                FwpsInjectionHandleDestroy0(self.transport_inject_handle);
-                self.transport_inject_handle = INVALID_HANDLE_VALUE;
-            }
-            if self.packet_inject_handle_v4 != INVALID_HANDLE_VALUE
-                && !self.packet_inject_handle_v4.is_null()
-            {
-                FwpsInjectionHandleDestroy0(self.packet_inject_handle_v4);
-                self.packet_inject_handle_v4 = INVALID_HANDLE_VALUE;
-            }
-            if self.packet_inject_handle_v6 != INVALID_HANDLE_VALUE
-                && !self.packet_inject_handle_v6.is_null()
-            {
-                FwpsInjectionHandleDestroy0(self.packet_inject_handle_v6);
-                self.packet_inject_handle_v6 = INVALID_HANDLE_VALUE;
+        if !crate::utils::is_passive_level() {
+            // The WFP API is PASSIVE_LEVEL-only. Do not call it from an
+            // arbitrary destructor context; normal Device teardown invokes
+            // destroy before this object is dropped and at PASSIVE_LEVEL.
+            crate::err!("cannot destroy injection handles outside PASSIVE_LEVEL");
+            return;
+        }
+
+        // A live injection handle must never survive the end of DriverUnload.
+        // Retry here as a final guard for construction/error paths; normal
+        // teardown has already cleared all handles, so this loop is normally
+        // entered only once and returns immediately.
+        loop {
+            match self.destroy() {
+                Ok(()) => return,
+                Err(err) => {
+                    crate::err!("failed to destroy injection handles during drop: {}", err);
+                    crate::utils::sleep_ms(1);
+                }
             }
         }
     }
 }
 
-unsafe extern "C" fn free_packet(
+unsafe extern "system" fn free_packet(
     context: *mut c_void,
     net_buffer_list: *mut NET_BUFFER_LIST,
-    _dispatch_level: bool,
+    _dispatch_level: BOOLEAN,
 ) {
     if let Some(nbl) = net_buffer_list.as_ref() {
         if let Err(err) = check_ntstatus(nbl.Status) {
@@ -381,16 +485,18 @@ unsafe extern "C" fn free_packet(
             crate::dbg!("inject status: Ok");
         }
     }
-    _ = Box::from_raw(context as *mut NetBufferList);
+    if !context.is_null() {
+        _ = Box::from_raw(context as *mut NetBufferList);
+    }
 }
 
 /// Completion callback for transport inject paths (both inbound and outbound).
 /// The context is a `Box<TransportPacketList>` cast to `*mut c_void`.
 /// Dropping it also correctly drops the inner `NetBufferList`.
-unsafe extern "C" fn free_transport_packet(
+unsafe extern "system" fn free_transport_packet(
     context: *mut c_void,
     net_buffer_list: *mut NET_BUFFER_LIST,
-    _dispatch_level: bool,
+    _dispatch_level: BOOLEAN,
 ) {
     if let Some(nbl) = net_buffer_list.as_ref() {
         if let Err(err) = check_ntstatus(nbl.Status) {
@@ -399,5 +505,7 @@ unsafe extern "C" fn free_transport_packet(
             crate::dbg!("inject status: Ok");
         }
     }
-    _ = Box::from_raw(context as *mut TransportPacketList);
+    if !context.is_null() {
+        _ = Box::from_raw(context as *mut TransportPacketList);
+    }
 }

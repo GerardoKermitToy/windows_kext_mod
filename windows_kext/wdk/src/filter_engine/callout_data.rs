@@ -12,7 +12,7 @@ use super::{
 };
 use crate::consts::FWP_CONDITION_FLAG_IS_REASSEMBLED;
 use alloc::string::{String, ToString};
-use core::{ffi::c_void, ptr::NonNull};
+use core::ffi::c_void;
 use windows_sys::Win32::{
     Foundation::HANDLE,
     NetworkManagement::WindowsFilteringPlatform::FWP_CONDITION_FLAG_IS_REAUTHORIZE,
@@ -42,7 +42,7 @@ impl ClassifyDefer {
                     let nbl = if inject_packet {
                         packet_list
                             .as_ref()
-                            .map(|packet| packet.net_buffer_list.nbl as *mut c_void)
+                            .map(|packet| packet.net_buffer_list.nbl)
                             .unwrap_or(core::ptr::null_mut())
                     } else {
                         core::ptr::null_mut()
@@ -79,42 +79,67 @@ pub struct CalloutData<'a> {
     pub(crate) callout_id: u32,
     pub(crate) flow_context: u64,
     pub(crate) values: &'a [Value],
-    pub(crate) metadata: *const FwpsIncomingMetadataValues,
-    pub(crate) classify_out: *mut ClassifyOut,
+    pub(crate) metadata: &'a FwpsIncomingMetadataValues,
+    pub(crate) classify_out: &'a mut ClassifyOut,
     pub(crate) layer_data: *mut c_void,
 }
 
 impl<'a> CalloutData<'a> {
     pub fn get_value_type(&self, index: usize) -> ValueType {
-        self.values[index].value_type
+        self.values
+            .get(index)
+            .map(|value| value.value_type)
+            .unwrap_or(ValueType::FwpEmpty)
     }
 
-    pub fn get_value_u8(&'a self, index: usize) -> u8 {
-        unsafe {
-            return self.values[index].value.uint8;
+    pub fn get_value_u8(&self, index: usize) -> u8 {
+        let Some(value) = self.values.get(index) else {
+            return 0;
         };
+        if value.value_type != ValueType::FwpUint8 {
+            return 0;
+        }
+
+        unsafe { value.value.uint8 }
     }
 
-    pub fn get_value_u16(&'a self, index: usize) -> u16 {
-        unsafe {
-            return self.values[index].value.uint16;
+    pub fn get_value_u16(&self, index: usize) -> u16 {
+        let Some(value) = self.values.get(index) else {
+            return 0;
         };
+        if value.value_type != ValueType::FwpUint16 {
+            return 0;
+        }
+
+        unsafe { value.value.uint16 }
     }
 
-    pub fn get_value_u32(&'a self, index: usize) -> u32 {
-        unsafe {
-            return self.values[index].value.uint32;
+    pub fn get_value_u32(&self, index: usize) -> u32 {
+        let Some(value) = self.values.get(index) else {
+            return 0;
         };
+        if value.value_type != ValueType::FwpUint32 {
+            return 0;
+        }
+
+        unsafe { value.value.uint32 }
     }
 
-    pub fn get_value_byte_array16(&'a self, index: usize) -> &'a [u8; 16] {
-        unsafe {
-            return self.values[index].value.byte_array16.as_ref().unwrap();
+    pub fn get_value_byte_array16(&self, index: usize) -> &[u8; 16] {
+        static EMPTY: [u8; 16] = [0; 16];
+
+        let Some(value) = self.values.get(index) else {
+            return &EMPTY;
         };
+        if value.value_type != ValueType::FwpByteArray16Type {
+            return &EMPTY;
+        }
+
+        unsafe { value.value.byte_array16.as_ref().unwrap_or(&EMPTY) }
     }
 
     pub fn get_flow_handle(&self) -> Option<u64> {
-        unsafe { (*self.metadata).get_flow_handle() }
+        self.metadata.get_flow_handle()
     }
 
     pub fn has_flow_context(&self) -> bool {
@@ -150,38 +175,30 @@ impl<'a> CalloutData<'a> {
     }
 
     pub fn get_process_id(&self) -> Option<u64> {
-        unsafe { (*self.metadata).get_process_id() }
+        self.metadata.get_process_id()
     }
 
     pub fn get_process_path(&self) -> Option<String> {
-        unsafe {
-            return (*self.metadata).get_process_path();
-        }
+        unsafe { self.metadata.get_process_path() }
     }
 
     pub fn get_transport_endpoint_handle(&self) -> Option<u64> {
-        unsafe {
-            return (*self.metadata).get_transport_endpoint_handle();
-        }
+        self.metadata.get_transport_endpoint_handle()
     }
 
     pub fn get_remote_scope_id(&self) -> Option<SCOPE_ID> {
-        unsafe {
-            return (*self.metadata).get_remote_scope_id();
-        }
+        self.metadata.get_remote_scope_id()
     }
 
-    pub fn get_control_data(&self) -> Option<NonNull<[u8]>> {
-        unsafe {
-            return (*self.metadata).get_control_data();
-        }
+    pub fn get_control_data(&self) -> Option<&[u8]> {
+        unsafe { self.metadata.get_control_data() }
     }
 
     pub fn get_layer_data(&self) -> *mut c_void {
         return self.layer_data;
     }
 
-    pub fn get_stream_callout_packet(&self) -> Option<&mut StreamCalloutIoPacket> {
+    pub fn get_stream_callout_packet(&mut self) -> Option<&mut StreamCalloutIoPacket> {
         match self.layer {
             Layer::StreamV4 | Layer::StreamV4Discard | Layer::StreamV6 | Layer::StreamV6Discard => unsafe {
                 (self.layer_data as *mut StreamCalloutIoPacket).as_mut()
@@ -191,39 +208,40 @@ impl<'a> CalloutData<'a> {
     }
 
     pub fn is_fragment_data(&self) -> bool {
-        unsafe { (*self.metadata).is_fragment_data() }
+        self.metadata.is_fragment_data()
     }
 
     /// Size of the IP header for this indication, if WFP provided it.
     pub fn get_ip_header_size(&self) -> Option<u32> {
-        unsafe { (*self.metadata).get_ip_header_size() }
+        self.metadata.get_ip_header_size()
     }
 
     /// Size of the transport header for this indication, if WFP provided it.
     pub fn get_transport_header_size(&self) -> Option<u32> {
-        unsafe { (*self.metadata).get_transport_header_size() }
+        self.metadata.get_transport_header_size()
     }
 
     /// Routing compartment for this indication, if WFP provided it.
     pub fn get_compartment_id(&self) -> Option<u32> {
-        unsafe { (*self.metadata).get_compartment_id() }
+        self.metadata.get_compartment_id()
     }
 
     pub fn pend_operation(
         &mut self,
         packet_list: Option<TransportPacketList>,
     ) -> Result<ClassifyDefer, String> {
-        unsafe {
-            let mut completion_context: HANDLE = core::ptr::null_mut();
-            if let Some(completion_handle) = (*self.metadata).get_completion_handle() {
-                let status = FwpsPendOperation0(completion_handle, &mut completion_context);
-                check_ntstatus(status)?;
-
-                return Ok(ClassifyDefer::Initial(completion_context, packet_list));
+        let mut completion_context: HANDLE = core::ptr::null_mut();
+        if let Some(completion_handle) = self.metadata.get_completion_handle() {
+            let status = unsafe { FwpsPendOperation0(completion_handle, &mut completion_context) };
+            check_ntstatus(status)?;
+            if completion_context.is_null() {
+                return Err("WFP returned a null completion context".to_string());
             }
 
-            Err("callout not supported".to_string())
+            return Ok(ClassifyDefer::Initial(completion_context, packet_list));
         }
+
+        Err("callout not supported".to_string())
     }
 
     pub fn pend_filter_rest(&mut self, packet_list: Option<TransportPacketList>) -> ClassifyDefer {
@@ -231,51 +249,40 @@ impl<'a> CalloutData<'a> {
     }
 
     pub fn action_permit(&mut self) {
-        unsafe {
-            (*self.classify_out).action_permit();
-            (*self.classify_out).clear_absorb_flag();
-        }
+        self.classify_out.action_permit();
+        self.classify_out.clear_absorb_flag();
     }
 
     pub fn action_continue(&mut self) {
-        unsafe {
-            (*self.classify_out).action_continue();
-            (*self.classify_out).clear_absorb_flag();
-        }
+        self.classify_out.action_continue();
+        self.classify_out.clear_absorb_flag();
     }
 
     // Block action and clear the write flag.
     // This will block the packet and prevent next filter in the chain to change the action.
     pub fn action_block_hard(&mut self) {
-        unsafe {
-            (*self.classify_out).action_block();
-            (*self.classify_out).clear_absorb_flag();
-            // Next filter in the chain will not change the action.
-            (*self.classify_out).clear_write_flag();
-        }
+        self.classify_out.action_block();
+        self.classify_out.clear_absorb_flag();
+        // Next filter in the chain will not change the action.
+        self.classify_out.clear_write_flag();
     }
 
     pub fn action_none(&mut self) {
-        unsafe {
-            (*self.classify_out).set_none();
-            (*self.classify_out).clear_absorb_flag();
-        }
+        self.classify_out.set_none();
+        self.classify_out.clear_absorb_flag();
     }
 
     pub fn block_and_absorb(&mut self) {
-        unsafe {
-            (*self.classify_out).action_block();
-            (*self.classify_out).set_absorb();
-        }
+        self.classify_out.action_block();
+        self.classify_out.set_absorb();
     }
     pub fn clear_write_flag(&mut self) {
-        unsafe {
-            (*self.classify_out).clear_write_flag();
-        }
+        self.classify_out.clear_write_flag();
     }
 
     pub fn is_reauthorize(&self, flags_index: usize) -> bool {
-        self.get_value_u32(flags_index) & FWP_CONDITION_FLAG_IS_REAUTHORIZE > 0
+        self.get_value_type(flags_index) == ValueType::FwpUint32
+            && self.get_value_u32(flags_index) & FWP_CONDITION_FLAG_IS_REAUTHORIZE > 0
     }
 
     /// Returns true if WFP indicated this packet as a reassembled datagram, i.e.

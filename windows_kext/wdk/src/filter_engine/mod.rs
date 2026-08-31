@@ -2,13 +2,12 @@ use core::ffi::c_void;
 
 use crate::alloc::borrow::ToOwned;
 use crate::driver::Driver;
-use crate::ffi::FWPS_FILTER2;
+use crate::ffi::FWPS_FILTER3;
 use crate::filter_engine::transaction::Transaction;
 use crate::{dbg, info};
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::{format, vec::Vec};
-use windows_sys::Wdk::Foundation::DEVICE_OBJECT;
 use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
 
 use self::callout::{Callout, FilterType};
@@ -33,12 +32,17 @@ pub mod transaction;
 // pub mod connect_request;
 
 pub struct FilterEngine {
-    device_object: *mut DEVICE_OBJECT,
+    device_object: *mut c_void,
     handle: HANDLE,
     sublayer_guid: u128,
     committed: bool,
     callouts: Option<Vec<Box<Callout>>>,
 }
+
+// FilterEngine is moved into PassiveMutex and thereafter accessed only while its
+// executive resource is held at PASSIVE_LEVEL. Its raw values are opaque kernel
+// handles/pointers whose pointees are owned by KMDF/WFP, not Rust aliases.
+unsafe impl Send for FilterEngine {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UnregisterCalloutsResult {
@@ -50,6 +54,11 @@ pub enum UnregisterCalloutsResult {
 
 impl FilterEngine {
     pub fn new(driver: &Driver, layer_guid: u128) -> Result<Self, String> {
+        let device_object = driver.get_device_object();
+        if device_object.is_null() {
+            return Err("WDF control device has no WDM device object".to_owned());
+        }
+
         let filter_engine_handle: HANDLE;
         match ffi::create_filter_engine() {
             Ok(handle) => {
@@ -59,8 +68,9 @@ impl FilterEngine {
                 return Err(format!("failed to initialize filter engine {}", code).to_owned());
             }
         }
+
         Ok(Self {
-            device_object: driver.get_device_object(),
+            device_object,
             handle: filter_engine_handle,
             sublayer_guid: layer_guid,
             committed: false,
@@ -147,28 +157,49 @@ impl FilterEngine {
         };
         let filter_engine_handle = filter_engine.handle;
         let sublayer_guid = filter_engine.sublayer_guid;
-        if let Some(callouts) = &mut filter_engine.callouts {
-            for callout in callouts {
-                if let FilterType::Resettable = callout.filter_type {
-                    if callout.filter_id != 0 {
-                        // Remove old filter.
-                        if let Err(err) =
-                            ffi::unregister_filter(filter_engine_handle, callout.filter_id)
-                        {
+        let old_filter_ids = filter_engine
+            .callouts
+            .as_ref()
+            .map(|callouts| callouts.iter().map(|callout| callout.filter_id).collect::<Vec<_>>())
+            .unwrap_or_default();
+
+        let result = (|| {
+            if let Some(callouts) = &mut filter_engine.callouts {
+                for callout in callouts {
+                    if let FilterType::Resettable = callout.filter_type {
+                        if callout.filter_id != 0 {
+                            // Remove old filter. The ID is restored below if the
+                            // transaction aborts, because WFP then keeps it.
+                            if let Err(err) =
+                                ffi::unregister_filter(filter_engine_handle, callout.filter_id)
+                            {
+                                return Err(format!("filter_engine: {}", err));
+                            }
+                        }
+                        // Create new filter. `register_filter` records the new
+                        // ID, but the old ID snapshot is restored if commit fails.
+                        if let Err(err) = callout.register_filter(filter_engine_handle, sublayer_guid) {
                             return Err(format!("filter_engine: {}", err));
                         }
-                        callout.filter_id = 0;
-                    }
-                    // Create new filter.
-                    if let Err(err) = callout.register_filter(filter_engine_handle, sublayer_guid) {
-                        return Err(format!("filter_engine: {}", err));
                     }
                 }
             }
+            // Commit transaction.
+            filter_engine.commit()
+        })();
+
+        if result.is_err() {
+            // A failed transaction is aborted by Transaction::drop. Restore the
+            // Rust-side IDs before that drop so they continue to name the filters
+            // that WFP retained after rollback.
+            if let Some(callouts) = filter_engine.callouts.as_mut() {
+                for (callout, old_id) in callouts.iter_mut().zip(old_filter_ids) {
+                    callout.filter_id = old_id;
+                }
+            }
         }
-        // Commit transaction.
-        filter_engine.commit()?;
-        return Ok(());
+
+        result
     }
 
     fn register_sublayer(&self) -> Result<(), String> {
@@ -195,7 +226,7 @@ impl FilterEngine {
                 continue;
             }
 
-            match ffi::unregister_callout(callout.id)
+            match ffi::unregister_callout(callout.id, callout.guid)
                 .map_err(|err| format!("failed to unregister callout {}: {}", callout.name, err))?
             {
                 ffi::UnregisterCalloutResult::Removed => {
@@ -220,7 +251,8 @@ impl FilterEngine {
 
         // The session is dynamic, so a successful close synchronously removes
         // its filters, management callouts, and sublayer. Runtime FWPS callouts
-        // were removed above because they are not owned by this session.
+        // intentionally remain registered until the caller performs the
+        // separate unregister step below.
         ffi::filter_engine_close(self.handle)
             .map_err(|err| format!("failed to close filter engine: {}", err))?;
         self.handle = INVALID_HANDLE_VALUE;
@@ -237,17 +269,16 @@ impl FilterEngine {
 
     /// Unregisters all runtime callouts and closes the dynamic FWPM session.
     ///
-    /// `STATUS_DEVICE_BUSY` is retryable after the owner removes all associated
-    /// flow contexts. Until WFP confirms removal, every runtime ID and backing
-    /// Callout Box remains live. The caller must run at PASSIVE_LEVEL.
+    /// The dynamic session is closed first so its filters disappear before a
+    /// runtime callout is deregistered. WFP treats a terminating filter whose
+    /// runtime callout is gone as BLOCK; removing the dynamic filters first
+    /// avoids introducing that transient fail-closed behavior during teardown.
+    /// Runtime registrations and their backing Boxes remain live until WFP
+    /// confirms each unregister, including the `STATUS_DEVICE_BUSY` retry path.
+    /// The caller must run at PASSIVE_LEVEL.
     pub fn unregister_all(&mut self) -> Result<UnregisterCalloutsResult, String> {
-        let result = self.unregister_runtime_callouts()?;
-        if result == UnregisterCalloutsResult::Busy {
-            return Ok(result);
-        }
-
         self.close_dynamic_session()?;
-        Ok(UnregisterCalloutsResult::Complete)
+        self.unregister_runtime_callouts()
     }
 
     /// Last-resort cleanup for construction failures and destructor paths.
@@ -277,12 +308,12 @@ impl Drop for FilterEngine {
 }
 
 #[no_mangle]
-unsafe extern "C" fn catch_all_callout(
+unsafe extern "system" fn catch_all_callout(
     fixed_values: *const IncomingValues,
     meta_values: *const FwpsIncomingMetadataValues,
     layer_data: *mut c_void,
-    _context: *mut c_void,
-    filter: *const FWPS_FILTER2,
+    _context: *const c_void,
+    filter: *const FWPS_FILTER3,
     flow_context: u64,
     classify_out: *mut ClassifyOut,
 ) {
@@ -291,26 +322,64 @@ unsafe extern "C" fn catch_all_callout(
     // A callback that arrives after admission closes is from a WFP teardown race;
     // leave the classify result untouched and, most importantly, do not
     // dereference memory owned by the retiring Device.
-    let Some(_callback_guard) = crate::callback_barrier::CALLBACK_BARRIER.enter_classify() else {
+    let Some(callback_admission) =
+        crate::callback_barrier::CALLBACK_BARRIER.enter_classify()
+    else {
+        // Final rundown has closed callback-code admission. Runtime callout
+        // unregistration must already prevent this path; avoid touching any
+        // driver-owned memory if WFP nevertheless arrives late.
         return;
     };
+    if !callback_admission.is_active() {
+        // Runtime callouts exist briefly while their FWPM transaction is being
+        // built and while unload removes filters. The lifetime guard remains held
+        // through return, but Device/filter context is intentionally inaccessible.
+        if let Some(classify_out) = classify_out.as_mut() {
+            if classify_out.can_set_action() {
+                classify_out.action_continue();
+                classify_out.clear_absorb_flag();
+            }
+        }
+        return;
+    }
 
-    let filter = &(*filter);
+    let Some(fixed_values) = fixed_values.as_ref() else {
+        return;
+    };
+    let Some(meta_values) = meta_values.as_ref() else {
+        return;
+    };
+    let Some(filter) = filter.as_ref() else {
+        return;
+    };
+    let Some(classify_out) = classify_out.as_mut() else {
+        return;
+    };
+    if fixed_values.value_count != 0 && fixed_values.incoming_value_array.is_null() {
+        return;
+    }
+
     // Filter context is the address of the callout.
     let callout = filter.context as *mut Callout;
 
     if let Some(callout) = callout.as_ref() {
-        // Setup callout data.
-        let array = core::slice::from_raw_parts(
-            (*fixed_values).incoming_value_array,
-            (*fixed_values).value_count as usize,
-        );
+        // A zero-length slice still requires a non-null aligned pointer in Rust.
+        // Use a dangling pointer only for that empty representation; WFP's pointer
+        // is used unchanged whenever it describes at least one value.
+        let values = if fixed_values.value_count == 0 {
+            &[]
+        } else {
+            core::slice::from_raw_parts(
+                fixed_values.incoming_value_array,
+                fixed_values.value_count as usize,
+            )
+        };
         let data = CalloutData {
             layer: callout.layer,
-            layer_id: (*fixed_values).layer_id,
+            layer_id: fixed_values.layer_id,
             callout_id: callout.id,
             flow_context,
-            values: array,
+            values,
             metadata: meta_values,
             classify_out,
             layer_data,

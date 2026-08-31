@@ -86,6 +86,10 @@ impl<T> PassiveMutex<T> {
 
         let status = unsafe { ExInitializeResourceLite(mutex.resource_ptr()) };
         if status != STATUS_SUCCESS {
+            // Returning drops `mutex`; its Drop implementation releases the
+            // protected value even though no executive resource was initialized.
+            // Do not drop it here as well, or a fallible T destructor would run
+            // twice on this error path.
             return Err(PassiveMutexError::InitializationFailed(status));
         }
 

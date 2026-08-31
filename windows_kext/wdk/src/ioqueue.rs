@@ -8,10 +8,25 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use crate::dbg;
+use crate::{dbg, rw_spin_lock::RwSpinLock};
 use alloc::boxed::Box;
-use ntstatus::ntstatus::NtStatus;
-use windows_sys::{Wdk::Foundation::KQUEUE, Win32::System::Kernel::LIST_ENTRY};
+use windows_sys::{
+    Wdk::Foundation::KQUEUE,
+    Win32::{
+        Foundation::{STATUS_ABANDONED, STATUS_TIMEOUT, STATUS_USER_APC},
+        System::Kernel::LIST_ENTRY,
+    },
+};
+
+// IOQueue owns the resident KQUEUE storage that KeInitializeQueue writes.
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    assert!(core::mem::size_of::<LIST_ENTRY>() == 16);
+    assert!(core::mem::align_of::<LIST_ENTRY>() == 8);
+    assert!(core::mem::size_of::<KQUEUE>() == 64);
+    assert!(core::mem::align_of::<KQUEUE>() == 8);
+    assert!(core::mem::offset_of!(Entry<()>, list) == 0);
+};
 
 #[derive(Debug)]
 pub enum Status {
@@ -20,6 +35,7 @@ pub enum Status {
     UserAPC,
     Abandoned,
     Cancelled,
+    InvalidResult,
 }
 
 impl Display for Status {
@@ -30,10 +46,12 @@ impl Display for Status {
             Status::UserAPC => write!(f, "UserAPC"),
             Status::Abandoned => write!(f, "Abandoned"),
             Status::Cancelled => write!(f, "Cancelled"),
+            Status::InvalidResult => write!(f, "InvalidResult"),
         }
     }
 }
 
+// KPROCESSOR_MODE is a CCHAR typedef in the WDK, not a native C enum.
 #[repr(i8)]
 pub enum KprocessorMode {
     KernelMode = 0,
@@ -41,7 +59,7 @@ pub enum KprocessorMode {
 }
 
 // #[link(name = "NtosKrnl", kind = "static")]
-extern "C" {
+extern "system" {
     /*
     KeInitializeQueue
         [out] Queue
@@ -50,7 +68,7 @@ extern "C" {
         [in] Count
         The maximum number of threads for which the waits on the queue object can be satisfied concurrently. If this parameter is not supplied, the number of processors in the machine is used.
     */
-    fn KeInitializeQueue(queue: *mut KQUEUE, count: u64);
+    fn KeInitializeQueue(queue: *mut KQUEUE, count: u32);
     /*
     KeInsertQueue returns the previous signal state of the given Queue. If it was set to zero (that is, not signaled) before KeInsertQueue was called, KeInsertQueue returns zero, meaning that no entries were queued. If it was nonzero (signaled), KeInsertQueue returns the number of entries that were queued before KeInsertQueue was called.
     */
@@ -84,11 +102,15 @@ pub struct IOQueue<T> {
     // Set while a handle cleanup or driver unload is releasing blocked reads.
     // Reads poll the KQUEUE with a short timeout and observe this flag.
     cancelled: AtomicBool,
+    // Serializes insert and rundown. `initialized` alone cannot prevent an
+    // insertion that passed its load from racing KeRundownQueue.
+    lifecycle_lock: RwSpinLock<()>,
     initialized: AtomicBool,
     _type: PhantomData<T>, // 0 size variable. Required for the generic to work properly. Compiler limitation.
 }
 
-unsafe impl<T> Sync for IOQueue<T> {}
+unsafe impl<T: Send> Sync for IOQueue<T> {}
+unsafe impl<T: Send> Send for IOQueue<T> {}
 
 impl<T> IOQueue<T> {
     /// Make sure `rundown` is called on exit, if `drop()` is not called for queue.
@@ -100,6 +122,7 @@ impl<T> IOQueue<T> {
             Self {
                 kernel_queue,
                 cancelled: AtomicBool::new(false),
+                lifecycle_lock: RwSpinLock::new(()),
                 initialized: AtomicBool::new(true),
                 _type: PhantomData,
             }
@@ -119,11 +142,16 @@ impl<T> IOQueue<T> {
         });
         let raw_ptr = Box::into_raw(list_entry);
 
-        // Check if initialized.
-        let result = if self.initialized.load(Ordering::Acquire) {
-            unsafe { KeInsertQueue(kqueue, raw_ptr as *mut c_void) }
-        } else {
-            -1
+        // Serialize this initialized check with rundown. Without the lock, a
+        // producer can observe true, lose the CPU while KeRundownQueue drains,
+        // then insert into a queue that will never be consumed or freed.
+        let result = {
+            let _lifecycle_guard = self.lifecycle_lock.write_lock();
+            if self.initialized.load(Ordering::Acquire) {
+                unsafe { KeInsertQueue(kqueue, raw_ptr as *mut c_void) }
+            } else {
+                -1
+            }
         };
         // There is no documentation that rundown queue will return error. This is here just for good measures.
         // It is unlikely to happen and not critical.
@@ -131,6 +159,8 @@ impl<T> IOQueue<T> {
             return Ok(());
         }
 
+        // Reclaim outside the spin lock so an arbitrary T destructor never runs
+        // at the lock-raised DISPATCH_LEVEL.
         _ = unsafe { Box::from_raw(raw_ptr) };
         return Err(Status::Uninitialized);
     }
@@ -158,16 +188,38 @@ impl<T> IOQueue<T> {
                 // Pop and check the return value.
                 let list_entry =
                     KeRemoveQueue(kqueue, KprocessorMode::KernelMode, timeout) as *mut Entry<T>;
-                let error_code = NtStatus::try_from(list_entry as u32);
-                match error_code {
-                    Ok(NtStatus::STATUS_TIMEOUT) => return Err(Status::Timeout),
-                    Ok(NtStatus::STATUS_USER_APC) => return Err(Status::UserAPC),
-                    Ok(NtStatus::STATUS_ABANDONED) => return Err(Status::Abandoned),
+                let result = list_entry as usize;
+                match result {
+                    status
+                        if status == STATUS_TIMEOUT as u32 as usize
+                            || status == STATUS_TIMEOUT as isize as usize =>
+                    {
+                        return Err(Status::Timeout)
+                    }
+                    status
+                        if status == STATUS_USER_APC as u32 as usize
+                            || status == STATUS_USER_APC as isize as usize =>
+                    {
+                        return Err(Status::UserAPC)
+                    }
+                    status
+                        if status == STATUS_ABANDONED as u32 as usize
+                            || status == STATUS_ABANDONED as isize as usize =>
+                    {
+                        return Err(Status::Abandoned)
+                    }
+                    0 => return Err(Status::InvalidResult),
+                    // A status cast to a pointer can be either zero-extended or
+                    // sign-extended by the native implementation; the guards above
+                    // accept both complete representations. Reject every remaining
+                    // low value without truncating a valid x64 kernel address to its
+                    // low 32 bits.
+                    status if status <= u32::MAX as usize => {
+                        return Err(Status::InvalidResult)
+                    }
                     _ => {
-                        // The return value is a pointer.
                         let list_entry = Box::from_raw(list_entry);
-                        let entry = list_entry.entry;
-                        return Ok(entry);
+                        return Ok(list_entry.entry);
                     }
                 }
             }
@@ -224,7 +276,7 @@ impl<T> IOQueue<T> {
 
     /// Returns element or a status. Waits the specified timeout.
     pub fn pop_timeout(&self, timeout: i64) -> Result<T, Status> {
-        let timeout_ptr: i64 = timeout * -10000;
+        let timeout_ptr = timeout.saturating_mul(-10_000);
         self.pop_internal(&timeout_ptr)
     }
 
@@ -237,20 +289,31 @@ impl<T> IOQueue<T> {
                 return;
             }
 
-            // Check if initialized.
-            if self.initialized.swap(false, Ordering::AcqRel) {
-                // Remove and free all elements from the queue.
-                let list_entries: *mut LIST_ENTRY = KeRundownQueue(kqueue);
-                if !list_entries.is_null() {
-                    let mut entry = list_entries;
-                    while !core::ptr::eq((*entry).Flink, list_entries) {
-                        let next = (*entry).Flink;
-                        dbg!("discarding entry");
-                        let _ = Box::from_raw(entry as *mut Entry<T>);
-                        entry = next;
-                    }
-                    dbg!("discarding last entry");
+            // Exclude insertions from the initialized transition through the
+            // native list detach. Producers that arrive later observe false and
+            // reclaim their own allocation instead of touching the dead queue.
+            let list_entries = {
+                let _lifecycle_guard = self.lifecycle_lock.write_lock();
+                if self.initialized.swap(false, Ordering::AcqRel) {
+                    KeRundownQueue(kqueue)
+                } else {
+                    core::ptr::null_mut()
+                }
+            };
+
+            // KeRundownQueue returns a detached circular list. Destructors are
+            // arbitrary T code, so traverse and free it only after restoring the
+            // caller's original IRQL on release of lifecycle_lock.
+            if !list_entries.is_null() {
+                let mut entry = list_entries;
+                loop {
+                    let next = (*entry).Flink;
+                    dbg!("discarding entry");
                     let _ = Box::from_raw(entry as *mut Entry<T>);
+                    if core::ptr::eq(next, list_entries) {
+                        break;
+                    }
+                    entry = next;
                 }
             }
         }

@@ -9,6 +9,14 @@ use windows_sys::Wdk::System::SystemServices::{
     ExReleaseSpinLockShared,
 };
 
+// EX_SPIN_LOCK is the WDK's volatile LONG. The lock storage below must remain
+// exactly that size and alignment on every supported 64-bit target.
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    assert!(core::mem::size_of::<i32>() == 4);
+    assert!(core::mem::align_of::<i32>() == 4);
+};
+
 /// A reader-writer spin lock which owns the value it protects.
 ///
 /// The lock and the protected value are one object. Callers can share a
@@ -130,7 +138,9 @@ impl<T> Drop for RwLockWriteGuard<'_, T> {
 /// Compatibility name for the old lock-only write guard.
 pub type RwLockGuard<'a, T = ()> = RwLockWriteGuard<'a, T>;
 
-// Moving the lock requires ownership of T. Sharing the lock requires the
-// standard cross-thread bounds; individual guards remain CPU-local.
-unsafe impl<T: Send + Sync> Sync for RwSpinLock<T> {}
+// Moving or sharing the lock requires ownership transfer of T. Shared access to
+// a non-Sync T is still impossible: `read_lock` has its own `T: Sync` bound, while
+// `write_lock` exposes only one exclusive reference. Individual guards remain
+// CPU-local.
+unsafe impl<T: Send> Sync for RwSpinLock<T> {}
 unsafe impl<T: Send> Send for RwSpinLock<T> {}

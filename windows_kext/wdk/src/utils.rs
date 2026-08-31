@@ -1,25 +1,29 @@
 use alloc::string::{String, ToString};
 use ntstatus::ntstatus::NtStatus;
-use windows_sys::{
-    Wdk::System::SystemServices::{KeDelayExecutionThread, KeQueryInterruptTimePrecise},
-    Win32::Foundation::STATUS_SUCCESS,
+use windows_sys::Wdk::System::SystemServices::{
+    KeDelayExecutionThread, KeGetCurrentIrql, KeQueryInterruptTimePrecise, PASSIVE_LEVEL,
 };
 
 use crate::ffi;
 
 pub fn check_ntstatus(status: i32) -> Result<(), String> {
-    if status == STATUS_SUCCESS {
+    // Match the native NT_SUCCESS macro: informational and warning-free positive
+    // statuses are successful too, not only STATUS_SUCCESS (zero).
+    if status >= 0 {
         return Ok(());
     }
 
-    let Some(status) = NtStatus::from_u32(status as u32) else {
-        return Err("UNKNOWN_ERROR_CODE".to_string());
+    let Some(status_name) = NtStatus::from_u32(status as u32) else {
+        return Err(alloc::format!("NTSTATUS({:#010x})", status as u32));
     };
 
-    return Err(status.to_string());
+    Err(status_name.to_string())
 }
 
-/// Returns monotonic elapsed time in milliseconds.
+pub fn is_passive_level() -> bool {
+    unsafe { KeGetCurrentIrql() == PASSIVE_LEVEL as u8 }
+}
+
 ///
 /// `KeQueryInterruptTimePrecise` is based on interrupt time rather than system
 /// time. It is not changed when the wall clock is adjusted and it includes time

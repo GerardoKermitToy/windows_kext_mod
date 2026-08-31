@@ -1,4 +1,4 @@
-use core::{ffi::c_void, ptr::NonNull};
+use core::ffi::c_void;
 
 use alloc::string::String;
 use widestring::U16CString;
@@ -69,7 +69,7 @@ pub(crate) struct FwpsIncomingMetadataValues {
     parent_endpoint_handle: u64,
     icmp_id_and_sequence: u32,
     /// PID of the process that will be accepting the redirected connection
-    local_redirect_target_pid: u64,
+    local_redirect_target_pid: u32,
     /// original destination of a redirected connection
     original_destination: *mut c_void,
     redirect_records: HANDLE,
@@ -79,9 +79,9 @@ pub(crate) struct FwpsIncomingMetadataValues {
     l2_flags: u32,
     ethernet_mac_header_size: u32,
     wifi_operation_mode: u32,
-    padding0: u32,
-    padding1: u16,
-    padding2: u32,
+    v_switch_source_port_id: u32,
+    v_switch_source_nic_index: u16,
+    v_switch_destination_port_id: u32,
     v_switch_packet_context: HANDLE,
     sub_process_tag: *mut c_void,
     // Reserved for system use.
@@ -90,7 +90,7 @@ pub(crate) struct FwpsIncomingMetadataValues {
 
 impl FwpsIncomingMetadataValues {
     pub(crate) fn has_field(&self, field: u32) -> bool {
-        self.current_metadata_values & field > 0
+        self.current_metadata_values & field == field
     }
 
     pub(crate) fn get_flow_handle(&self) -> Option<u64> {
@@ -110,14 +110,24 @@ impl FwpsIncomingMetadataValues {
     }
 
     pub(crate) unsafe fn get_process_path(&self) -> Option<String> {
-        if self.has_field(FWPS_METADATA_FIELD_PROCESS_PATH) {
-            if let Ok(path16) = U16CString::from_ptr(
-                core::mem::transmute((*self.process_path).data),
-                (*self.process_path).size as usize / 2,
-            ) {
-                if let Ok(path) = path16.to_string() {
-                    return Some(path);
-                }
+        if !self.has_field(FWPS_METADATA_FIELD_PROCESS_PATH) || self.process_path.is_null() {
+            return None;
+        }
+
+        let path = &*self.process_path;
+        if path.size == 0 {
+            return None;
+        }
+        // Process paths are UTF-16. Reject an odd byte count rather than silently
+        // truncating malformed metadata, and never pass a null non-empty buffer to
+        // widestring's raw-slice constructor.
+        if path.size % 2 != 0 || path.data.is_null() {
+            return None;
+        }
+
+        if let Ok(path16) = U16CString::from_ptr(path.data as *const u16, path.size as usize / 2) {
+            if let Ok(path) = path16.to_string() {
+                return Some(path);
             }
         }
 
@@ -185,28 +195,24 @@ impl FwpsIncomingMetadataValues {
         false
     }
 
-    pub(crate) unsafe fn get_control_data(&self) -> Option<NonNull<[u8]>> {
+    pub(crate) unsafe fn get_control_data(&self) -> Option<&[u8]> {
         if self.has_field(FWPS_METADATA_FIELD_TRANSPORT_CONTROL_DATA) {
             if self.control_data.is_null() || self.control_data_length == 0 {
                 return None;
             }
-            let ptr = NonNull::new(self.control_data as *mut u8).unwrap();
-            let slice = NonNull::slice_from_raw_parts(ptr, self.control_data_length as usize);
-            return Some(slice);
+            return Some(core::slice::from_raw_parts(
+                self.control_data,
+                self.control_data_length as usize,
+            ));
         }
 
         None
     }
 }
 
-#[allow(dead_code)]
-#[repr(C)]
-enum FwpsDiscardModule0 {
-    Network = 0,
-    Transport = 1,
-    General = 2,
-    Max = 3,
-}
+/// Native `FWPS_DISCARD_MODULE0` storage. Keep this integer-backed because the
+/// value is supplied by WFP and newer kernels may add enum values.
+type FwpsDiscardModule0 = i32;
 
 #[repr(C)]
 struct FwpsDiscardMetadata0 {
@@ -221,3 +227,69 @@ struct FwpsInboundFragmentMetadata0 {
     fragment_offset: u16,
     fragment_length: u32,
 }
+
+// FWPS_INCOMING_METADATA_VALUES0 is supplied by WFP and read directly by the
+// classify path. Keep its complete x64 layout pinned to the WDK, including
+// fields this driver currently ignores, so a later field access cannot inherit
+// an unnoticed shift in the tail.
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    use core::mem::{align_of, offset_of, size_of};
+
+    assert!(size_of::<FwpsDiscardModule0>() == 4);
+    assert!(align_of::<FwpsDiscardModule0>() == 4);
+    assert!(size_of::<FwpsDiscardMetadata0>() == 16);
+    assert!(align_of::<FwpsDiscardMetadata0>() == 8);
+    assert!(offset_of!(FwpsDiscardMetadata0, discard_module) == 0);
+    assert!(offset_of!(FwpsDiscardMetadata0, discard_reason) == 4);
+    assert!(offset_of!(FwpsDiscardMetadata0, filter_id) == 8);
+
+    assert!(size_of::<FwpsInboundFragmentMetadata0>() == 12);
+    assert!(align_of::<FwpsInboundFragmentMetadata0>() == 4);
+    assert!(offset_of!(FwpsInboundFragmentMetadata0, fragment_identification) == 0);
+    assert!(offset_of!(FwpsInboundFragmentMetadata0, fragment_offset) == 4);
+    assert!(offset_of!(FwpsInboundFragmentMetadata0, fragment_length) == 8);
+
+    assert!(size_of::<FwpsIncomingMetadataValues>() == 280);
+    assert!(align_of::<FwpsIncomingMetadataValues>() == 8);
+    assert!(offset_of!(FwpsIncomingMetadataValues, current_metadata_values) == 0);
+    assert!(offset_of!(FwpsIncomingMetadataValues, flags) == 4);
+    assert!(offset_of!(FwpsIncomingMetadataValues, reserved) == 8);
+    assert!(offset_of!(FwpsIncomingMetadataValues, discard_metadata) == 16);
+    assert!(offset_of!(FwpsIncomingMetadataValues, flow_handle) == 32);
+    assert!(offset_of!(FwpsIncomingMetadataValues, ip_header_size) == 40);
+    assert!(offset_of!(FwpsIncomingMetadataValues, transport_header_size) == 44);
+    assert!(offset_of!(FwpsIncomingMetadataValues, process_path) == 48);
+    assert!(offset_of!(FwpsIncomingMetadataValues, token) == 56);
+    assert!(offset_of!(FwpsIncomingMetadataValues, process_id) == 64);
+    assert!(offset_of!(FwpsIncomingMetadataValues, source_interface_index) == 72);
+    assert!(offset_of!(FwpsIncomingMetadataValues, destination_interface_index) == 76);
+    assert!(offset_of!(FwpsIncomingMetadataValues, compartment_id) == 80);
+    assert!(offset_of!(FwpsIncomingMetadataValues, fragment_metadata) == 84);
+    assert!(offset_of!(FwpsIncomingMetadataValues, path_mtu) == 96);
+    assert!(offset_of!(FwpsIncomingMetadataValues, completion_handle) == 104);
+    assert!(offset_of!(FwpsIncomingMetadataValues, transport_endpoint_handle) == 112);
+    assert!(offset_of!(FwpsIncomingMetadataValues, remote_scope_id) == 120);
+    assert!(offset_of!(FwpsIncomingMetadataValues, control_data) == 128);
+    assert!(offset_of!(FwpsIncomingMetadataValues, control_data_length) == 136);
+    assert!(offset_of!(FwpsIncomingMetadataValues, packet_direction) == 140);
+    assert!(offset_of!(FwpsIncomingMetadataValues, header_include_header) == 144);
+    assert!(offset_of!(FwpsIncomingMetadataValues, header_include_header_length) == 152);
+    assert!(offset_of!(FwpsIncomingMetadataValues, destination_prefix) == 156);
+    assert!(offset_of!(FwpsIncomingMetadataValues, frame_length) == 188);
+    assert!(offset_of!(FwpsIncomingMetadataValues, parent_endpoint_handle) == 192);
+    assert!(offset_of!(FwpsIncomingMetadataValues, icmp_id_and_sequence) == 200);
+    assert!(offset_of!(FwpsIncomingMetadataValues, local_redirect_target_pid) == 204);
+    assert!(offset_of!(FwpsIncomingMetadataValues, original_destination) == 208);
+    assert!(offset_of!(FwpsIncomingMetadataValues, redirect_records) == 216);
+    assert!(offset_of!(FwpsIncomingMetadataValues, current_l2_metadata_values) == 224);
+    assert!(offset_of!(FwpsIncomingMetadataValues, l2_flags) == 228);
+    assert!(offset_of!(FwpsIncomingMetadataValues, ethernet_mac_header_size) == 232);
+    assert!(offset_of!(FwpsIncomingMetadataValues, wifi_operation_mode) == 236);
+    assert!(offset_of!(FwpsIncomingMetadataValues, v_switch_source_port_id) == 240);
+    assert!(offset_of!(FwpsIncomingMetadataValues, v_switch_source_nic_index) == 244);
+    assert!(offset_of!(FwpsIncomingMetadataValues, v_switch_destination_port_id) == 248);
+    assert!(offset_of!(FwpsIncomingMetadataValues, v_switch_packet_context) == 256);
+    assert!(offset_of!(FwpsIncomingMetadataValues, sub_process_tag) == 264);
+    assert!(offset_of!(FwpsIncomingMetadataValues, reserved1) == 272);
+};

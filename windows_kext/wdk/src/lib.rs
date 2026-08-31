@@ -3,6 +3,8 @@
 
 extern crate alloc;
 
+mod abi;
+
 pub mod allocator;
 pub mod callback_barrier;
 pub mod consts;

@@ -26,6 +26,12 @@ pub struct NetBufferList {
     advance_on_drop: Option<u32>,
 }
 
+// Owned packet clones are deliberately transferred from classify callbacks to
+// the verdict path and later to an asynchronous injection completion callback.
+// WFP/NDIS own synchronization of the native NBL; this wrapper never shares
+// mutable Rust access to it between those phases.
+unsafe impl Send for NetBufferList {}
+
 impl NetBufferList {
     pub fn new(nbl: *mut NET_BUFFER_LIST) -> NetBufferList {
         NetBufferList {
@@ -128,8 +134,7 @@ impl NetBufferList {
 
             let mut packets = Vec::new();
             let mut nb = nbl.Header.first_net_buffer;
-            while !nb.is_null() {
-                let nb_ref = nb.as_ref().unwrap();
+            while let Some(nb_ref) = nb.as_ref() {
                 let data_length = nb_ref.nbSize.DataLength;
                 if data_length == 0 {
                     return Err("can't clone empty packet".to_string());
@@ -251,7 +256,7 @@ impl NetBufferList {
         unsafe {
             if let Some(nbl) = self.nbl.as_mut() {
                 if let Some(nb) = nbl.Header.first_net_buffer.as_mut() {
-                    NdisAdvanceNetBufferDataStart(nb as _, size, false, core::ptr::null_mut());
+                    NdisAdvanceNetBufferDataStart(nb as _, size, 0, core::ptr::null_mut());
                 }
             }
         }
@@ -320,34 +325,32 @@ pub fn read_packet_partial(nbl: *mut NET_BUFFER_LIST, buffer: &mut [u8]) -> Resu
     return Err(());
 }
 
-pub struct RetreatGuard {
-    size: u32,
-    nbl: *mut NET_BUFFER_LIST,
-}
-
-impl Drop for RetreatGuard {
-    fn drop(&mut self) {
-        NetworkAllocator::advance_net_buffer(self.nbl, self.size);
-    }
-}
-
 pub struct NetworkAllocator {
     pool_handle: NDIS_HANDLE,
 }
 
+// NDIS NBL pools support concurrent allocation/free operations. The handle is
+// immutable until Device teardown, which starts only after dispatch and classify
+// admission have drained.
+unsafe impl Send for NetworkAllocator {}
+unsafe impl Sync for NetworkAllocator {}
+
 impl NetworkAllocator {
-    pub fn new() -> Self {
+    pub fn new() -> Result<Self, String> {
         unsafe {
             let mut params: NET_BUFFER_LIST_POOL_PARAMETERS = MaybeUninit::zeroed().assume_init();
             params.Header.Type = NDIS_OBJECT_TYPE_DEFAULT;
             params.Header.Revision = NET_BUFFER_LIST_POOL_PARAMETERS_REVISION_1;
             params.Header.Size = core::mem::size_of::<NET_BUFFER_LIST_POOL_PARAMETERS>() as u16;
-            params.fAllocateNetBuffer = true;
+            params.fAllocateNetBuffer = 1;
             params.PoolTag = POOL_TAG;
             params.DataSize = 0;
 
             let pool_handle = NdisAllocateNetBufferListPool(core::ptr::null_mut(), &params);
-            Self { pool_handle }
+            if pool_handle.is_null() {
+                return Err("failed to allocate NET_BUFFER_LIST pool".to_string());
+            }
+            Ok(Self { pool_handle })
         }
     }
 
@@ -379,12 +382,16 @@ impl NetworkAllocator {
                 0,
                 mdl,
                 0,
-                packet_data.len() as u64,
+                packet_data.len(),
                 &mut nbl,
             );
             if let Err(err) = check_ntstatus(status) {
                 IoFreeMdl(mdl);
                 return Err(err);
+            }
+            if nbl.is_null() {
+                IoFreeMdl(mdl);
+                return Err("WFP returned a null NET_BUFFER_LIST".to_string());
             }
             return Ok(nbl);
         }
@@ -393,41 +400,23 @@ impl NetworkAllocator {
     pub fn free_net_buffer(nbl: *mut NET_BUFFER_LIST) {
         NetBufferListIter::new(nbl).for_each(|nbl| unsafe {
             if let Some(nbl) = nbl.nbl.as_mut() {
-                if let Some(nb) = nbl.Header.first_net_buffer.as_mut() {
-                    IoFreeMdl(nb.MdlChain);
-                }
+                // FwpsFreeNetBufferList0 destroys the NBL/NB objects, which
+                // still contain the caller-owned MDL pointer. Release the
+                // enclosing WFP objects before freeing that MDL.
+                let mdl = nbl
+                    .Header
+                    .first_net_buffer
+                    .as_ref()
+                    .map(|nb| nb.MdlChain)
+                    .unwrap_or(core::ptr::null_mut());
                 FwpsFreeNetBufferList0(nbl);
+                if !mdl.is_null() {
+                    IoFreeMdl(mdl);
+                }
             }
         });
     }
 
-    pub fn retreat_net_buffer(
-        nbl: *mut NET_BUFFER_LIST,
-        size: u32,
-        auto_advance: bool,
-    ) -> Option<RetreatGuard> {
-        unsafe {
-            if let Some(nbl) = nbl.as_mut() {
-                if let Some(nb) = nbl.Header.first_net_buffer.as_mut() {
-                    NdisRetreatNetBufferDataStart(nb as _, size, 0, core::ptr::null_mut());
-                    if auto_advance {
-                        return Some(RetreatGuard { size, nbl });
-                    }
-                }
-            }
-        }
-
-        return None;
-    }
-    pub fn advance_net_buffer(nbl: *mut NET_BUFFER_LIST, size: u32) {
-        unsafe {
-            if let Some(nbl) = nbl.as_mut() {
-                if let Some(nb) = nbl.Header.first_net_buffer.as_mut() {
-                    NdisAdvanceNetBufferDataStart(nb as _, size, false, core::ptr::null_mut());
-                }
-            }
-        }
-    }
 }
 
 impl Drop for NetworkAllocator {

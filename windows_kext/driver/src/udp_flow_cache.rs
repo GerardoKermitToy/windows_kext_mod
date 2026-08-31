@@ -147,9 +147,20 @@ impl UdpFlowCache {
     /// Cleanup-requested callbacks skip connection and endpoint mutation because
     /// those cache instances were already found stale. `None` means a duplicate or
     /// unknown callback whose pointer has already been reclaimed.
-    pub fn begin_callback(&self, flow_context: u64) -> Option<bool> {
+    /// The layer/callout check rejects a delayed callback for an older context if
+    /// the allocator has reused the same address for a different registration.
+    pub fn begin_callback(
+        &self,
+        flow_context: u64,
+        layer_id: u16,
+        callout_id: u32,
+    ) -> Option<bool> {
         let _guard = self.lock.write_lock();
         let state = unsafe { &mut *self.state.get() };
+        let registration = state.registrations.get(&flow_context)?;
+        if registration.layer_id != layer_id || registration.callout_id != callout_id {
+            return None;
+        }
         let registration = state.registrations.remove(&flow_context)?;
         let reclaim_only = state.shutting_down || registration.removal_requested;
         state.callbacks_in_progress = state.callbacks_in_progress.saturating_add(1);
@@ -311,12 +322,12 @@ mod tests {
                 ..registration(1)
             }]
         );
-        assert_eq!(cache.begin_callback(100), Some(false));
+        assert_eq!(cache.begin_callback(100, 48, 7), Some(false));
         assert!(!cache.is_drained());
         assert_eq!(cache.callbacks_in_progress(), 1);
         cache.finish_callback();
         assert!(cache.is_drained());
-        assert!(cache.begin_callback(100).is_none());
+        assert!(cache.begin_callback(100, 48, 7).is_none());
     }
 
     #[test]
@@ -338,7 +349,7 @@ mod tests {
         cache.retry_removal(100, 1_001);
         assert_eq!(cache.removal_candidates().len(), 1);
         assert!(cache.claim_removal(100, 1_001).is_some());
-        assert_eq!(cache.begin_callback(100), Some(true));
+        assert_eq!(cache.begin_callback(100, 48, 7), Some(true));
         cache.finish_callback();
         assert!(cache.is_drained());
     }
@@ -360,7 +371,7 @@ mod tests {
         );
         assert!(cache.pending_removals().is_empty());
         assert!(!cache.register(200, registration(2)));
-        assert_eq!(cache.begin_callback(100), Some(true));
+        assert_eq!(cache.begin_callback(100, 48, 7), Some(true));
         assert!(!cache.is_drained());
         assert_eq!(cache.callbacks_in_progress(), 1);
         cache.finish_callback();

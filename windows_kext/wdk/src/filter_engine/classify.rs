@@ -49,6 +49,20 @@ pub struct ClassifyOut {
     reserved: u32,
 }
 
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    use core::mem::{align_of, offset_of, size_of};
+
+    assert!(size_of::<ClassifyOut>() == 40);
+    assert!(align_of::<ClassifyOut>() == 8);
+    assert!(offset_of!(ClassifyOut, action_type) == 0);
+    assert!(offset_of!(ClassifyOut, _out_context) == 8);
+    assert!(offset_of!(ClassifyOut, _filter_id) == 16);
+    assert!(offset_of!(ClassifyOut, rights) == 24);
+    assert!(offset_of!(ClassifyOut, flags) == 28);
+    assert!(offset_of!(ClassifyOut, reserved) == 32);
+};
+
 impl ClassifyOut {
     // Checks if write action flag is set. Indicates if the callout can change the action.
     pub fn can_set_action(&self) -> bool {

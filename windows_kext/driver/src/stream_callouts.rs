@@ -3,7 +3,7 @@ use wdk::filter_engine::{callout_data::CalloutData, layer, net_buffer::NetBuffer
 
 use crate::{bandwidth, connection::Direction, device::Device};
 
-pub fn stream_layer_tcp_v4(data: CalloutData) {
+pub fn stream_layer_tcp_v4(mut data: CalloutData) {
     type Fields = layer::FieldsStreamV4;
 
     let Some(device) = crate::entry::get_device() else {
@@ -56,7 +56,7 @@ pub fn stream_layer_tcp_v4(data: CalloutData) {
     }
 }
 
-pub fn stream_layer_tcp_v6(data: CalloutData) {
+pub fn stream_layer_tcp_v6(mut data: CalloutData) {
     type Fields = layer::FieldsStreamV6;
 
     let Some(device) = crate::entry::get_device() else {
