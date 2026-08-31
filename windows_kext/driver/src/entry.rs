@@ -680,10 +680,15 @@ unsafe extern "system" fn driver_write(
         return write_request.complete();
     };
 
-    device.write(&mut write_request);
-
-    write_request.mark_all_as_read();
-    write_request.complete()
+    match device.write(&write_request) {
+        Ok(()) => {
+            // Report the input as consumed only after the complete command has
+            // been validated and accepted by Device::write.
+            write_request.mark_all_as_read();
+            write_request.complete()
+        }
+        Err(status) => write_request.fail(status),
+    }
 }
 
 /// device_control event triggered from user-space on file.deviceIOControl.

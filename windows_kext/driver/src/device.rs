@@ -20,7 +20,7 @@ use wdk::{
     rw_spin_lock::RwSpinLock,
 };
 
-use windows_sys::Win32::Foundation::NTSTATUS;
+use windows_sys::Win32::Foundation::{NTSTATUS, STATUS_INVALID_PARAMETER};
 
 use crate::{
     array_holder::ArrayHolder,
@@ -251,17 +251,18 @@ impl Device {
         read_request.complete()
     }
 
-    // Called when handle.Write is called from user-space.
-    pub fn write(&self, write_request: &mut WriteRequest) {
+    /// Applies exactly one command supplied by a user-mode WriteFile request.
+    /// Malformed commands fail without consuming input bytes or mutating state.
+    pub fn write(&self, write_request: &WriteRequest) -> Result<(), NTSTATUS> {
         // Every WriteFile contains exactly one command. Validate the command byte
         // and complete payload before reading any field from user-controlled data.
         let buffer = write_request.get_buffer();
         let Some(command) = protocol::command::parse_type(buffer) else {
             match buffer.first() {
                 Some(command) => err!("Unknown command number: {}", command),
-                None => err!("Ignoring empty command write"),
+                None => err!("Rejecting empty command write"),
             }
-            return;
+            return Err(STATUS_INVALID_PARAMETER);
         };
         let payload = &buffer[1..];
         if !protocol::command::has_valid_payload_length(command, payload) {
@@ -270,7 +271,7 @@ impl Device {
                 command.payload_size(),
                 payload.len()
             );
-            return;
+            return Err(STATUS_INVALID_PARAMETER);
         }
 
         match command {
@@ -283,8 +284,18 @@ impl Device {
                     // The length was checked above; keep this guard in case the
                     // parser and command table ever diverge.
                     err!("Failed to decode Verdict command");
-                    return;
+                    return Err(STATUS_INVALID_PARAMETER);
                 };
+                let Some(action): Option<crate::connection::Verdict> =
+                    FromPrimitive::from_u8(verdict.verdict)
+                else {
+                    // Validate the action before consuming the pending packet. A
+                    // malformed command must not mutate driver state before its
+                    // WriteFile request is failed.
+                    err!("invalid verdict value: {}", verdict.verdict);
+                    return Err(STATUS_INVALID_PARAMETER);
+                };
+
                 wdk::dbg!("Verdict command");
                 // Received verdict decision for a specific connection.
                 let packet = {
@@ -292,53 +303,45 @@ impl Device {
                     packet_cache.pop_id(verdict.id)
                 };
                 if let Some((key, mut packet)) = packet {
-                    if let Some(verdict) = FromPrimitive::from_u8(verdict.verdict) {
-                        dbg!("Verdict received {}: {}", key, verdict);
-                        // Add verdict in the cache.
-                        let redirect_info = self.connection_cache.update_connection(key, verdict);
+                    dbg!("Verdict received {}: {}", key, action);
+                    // Add verdict in the cache.
+                    let redirect_info = self.connection_cache.update_connection(key, action);
 
-                        match verdict {
-                            crate::connection::Verdict::Accept
-                            | crate::connection::Verdict::PermanentAccept => {
+                    match action {
+                        crate::connection::Verdict::Accept
+                        | crate::connection::Verdict::PermanentAccept => {
+                            if let Err(err) = self.inject_verdict_packet(packet, false) {
+                                err!("failed to inject packet: {}", err);
+                            } else {
+                                dbg!("packet injected: {}", key);
+                            }
+                        }
+                        crate::connection::Verdict::RedirectNameServer
+                        | crate::connection::Verdict::RedirectTunnel
+                        | crate::connection::Verdict::RedirectSplitTunnel => {
+                            if let Some(redirect_info) = redirect_info {
+                                // Will not redirect packets from ALE layer
+                                if let Err(err) = packet.redirect(redirect_info) {
+                                    err!("failed to redirect packet: {}", err);
+                                }
                                 if let Err(err) = self.inject_verdict_packet(packet, false) {
                                     err!("failed to inject packet: {}", err);
-                                } else {
-                                    dbg!("packet injected: {}", key);
                                 }
-                            }
-                            crate::connection::Verdict::RedirectNameServer
-                            | crate::connection::Verdict::RedirectTunnel
-                            | crate::connection::Verdict::RedirectSplitTunnel => {
-                                if let Some(redirect_info) = redirect_info {
-                                    // Will not redirect packets from ALE layer
-                                    if let Err(err) = packet.redirect(redirect_info) {
-                                        err!("failed to redirect packet: {}", err);
-                                    }
-                                    if let Err(err) = self.inject_verdict_packet(packet, false) {
-                                        err!("failed to inject packet: {}", err);
-                                    }
-                                } else {
-                                    // The connection disappeared before its verdict was
-                                    // applied. Complete an ALE pend, if this is one, but
-                                    // do not inject a packet with no redirect state.
-                                    if let Err(err) = self.inject_verdict_packet(packet, true) {
-                                        err!("failed to complete packet: {}", err);
-                                    }
-                                }
-                            }
-                            _ => {
-                                // Complete ALE operations without injecting their
-                                // packet clone. Packet-layer clones are discarded.
+                            } else {
+                                // The connection disappeared before its verdict was
+                                // applied. Complete an ALE pend, if this is one, but
+                                // do not inject a packet with no redirect state.
                                 if let Err(err) = self.inject_verdict_packet(packet, true) {
-                                    err!("failed to inject packet: {}", err);
+                                    err!("failed to complete packet: {}", err);
                                 }
                             }
                         }
-                    } else {
-                        let invalid_verdict = verdict.verdict;
-                        err!("invalid verdict value: {}", invalid_verdict);
-                        if let Err(err) = self.inject_verdict_packet(packet, true) {
-                            err!("failed to complete packet: {}", err);
+                        _ => {
+                            // Complete ALE operations without injecting their
+                            // packet clone. Packet-layer clones are discarded.
+                            if let Err(err) = self.inject_verdict_packet(packet, true) {
+                                err!("failed to inject packet: {}", err);
+                            }
                         }
                     }
                 } else {
@@ -350,7 +353,7 @@ impl Device {
             CommandType::UpdateV4 => {
                 let Some(update) = protocol::command::parse_update_v4(payload) else {
                     err!("Failed to decode UpdateV4 command");
-                    return;
+                    return Err(STATUS_INVALID_PARAMETER);
                 };
                 // Build the new action.
                 if let Some(verdict) = FromPrimitive::from_u8(update.verdict) {
@@ -377,12 +380,13 @@ impl Device {
                     }
                 } else {
                     err!("invalid verdict value: {}", update.verdict);
+                    return Err(STATUS_INVALID_PARAMETER);
                 }
             }
             CommandType::UpdateV6 => {
                 let Some(update) = protocol::command::parse_update_v6(payload) else {
                     err!("Failed to decode UpdateV6 command");
-                    return;
+                    return Err(STATUS_INVALID_PARAMETER);
                 };
                 // Build the new action.
                 if let Some(verdict) = FromPrimitive::from_u8(update.verdict) {
@@ -409,6 +413,7 @@ impl Device {
                     }
                 } else {
                     err!("invalid verdict value: {}", update.verdict);
+                    return Err(STATUS_INVALID_PARAMETER);
                 }
             }
             CommandType::ClearCache => {
@@ -511,6 +516,8 @@ impl Device {
                 icmp_echo_cache.clean_expired_entries();
             }
         }
+
+        Ok(())
     }
 
     /// Removes one associated WFP flow context without terminating the socket or
