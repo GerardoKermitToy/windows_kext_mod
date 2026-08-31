@@ -19,9 +19,6 @@
 
 #include <fwpmk.h>              // Functions used for managing IKE and AuthIP main mode (MM) policy and security associations
 #include <fwpvi.h>              // Mappings of OS specific function versions (i.e. fn's that end in 0 or 1)
-#include <guiddef.h>            // Used to define GUID's
-#include <initguid.h>           // Used to define GUID's
-#include "devguid.h"
 #include <stdarg.h>
 #include <stdbool.h>
 #include <ntstrsafe.h>
@@ -89,8 +86,9 @@ NTSTATUS pm_InitDriverObject(
     if (!NT_SUCCESS(status)) {
         goto Exit;
     }
-    (void) WdfPdoInitAssignRawDevice(deviceInit, &GUID_DEVCLASS_NET);
-    WdfDeviceInitSetDeviceClass(deviceInit, &GUID_DEVCLASS_NET);
+    // This WDFDEVICE_INIT describes a non-PnP control device, not a child PDO.
+    // Access is fixed by the explicit SDDL above, so it does not need setup-class
+    // registry overrides either.
 
 #define PM_REGISTER_PREPROCESS(callback, majorFunction) \
     status = WdfDeviceInitAssignWdmIrpPreprocessCallback( \
