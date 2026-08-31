@@ -1,12 +1,15 @@
 use alloc::string::{String, ToString};
 use smoltcp::wire::{
-    IpAddress, IpProtocol, Ipv4Address, Ipv4Packet, Ipv6Address, Ipv6ExtHeader,
-    Ipv6FragmentHeader, Ipv6Packet, TcpPacket, UdpPacket, IPV4_HEADER_LEN, IPV6_HEADER_LEN,
+    IpAddress, IpProtocol, Ipv4Address, Ipv4Packet, Ipv6Address, Ipv6Packet, TcpPacket, UdpPacket,
+    IPV4_HEADER_LEN, IPV6_HEADER_LEN,
 };
 use wdk::filter_engine::net_buffer::NetBufferList;
 
 use crate::connection_map::Key;
 use crate::device::Packet;
+use crate::ipv6_packet::{
+    recalculate_ipv6_transport_checksum, rewrite_ipv6_tcp_udp, walk_ipv6_headers, PortRewrite,
+};
 use crate::{
     connection::{Direction, RedirectInfo},
     dbg, err,
@@ -44,14 +47,14 @@ impl Redirect for Packet {
                         redirect_info.local_address,
                         redirect_info.remote_address,
                         redirect_info.remote_port,
-                    );
+                    )?;
                 } else {
                     redirect_outbound_packet(
                         data,
                         redirect_info.redirect_address,
                         redirect_info.redirect_port,
                         redirect_info.unify,
-                    );
+                    )?;
                 }
             }
             return Ok(());
@@ -79,7 +82,7 @@ fn redirect_outbound_packet(
     remote_address: IpAddress,
     remote_port: u16,
     unify: bool,
-) {
+) -> Result<(), String> {
     match remote_address {
         IpAddress::Ipv4(remote_address) => {
             if let Ok(mut ip_packet) = Ipv4Packet::new_checked(packet) {
@@ -109,35 +112,32 @@ fn redirect_outbound_packet(
                     }
                 }
             }
+            Ok(())
         }
         IpAddress::Ipv6(remote_address) => {
-            if let Ok(mut ip_packet) = Ipv6Packet::new_checked(packet) {
-                ip_packet.set_dst_addr(remote_address);
-                if unify {
-                    ip_packet.set_dst_addr(ip_packet.src_addr());
-                } else {
-                    ip_packet.set_dst_addr(remote_address);
-                    if remote_address.is_loopback() {
-                        ip_packet.set_src_addr(Ipv6Address::LOOPBACK);
-                    }
-                }
-                let src_addr = ip_packet.src_addr();
-                let dst_addr = ip_packet.dst_addr();
-                if ip_packet.next_header() == IpProtocol::Udp {
-                    if let Ok(mut udp_packet) = UdpPacket::new_checked(ip_packet.payload_mut()) {
-                        udp_packet.set_dst_port(remote_port);
-                        udp_packet
-                            .fill_checksum(&IpAddress::Ipv6(src_addr), &IpAddress::Ipv6(dst_addr));
-                    }
-                }
-                if ip_packet.next_header() == IpProtocol::Tcp {
-                    if let Ok(mut tcp_packet) = TcpPacket::new_checked(ip_packet.payload_mut()) {
-                        tcp_packet.set_dst_port(remote_port);
-                        tcp_packet
-                            .fill_checksum(&IpAddress::Ipv6(src_addr), &IpAddress::Ipv6(dst_addr));
-                    }
-                }
-            }
+            // The base Next Header can name an extension header, so resolve the
+            // upper-layer offset before changing either addresses or ports.
+            let ip_packet = Ipv6Packet::new_checked(&*packet)
+                .map_err(|_| "invalid outbound IPv6 packet".to_string())?;
+            let original_source = ip_packet.src_addr();
+            let destination = if unify {
+                original_source
+            } else {
+                remote_address
+            };
+            let source = if !unify && remote_address.is_loopback() {
+                Ipv6Address::LOOPBACK
+            } else {
+                original_source
+            };
+
+            rewrite_ipv6_tcp_udp(
+                packet,
+                source,
+                destination,
+                PortRewrite::Destination(remote_port),
+            )
+            .map_err(|error| error.to_string())
         }
     }
 }
@@ -161,11 +161,11 @@ fn redirect_inbound_packet(
     local_address: IpAddress,
     original_remote_address: IpAddress,
     original_remote_port: u16,
-) {
+) -> Result<(), String> {
     match local_address {
         IpAddress::Ipv4(local_address) => {
             let IpAddress::Ipv4(original_remote_address) = original_remote_address else {
-                return;
+                return Err("IPv4 redirect has an IPv6 remote address".to_string());
             };
 
             if let Ok(mut ip_packet) = Ipv4Packet::new_checked(packet) {
@@ -189,53 +189,30 @@ fn redirect_inbound_packet(
                     }
                 }
             }
+            Ok(())
         }
         IpAddress::Ipv6(local_address) => {
-            if let Ok(mut ip_packet) = Ipv6Packet::new_checked(packet) {
-                let IpAddress::Ipv6(original_remote_address) = original_remote_address else {
-                    return;
-                };
-                ip_packet.set_dst_addr(local_address);
-                ip_packet.set_src_addr(original_remote_address);
-                let src_addr = ip_packet.src_addr();
-                let dst_addr = ip_packet.dst_addr();
-                if ip_packet.next_header() == IpProtocol::Udp {
-                    if let Ok(mut udp_packet) = UdpPacket::new_checked(ip_packet.payload_mut()) {
-                        udp_packet.set_src_port(original_remote_port);
-                        udp_packet
-                            .fill_checksum(&IpAddress::Ipv6(src_addr), &IpAddress::Ipv6(dst_addr));
-                    }
-                }
-                if ip_packet.next_header() == IpProtocol::Tcp {
-                    if let Ok(mut tcp_packet) = TcpPacket::new_checked(ip_packet.payload_mut()) {
-                        tcp_packet.set_src_port(original_remote_port);
-                        tcp_packet
-                            .fill_checksum(&IpAddress::Ipv6(src_addr), &IpAddress::Ipv6(dst_addr));
-                    }
-                }
-            }
+            let IpAddress::Ipv6(original_remote_address) = original_remote_address else {
+                return Err("IPv6 redirect has an IPv4 remote address".to_string());
+            };
+
+            rewrite_ipv6_tcp_udp(
+                packet,
+                original_remote_address,
+                local_address,
+                PortRewrite::Source(original_remote_port),
+            )
+            .map_err(|error| error.to_string())
         }
     }
 }
 
-pub fn recalc_header_checksums(packet: &mut [u8], ipv6: bool) {
+pub fn recalc_header_checksums(packet: &mut [u8], ipv6: bool) -> Result<(), String> {
     if ipv6 {
-        if let Ok(mut ip_packet) = Ipv6Packet::new_checked(packet) {
-            let src_addr = ip_packet.src_addr();
-            let dst_addr = ip_packet.dst_addr();
-            if ip_packet.next_header() == IpProtocol::Udp {
-                if let Ok(mut udp_packet) = UdpPacket::new_checked(ip_packet.payload_mut()) {
-                    udp_packet
-                        .fill_checksum(&IpAddress::Ipv6(src_addr), &IpAddress::Ipv6(dst_addr));
-                }
-            }
-            if ip_packet.next_header() == IpProtocol::Tcp {
-                if let Ok(mut tcp_packet) = TcpPacket::new_checked(ip_packet.payload_mut()) {
-                    tcp_packet
-                        .fill_checksum(&IpAddress::Ipv6(src_addr), &IpAddress::Ipv6(dst_addr));
-                }
-            }
-        }
+        // TCP/UDP start after the complete extension-header chain, and the
+        // pseudo-header length is the upper-layer length rather than the IPv6
+        // payload length (which includes extensions).
+        recalculate_ipv6_transport_checksum(packet).map_err(|error| error.to_string())?;
     } else {
         if let Ok(mut ip_packet) = Ipv4Packet::new_checked(packet) {
             ip_packet.fill_checksum();
@@ -255,6 +232,8 @@ pub fn recalc_header_checksums(packet: &mut [u8], ipv6: bool) {
             }
         }
     }
+
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -387,7 +366,6 @@ pub fn is_fragment_v4(nbl: &NetBufferList) -> bool {
 /// maximum is 15 * 4 = 60 bytes (40 bytes of options beyond the fixed 20).
 pub const IPV4_MAX_HEADER_LEN: usize = 60;
 
-
 /// Reads as many leading bytes of a packet as it actually contains, up to
 /// `buffer.len()`.
 ///
@@ -397,11 +375,7 @@ pub const IPV4_MAX_HEADER_LEN: usize = 60;
 /// takes one read instead of probing sizes downwards.
 ///
 /// Returns `None` if fewer than `min_len` bytes are available.
-fn read_leading_bytes(
-    nbl: &NetBufferList,
-    buffer: &mut [u8],
-    min_len: usize,
-) -> Option<usize> {
+fn read_leading_bytes(nbl: &NetBufferList, buffer: &mut [u8], min_len: usize) -> Option<usize> {
     let available = nbl.get_data_length() as usize;
     if available < min_len {
         return None;
@@ -430,108 +404,6 @@ fn read_leading_bytes(
 /// port fields. A chain longer than this is not decoded: `walk_ipv6_headers`
 /// reports what it managed to parse rather than reading past the buffer.
 pub const IPV6_INSPECT_LEN: usize = 128;
-
-/// Maximum number of extension headers followed before giving up.
-///
-/// A crafted packet can chain extension headers arbitrarily, and a malformed one
-/// can declare a zero-length header that never advances. Both would spin forever
-/// in a callout running at DISPATCH_LEVEL, which hangs the machine rather than
-/// crashing it. The limit bounds the walk unconditionally.
-const MAX_IPV6_EXT_HEADERS: usize = 8;
-
-/// Result of walking an IPv6 extension header chain.
-pub struct Ipv6Headers {
-    /// The real transport protocol, after skipping extension headers. Only
-    /// meaningful when `resolved` is true; otherwise it is the last
-    /// `next_header` value seen before the walk gave up.
-    pub protocol: IpProtocol,
-    /// Offset of the transport header from the start of the IPv6 packet.
-    pub transport_offset: usize,
-    /// True if a fragment header was present and this packet is an individual
-    /// fragment of a larger datagram.
-    pub is_fragment: bool,
-    /// True if the walk reached a non-extension `next_header`, i.e. `protocol`
-    /// really is the transport protocol.
-    ///
-    /// False when the chain was longer than `MAX_IPV6_EXT_HEADERS`, ran past the
-    /// end of the buffer, or contained a header that could not be parsed. In that
-    /// case `protocol` holds an extension header type (60, 43, 0, 44) and
-    /// `transport_offset` points at whatever the walk stopped on - neither
-    /// describes the packet, so no connection key should be built from them.
-    pub resolved: bool,
-}
-
-/// Walks the IPv6 extension header chain to find the transport protocol and its
-/// offset.
-///
-/// IPv6 keeps fragmentation and options in a linked chain of extension headers
-/// after the base header, unlike IPv4 which has fixed fields. The base header's
-/// `next_header` therefore does not identify the transport protocol whenever any
-/// extension header is present: it identifies the first extension instead.
-///
-/// `packet` must start at the IPv6 base header. Reading stops at the end of the
-/// slice, so a truncated buffer yields whatever could be parsed rather than a
-/// panic.
-pub fn walk_ipv6_headers(packet: &[u8]) -> Ipv6Headers {
-    let mut result = Ipv6Headers {
-        protocol: IpProtocol::Unknown(0),
-        transport_offset: IPV6_HEADER_LEN,
-        is_fragment: false,
-        resolved: false,
-    };
-
-    if packet.len() < IPV6_HEADER_LEN {
-        return result;
-    }
-
-    let mut protocol = Ipv6Packet::new_unchecked(packet).next_header();
-    let mut offset = IPV6_HEADER_LEN;
-
-    for _ in 0..MAX_IPV6_EXT_HEADERS {
-        match protocol {
-            IpProtocol::Ipv6Frag => {
-                // Fragment header is a fixed 8 bytes and is not self-describing
-                // through header_len, so it is handled separately.
-                let Some(rest) = packet.get(offset..) else {
-                    break;
-                };
-                let Ok(frag) = Ipv6FragmentHeader::new_checked(rest) else {
-                    break;
-                };
-
-                if frag.frag_offset() != 0 || frag.more_frags() {
-                    result.is_fragment = true;
-                }
-
-                protocol = Ipv6ExtHeader::new_unchecked(rest).next_header();
-                offset += 8;
-            }
-            IpProtocol::HopByHop | IpProtocol::Ipv6Route | IpProtocol::Ipv6Opts => {
-                let Some(rest) = packet.get(offset..) else {
-                    break;
-                };
-                let Ok(ext) = Ipv6ExtHeader::new_checked(rest) else {
-                    break;
-                };
-
-                // header_len counts 8-octet units beyond the first 8 octets.
-                let len = (ext.header_len() as usize + 1) * 8;
-                protocol = ext.next_header();
-                offset += len;
-            }
-            // Not an extension header, so this is the transport protocol. This is
-            // the only exit that means the chain was followed to its end.
-            _ => {
-                result.resolved = true;
-                break;
-            }
-        }
-    }
-
-    result.protocol = protocol;
-    result.transport_offset = offset;
-    result
-}
 
 /// Returns true if this IPv6 packet is an individual fragment of a larger
 /// datagram.
@@ -613,11 +485,8 @@ pub fn is_tcp_reset_from_nbl(nbl: &NetBufferList, ipv6: bool) -> bool {
     // Read through the flags byte even when the IPv4 header has its maximum
     // 40 bytes of options.
     let mut packet = [0u8; IPV4_MAX_HEADER_LEN + TCP_FLAGS_OFFSET + 1];
-    let Some(len) = read_leading_bytes(
-        nbl,
-        &mut packet,
-        IPV4_HEADER_LEN + TCP_FLAGS_OFFSET + 1,
-    ) else {
+    let Some(len) = read_leading_bytes(nbl, &mut packet, IPV4_HEADER_LEN + TCP_FLAGS_OFFSET + 1)
+    else {
         return false;
     };
     let packet = &packet[..len];

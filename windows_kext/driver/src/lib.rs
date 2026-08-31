@@ -28,6 +28,7 @@ mod entry;
 mod icmp_echo_cache;
 #[cfg(not(test))]
 mod id_cache;
+mod ipv6_packet;
 #[cfg(not(test))]
 pub mod logger;
 #[cfg(not(test))]

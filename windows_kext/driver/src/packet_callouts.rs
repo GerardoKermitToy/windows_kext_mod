@@ -1,4 +1,4 @@
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use smoltcp::wire::{IPV4_HEADER_LEN, IPV6_HEADER_LEN};
 use wdk::filter_engine::callout_data::CalloutData;
 use wdk::filter_engine::layer;
@@ -435,14 +435,19 @@ fn ip_packet_layer(
                                 interface_index,
                                 sub_interface_index,
                             ) {
-                                Ok(mut packet) => {
-                                    if let Err(err) = packet.redirect(redirect_info) {
+                                Ok(mut packet) => match packet.redirect(redirect_info) {
+                                    Ok(()) => {
+                                        if let Err(err) = device.inject_packet(packet, false) {
+                                            crate::err!("failed to inject packet: {}", err);
+                                        }
+                                    }
+                                    Err(err) => {
+                                        // The original packet is absorbed below. Drop an
+                                        // unmodified or partially redirected clone rather
+                                        // than bypassing the redirect policy.
                                         crate::err!("failed to redirect packet: {}", err);
                                     }
-                                    if let Err(err) = device.inject_packet(packet, false) {
-                                        crate::err!("failed to inject packet: {}", err);
-                                    }
-                                }
+                                },
                                 Err(err) => crate::err!("failed to clone packet: {}", err),
                             }
                         }
@@ -537,15 +542,18 @@ fn clone_packet(
     };
 
     for clone in &mut clones {
-        if let Some(data) = clone.get_data_mut() {
-            // Outbound packets intercepted at the IP layer may carry only a partial
-            // pseudo-header checksum because the TCP/IP stack relies on NIC hardware
-            // checksum offload to fill in the real value before transmission.
-            // When this clone is later re-injected via FwpsInjectNetwork*Async (on
-            // Accept/PermanentAccept verdict), it bypasses the NIC entirely, so offload
-            // never runs. We must compute the full software checksum here.
-            recalc_header_checksums(data, ipv6);
-        }
+        let Some(data) = clone.get_data_mut() else {
+            return Err("failed to access cloned packet data".to_string());
+        };
+        // Outbound packets intercepted at the IP layer may carry only a partial
+        // pseudo-header checksum because the TCP/IP stack relies on NIC hardware
+        // checksum offload to fill in the real value before transmission.
+        // When this clone is later re-injected via FwpsInjectNetwork*Async (on
+        // Accept/PermanentAccept verdict), it bypasses the NIC entirely, so offload
+        // never runs. We must compute the full software checksum here. An IPv6
+        // packet whose extension chain cannot be resolved must not enter the
+        // pending cache with a checksum that can never be made valid.
+        recalc_header_checksums(data, ipv6)?;
     }
 
     Ok(Packet::PacketLayer(

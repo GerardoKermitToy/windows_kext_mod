@@ -344,12 +344,17 @@ impl Device {
                         | crate::connection::Verdict::RedirectTunnel
                         | crate::connection::Verdict::RedirectSplitTunnel => {
                             if let Some(redirect_info) = redirect_info {
-                                // Will not redirect packets from ALE layer
-                                if let Err(err) = packet.redirect(redirect_info) {
-                                    err!("failed to redirect packet: {}", err);
-                                }
-                                if let Err(err) = self.inject_verdict_packet(packet, false) {
-                                    err!("failed to inject packet: {}", err);
+                                // Never inject a clone when redirect validation or
+                                // checksum reconstruction failed. The packet is dropped
+                                // with this verdict instead of escaping unredirected.
+                                match packet.redirect(redirect_info) {
+                                    Ok(()) => {
+                                        if let Err(err) = self.inject_verdict_packet(packet, false)
+                                        {
+                                            err!("failed to inject packet: {}", err);
+                                        }
+                                    }
+                                    Err(err) => err!("failed to redirect packet: {}", err),
                                 }
                             } else {
                                 // The connection disappeared before its verdict was
