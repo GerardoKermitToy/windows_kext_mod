@@ -20,7 +20,9 @@ use wdk::{
     rw_spin_lock::RwSpinLock,
 };
 
-use windows_sys::Win32::Foundation::{NTSTATUS, STATUS_INVALID_PARAMETER};
+use windows_sys::Win32::Foundation::{
+    NTSTATUS, STATUS_INVALID_DEVICE_STATE, STATUS_INVALID_PARAMETER,
+};
 
 use crate::{
     array_holder::ArrayHolder,
@@ -56,7 +58,10 @@ impl Packet {
 // Device Context
 pub struct Device {
     pub(crate) filter_engine: PassiveMutex<FilterEngine>,
-    pub(crate) read_leftover: RwSpinLock<ArrayHolder>,
+    /// Serializes the complete event-stream read transaction: consuming a saved
+    /// fragment, waiting for/dequeuing records, and publishing the next fragment.
+    /// A spin lock cannot protect this state because an empty stream may wait.
+    read_stream: PassiveMutex<ArrayHolder>,
     pub(crate) event_queue: IOQueue<Info>, // Queue for events to user-space
     pub(crate) packet_cache: RwSpinLock<IdCache>, // Cache of pending packets waiting for verdict
     pub(crate) connection_cache: ConnectionCache, // Cache of connections and their verdicts
@@ -93,8 +98,10 @@ impl Device {
         // callbacks. If either resource is unavailable, DriverEntry fails without
         // ever exposing a callback that depends on a partially built Device.
         let injector = Injector::new().map_err(|err| format!("injector error: {}", err))?;
-        let network_allocator = NetworkAllocator::new()
-            .map_err(|err| format!("network allocator error: {}", err))?;
+        let network_allocator =
+            NetworkAllocator::new().map_err(|err| format!("network allocator error: {}", err))?;
+        let read_stream = PassiveMutex::new(ArrayHolder::default())
+            .map_err(|err| format!("read stream lock error: {}", err))?;
 
         let filter_engine = FilterEngine::new(driver, 0x7dab1057_8e2b_40c4_9b85_693e381d7896)
             .map_err(|err| alloc::format!("filter engine error: {}", err))?;
@@ -106,7 +113,7 @@ impl Device {
 
         Ok(Self {
             filter_engine,
-            read_leftover: RwSpinLock::new(ArrayHolder::default()),
+            read_stream,
             event_queue: IOQueue::new(), // Queue for events to user-space
             packet_cache: RwSpinLock::new(IdCache::new()), // Cache of pending packets waiting for verdict
             connection_cache: ConnectionCache::new(),
@@ -186,39 +193,56 @@ impl Device {
         self.inject_packet(packet, blocked)
     }
 
-    fn write_buffer(&self, read_request: &mut ReadRequest, info: Info) {
+    fn write_buffer(read_request: &mut ReadRequest, info: Info, read_stream: &mut ArrayHolder) {
         let bytes = info.as_bytes();
         let count = read_request.write(bytes);
 
         // Check if the full buffer was written.
         if count < bytes.len() {
-            // Save the leftovers for later.
-            let mut leftover = self.read_leftover.write_lock();
-            leftover.save(&bytes[count..]);
+            // Save the leftovers for later while the same stream transaction is
+            // still exclusively owned by this read.
+            read_stream.save(&bytes[count..]);
         }
+    }
+
+    /// Discards a partial record after every read admitted for the old owner has
+    /// returned. A replacement handle must always begin at a record boundary.
+    pub(crate) fn clear_read_leftover(&self) -> Result<(), String> {
+        let mut read_stream = self
+            .read_stream
+            .lock()
+            .map_err(|err| format!("failed to lock read stream: {}", err))?;
+        read_stream.clear();
+        Ok(())
     }
 
     /// Called when handle. Read is called from user-space.
     pub fn read(&self, read_request: &mut ReadRequest) -> NTSTATUS {
-        let leftover_data = {
-            let mut leftover = self.read_leftover.write_lock();
-            leftover.load()
+        // Keep one exclusive owner across the entire operation. Locking only the
+        // individual load/save calls permits two overlapped reads to consume the
+        // same logical stream concurrently and overwrite each other's fragment.
+        let mut read_stream = match self.read_stream.lock() {
+            Ok(read_stream) => read_stream,
+            Err(err) => {
+                err!("failed to lock read stream: {}", err);
+                return read_request.fail(STATUS_INVALID_DEVICE_STATE);
+            }
         };
-        if let Some(data) = leftover_data {
+
+        if let Some(data) = read_stream.load() {
             // There are leftovers from previous request.
             let count = read_request.write(&data);
 
             // Check if full command was written.
             if count < data.len() {
                 // Save the leftovers for later.
-                let mut leftover = self.read_leftover.write_lock();
-                leftover.save(&data[count..]);
+                read_stream.save(&data[count..]);
             }
         } else {
-            // Noting left from before. Wait for next commands.
+            // Nothing left from before. Wait for the next record.
             match self.event_queue.wait_and_pop_cancellable() {
                 Ok(info) => {
-                    self.write_buffer(read_request, info);
+                    Self::write_buffer(read_request, info, &mut read_stream);
                 }
                 Err(ioqueue::Status::Timeout) => {
                     // Timeout. This will only trigger if pop function is called with timeout.
@@ -241,7 +265,7 @@ impl Device {
         while read_request.free_space() > 5 {
             match self.event_queue.pop() {
                 Ok(info) => {
-                    self.write_buffer(read_request, info);
+                    Self::write_buffer(read_request, info, &mut read_stream);
                 }
                 Err(_) => {
                     break;

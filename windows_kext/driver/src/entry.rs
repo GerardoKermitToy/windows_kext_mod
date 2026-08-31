@@ -587,9 +587,13 @@ unsafe extern "system" fn driver_cleanup(
         {
             // Stop new reads before signaling the wait. Reads that passed the
             // admission check are counted by DispatchGate and are drained below.
-            DISPATCH_GATE.close_reads();
-            device.cancel_read_waiters();
-            DISPATCH_GATE.wait_for_reads();
+            close_and_wait_for_reads(device);
+            // The session gate keeps CREATE from reopening read admission between
+            // the zero-reader observation and this reset. A replacement handle
+            // must begin at a complete record boundary.
+            if let Err(err) = device.clear_read_leftover() {
+                err!("failed to clear read stream during cleanup: {}", err);
+            }
 
             // Keep the owner pointer published until every old read has left;
             // this prevents a replacement CREATE from resetting the event too

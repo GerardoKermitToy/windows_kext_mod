@@ -9,7 +9,6 @@ extern crate alloc;
 // in that graph and compile the full driver graph for every non-test build.
 #[cfg(not(test))]
 mod ale_callouts;
-#[cfg(not(test))]
 mod array_holder;
 #[cfg(not(test))]
 mod bandwidth;
