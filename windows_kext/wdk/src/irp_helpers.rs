@@ -415,6 +415,16 @@ impl DeviceControlRequest {
         bytes_to_write
     }
 
+    pub fn write_exact(&mut self, bytes: &[u8]) -> bool {
+        // Fixed-size IOCTL responses must be all-or-nothing. In particular, do
+        // not advance Information after copying only the prefix of a response.
+        if self.free_space() < bytes.len() {
+            return false;
+        }
+
+        self.write(bytes) == bytes.len()
+    }
+
     pub fn complete(&mut self) -> NTSTATUS {
         self.irp.complete(STATUS_SUCCESS, self.fill_index)
     }
@@ -433,5 +443,51 @@ impl DeviceControlRequest {
 
     pub fn free_space(&self) -> usize {
         self.buffer_len.saturating_sub(self.fill_index)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DeviceControlRequest, IrpPtr};
+
+    fn device_control_request(buffer: &mut [u8]) -> DeviceControlRequest {
+        DeviceControlRequest {
+            // These tests exercise only buffer writes. No completion method may
+            // be called with this inert IRP pointer.
+            irp: IrpPtr {
+                ptr: core::ptr::null_mut(),
+            },
+            buffer: if buffer.is_empty() {
+                core::ptr::null_mut()
+            } else {
+                buffer.as_mut_ptr()
+            },
+            buffer_len: buffer.len(),
+            fill_index: 0,
+            control_code: 0,
+        }
+    }
+
+    #[test]
+    fn exact_ioctl_write_rejects_short_buffer_without_partial_output() {
+        for output_len in 0..4 {
+            let mut output = [0xAA; 3];
+            let mut request = device_control_request(&mut output[..output_len]);
+
+            assert!(!request.write_exact(&[1, 2, 3, 4]));
+            assert_eq!(request.fill_index, 0);
+            assert_eq!(output, [0xAA; 3]);
+        }
+    }
+
+    #[test]
+    fn exact_ioctl_write_reports_complete_output_only() {
+        let mut output = [0xAA; 6];
+        let mut request = device_control_request(&mut output);
+
+        assert!(request.write_exact(&[1, 2, 3, 4]));
+        assert_eq!(request.fill_index, 4);
+        assert_eq!(request.free_space(), 2);
+        assert_eq!(output, [1, 2, 3, 4, 0xAA, 0xAA]);
     }
 }

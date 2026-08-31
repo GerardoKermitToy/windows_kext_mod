@@ -20,8 +20,8 @@ use windows_sys::Wdk::{
     },
 };
 use windows_sys::Win32::Foundation::{
-    NTSTATUS, STATUS_DEVICE_NOT_READY, STATUS_INVALID_DEVICE_STATE, STATUS_INVALID_PARAMETER,
-    STATUS_SHARING_VIOLATION, STATUS_SUCCESS,
+    NTSTATUS, STATUS_BUFFER_TOO_SMALL, STATUS_DEVICE_NOT_READY, STATUS_INVALID_DEVICE_STATE,
+    STATUS_INVALID_PARAMETER, STATUS_SHARING_VIOLATION, STATUS_SUCCESS,
 };
 
 static VERSION: [u8; 4] = include!("../../kextinterface/version.txt");
@@ -728,7 +728,9 @@ unsafe extern "system" fn device_control(
 
     match control_code {
         ControlCode::Version => {
-            control_request.write(&VERSION);
+            if !control_request.write_exact(&VERSION) {
+                return control_request.fail(STATUS_BUFFER_TOO_SMALL);
+            }
         }
         ControlCode::ShutdownRequest => device.shutdown(),
     };
