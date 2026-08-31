@@ -10,8 +10,8 @@ The first callout depends on packet direction and protocol:
 - Outbound UDP is registered at `ALE_AUTH_CONNECT` to capture its PID, but is authorized at the outbound IP packet layer so an ALE pend cannot corrupt the application's send result.
 - Inbound traffic first reaches the inbound IP packet layer.
   - A new TCP or UDP tuple is permitted upward to `ALE_AUTH_RECV_ACCEPT`.
-  - A tuple already known as an inbound connection bypasses packet-level classification in both directions because its policy is owned by ALE.
-  - A received packet belonging to an outbound connection remains on the packet path; this is required for temporary verdicts and reverse redirect rewriting.
+  - A cached inbound tuple is also permitted while its verdict is still `Undecided` and its PID is unknown (`0`) or System (`4`).
+  - Once a verdict is cached or a concrete application PID is known, the packet layer handles it; received packets belonging to outbound connections remain on this path as before for temporary verdicts and reverse redirect rewriting.
 - ICMP and other protocols are handled at the IP packet layer.
 
 ## ALE authorization
@@ -55,17 +55,17 @@ The cache's PID precedence rules ignore PID 0, prevent System (PID 4) from repla
 
 `ALE_FLOW_ESTABLISHED` is not emitted again for successful reauthorization, so this monitor cannot attribute a flow that was already active when the driver loaded.
 
-`ALE_AUTH_RECV_ACCEPT` is a connection/remote-tuple authorization layer, not a per-packet layer. Consequently, inbound TCP/UDP verdicts apply to the ALE connection or UDP remote tuple. Per-packet temporary verdict processing remains only for flows owned by the outbound packet path.
+`ALE_AUTH_RECV_ACCEPT` is a connection/remote-tuple authorization layer, not a per-packet layer. It attributes and performs the initial authorization of inbound TCP/UDP connections. The packet layer permits a missing tuple upward to that layer and keeps permitting a cached `Undecided` tuple only while its PID is unknown (`0`) or System (`4`). Once a verdict or concrete application PID is cached, subsequent packet indications are processed on the packet path instead of being permitted unconditionally.
 
 ## IP packet layer
 
-The packet callouts still see every network-layer indication, but they no longer create or decide inbound TCP/UDP connections.
+The packet callouts still see every network-layer indication. They defer missing inbound TCP/UDP connections, plus undecided connections with PID 0 or 4, to ALE; all other cached states are processed on the packet path.
 
 ### TCP and UDP
 
-- A new inbound tuple is permitted to `ALE_AUTH_RECV_ACCEPT`.
-- Packets whose cached connection direction is inbound are permitted without a second packet-level decision.
-- Packets whose cached connection direction is outbound retain the existing packet behavior:
+- An inbound tuple missing from the cache is permitted to `ALE_AUTH_RECV_ACCEPT`.
+- A cached inbound connection is also permitted while its verdict is `Undecided` and its PID is `0` or `4`.
+- Once a verdict or concrete application PID is cached, the existing packet behavior applies regardless of the cached connection direction:
   - permanent accept/block/drop is applied immediately;
   - temporary verdicts create a Portmaster request;
   - redirect verdicts clone, rewrite, recalculate checksums, inject the replacement, and absorb the original.

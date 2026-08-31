@@ -389,14 +389,19 @@ fn ip_packet_layer(
             if let Some(mut conn_info) =
                 get_connection_info(&device.connection_cache, &key, ipv6)
             {
-                // A connection authorized by ALE_AUTH_RECV_ACCEPT is enforced at
-                // that layer for its lifetime. Do not classify either direction of
-                // the same connection a second time at the packet layer.
+                // A new inbound connection must reach ALE_AUTH_RECV_ACCEPT so it
+                // can be attributed and authorized there. Keep permitting it while
+                // that authorization is still pending and the owning process is
+                // unknown or System, but once ALE has cached a verdict or a concrete
+                // application PID is known, enforce it at the packet layer below.
                 //
                 // Connections authorized by ALE_AUTH_CONNECT are intentionally not
                 // bypassed here. Their packet path still handles temporary verdicts
                 // and reverse redirect rewriting on received packets.
-                if matches!(conn_info.direction, Direction::Inbound) {
+                if matches!(conn_info.direction, Direction::Inbound)
+                    && matches!(conn_info.verdict, Verdict::Undecided)
+                    && matches!(conn_info.process_id, 0 | 4)
+                {
                     data.action_permit();
                     return;
                 }
