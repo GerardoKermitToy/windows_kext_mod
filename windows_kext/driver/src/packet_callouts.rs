@@ -469,26 +469,18 @@ fn ip_packet_layer(
                 // reach this layer without a cache entry.
                 process_id = 0;
 
-                crate::dbg!(
-                    "packet layer adding connection: {} PID: {}",
-                    key,
-                    process_id
-                );
-                if ipv6 {
-                    match ConnectionV6::from_key(&key, process_id, effective_direction) {
-                        Ok(conn) => device.connection_cache.add_connection_v6(conn),
-                        Err(err) => {
-                            crate::err!("failed to build connection: {}", err);
-                            return;
-                        }
+                match device.connection_cache.register_connection(
+                    &key,
+                    process_id,
+                    effective_direction,
+                ) {
+                    Ok(true) => {
+                        crate::dbg!("packet layer added connection: {} PID: {}", key, process_id)
                     }
-                } else {
-                    match ConnectionV4::from_key(&key, process_id, effective_direction) {
-                        Ok(conn) => device.connection_cache.add_connection_v4(conn),
-                        Err(err) => {
-                            crate::err!("failed to build connection: {}", err);
-                            return;
-                        }
+                    Ok(false) => crate::dbg!("connection registered concurrently: {}", key),
+                    Err(err) => {
+                        crate::err!("failed to build connection: {}", err);
+                        return;
                     }
                 }
             }

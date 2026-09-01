@@ -1,8 +1,8 @@
 use crate::{
-    connection::{Connection, ConnectionV4, ConnectionV6, RedirectInfo, Verdict},
+    connection::{Connection, ConnectionV4, ConnectionV6, Direction, RedirectInfo, Verdict},
     connection_map::{ConnectionMap, Key},
 };
-use alloc::vec::Vec;
+use alloc::{string::String, vec::Vec};
 
 use smoltcp::wire::{IpAddress, IpProtocol};
 use wdk::rw_spin_lock::RwSpinLock;
@@ -16,6 +16,19 @@ pub struct ConnectionCache {
     connections_v6: RwSpinLock<ConnectionMap<ConnectionV6>>,
 }
 
+/// Merges process attribution using the same precedence for registration and
+/// later flow-established updates.
+fn merge_process_id(stored: &mut u64, incoming: u64) -> bool {
+    // PID 0 carries no attribution. PID 4 (System) can fill an unknown entry but
+    // must not replace a concrete application PID. Any other concrete PID is the
+    // most useful attribution currently available.
+    if incoming != 0 && (*stored == 0 || incoming != 4) {
+        *stored = incoming;
+        return true;
+    }
+    false
+}
+
 impl ConnectionCache {
     pub fn new() -> Self {
         Self {
@@ -24,14 +37,72 @@ impl ConnectionCache {
         }
     }
 
-    pub fn add_connection_v4(&self, connection: ConnectionV4) {
-        let mut connections = self.connections_v4.write_lock();
-        connections.add(connection);
+    /// Atomically returns the existing live connection or inserts a new one.
+    ///
+    /// Connection construction happens before the spin lock is acquired. The
+    /// exact-tuple check and insertion then share one exclusive map guard, so two
+    /// classify callbacks cannot register duplicate live entries. If another
+    /// callback won the race, preserve its verdict and instance ID while merging
+    /// any more useful process attribution from the rejected candidate.
+    ///
+    /// Returns `true` only when this call inserted the connection.
+    pub fn register_connection(
+        &self,
+        key: &Key,
+        process_id: u64,
+        direction: Direction,
+    ) -> Result<bool, String> {
+        if key.is_ipv6() {
+            let connection = ConnectionV6::from_key(key, process_id, direction)?;
+            Ok(self.register_connection_v6(connection))
+        } else {
+            let connection = ConnectionV4::from_key(key, process_id, direction)?;
+            Ok(self.register_connection_v4(connection))
+        }
     }
 
-    pub fn add_connection_v6(&self, connection: ConnectionV6) {
-        let mut connections = self.connections_v6.write_lock();
-        connections.add(connection);
+    fn register_connection_v4(&self, connection: ConnectionV4) -> bool {
+        let key = connection.get_key();
+        let process_id = connection.process_id;
+        let rejected = {
+            let mut connections = self.connections_v4.write_lock();
+            match connections.insert_if_absent(connection) {
+                Ok(()) => None,
+                Err(connection) => {
+                    if let Some(existing) = connections.get_mut(&key) {
+                        merge_process_id(&mut existing.process_id, process_id);
+                    }
+                    Some(connection)
+                }
+            }
+        };
+
+        // A Connection owns heap state. Drop a rejected candidate only after the
+        // map guard has restored the caller's original IRQL.
+        let inserted = rejected.is_none();
+        drop(rejected);
+        inserted
+    }
+
+    fn register_connection_v6(&self, connection: ConnectionV6) -> bool {
+        let key = connection.get_key();
+        let process_id = connection.process_id;
+        let rejected = {
+            let mut connections = self.connections_v6.write_lock();
+            match connections.insert_if_absent(connection) {
+                Ok(()) => None,
+                Err(connection) => {
+                    if let Some(existing) = connections.get_mut(&key) {
+                        merge_process_id(&mut existing.process_id, process_id);
+                    }
+                    Some(connection)
+                }
+            }
+        };
+
+        let inserted = rejected.is_none();
+        drop(rejected);
+        inserted
     }
 
     /// Updates the owning process of a connection when the incoming PID is usable.
@@ -57,21 +128,12 @@ impl ConnectionCache {
         if key.is_ipv6() {
             let mut connections = self.connections_v6.write_lock();
             if let Some(conn) = connections.get_mut(key) {
-                // PID 4 may fill an unknown entry, while every other PID may
-                // replace the current value. A PID 4 must not replace a
-                // concrete application PID.
-                if conn.process_id == 0 || process_id != 4 {
-                    conn.process_id = process_id;
-                    return true;
-                }
+                return merge_process_id(&mut conn.process_id, process_id);
             }
         } else {
             let mut connections = self.connections_v4.write_lock();
             if let Some(conn) = connections.get_mut(key) {
-                if conn.process_id == 0 || process_id != 4 {
-                    conn.process_id = process_id;
-                    return true;
-                }
+                return merge_process_id(&mut conn.process_id, process_id);
             }
         }
         false

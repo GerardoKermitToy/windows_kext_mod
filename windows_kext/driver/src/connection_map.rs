@@ -71,10 +71,10 @@ impl Key {
 /// inbound flood - where every packet used to walk the entire vector while
 /// holding a spin lock at DISPATCH_LEVEL.
 ///
-/// The invariant is maintained by `add` alone. Nothing else inserts, `retain`
-/// preserves relative order, and the only field callers mutate through
-/// `get_mut` is the verdict, which is not part of the sort key. Should that ever
-/// change, lookups would start missing silently.
+/// The invariant is maintained by the insertion methods alone. Nothing else
+/// inserts, `retain` preserves relative order, and the fields callers mutate
+/// through `get_mut` are not part of the sort key. Should that ever change,
+/// lookups would start missing silently.
 ///
 /// The sort key is deliberately *not* unique. Several connections can share a
 /// remote endpoint on the same local port: an ended entry still awaiting cleanup
@@ -143,7 +143,7 @@ impl<T: Connection + Clone> ConnectionMap<T> {
         Self(BTreeMap::new())
     }
 
-    pub fn add(&mut self, conn: T) {
+    fn add(&mut self, conn: T) {
         let key = conn.get_key().small();
         if let Some(connections) = self.0.get_mut(&key) {
             // Insert *after* any entries with the same remote endpoint. That keeps
@@ -156,6 +156,29 @@ impl<T: Connection + Clone> ConnectionMap<T> {
         } else {
             self.0.insert(key, alloc::vec![conn]);
         }
+    }
+
+    /// Inserts `conn` only when its exact tuple has no live cache entry.
+    ///
+    /// The caller owns the map exclusively for this entire check-and-insert, so
+    /// two classify callbacks cannot both observe absence and create duplicate
+    /// live entries. Retained ended history deliberately does not block tuple
+    /// reuse. On a duplicate, ownership of the rejected candidate is returned so
+    /// its destructor can run after the caller releases any surrounding spin lock.
+    pub(crate) fn insert_if_absent(&mut self, conn: T) -> Result<(), T> {
+        let key = conn.get_key();
+        if let Some(connections) = self.0.get(&key.small()) {
+            let range = equal_range(connections, (key.remote_address, key.remote_port));
+            if connections[range]
+                .iter()
+                .any(|existing| existing.remote_equals(&key) && !existing.has_ended())
+            {
+                return Err(conn);
+            }
+        }
+
+        self.add(conn);
+        Ok(())
     }
 
     /// Returns the live connection matching `key` for mutation.
@@ -494,6 +517,33 @@ mod tests {
             Some(10)
         );
         assert!(map.get_mut(&tuple).is_none());
+    }
+
+    #[test]
+    fn insert_if_absent_rejects_duplicate_live_tuple() {
+        let tuple = key([8, 8, 8, 8], 443);
+        let mut map = ConnectionMap::new();
+        map.add(live(&tuple, 10));
+
+        let rejected = match map.insert_if_absent(live(&tuple, 20)) {
+            Ok(()) => panic!("duplicate live tuple was inserted"),
+            Err(connection) => connection,
+        };
+
+        assert_eq!(rejected.process_id, 20);
+        assert_eq!(map.get_count(), 1);
+        assert_eq!(map.read(&tuple, read_process_id), Some(10));
+    }
+
+    #[test]
+    fn insert_if_absent_allows_tuple_reuse_after_end() {
+        let tuple = key([8, 8, 4, 4], 443);
+        let mut map = ConnectionMap::new();
+        map.add(ended(&tuple, 10));
+
+        assert!(map.insert_if_absent(live(&tuple, 20)).is_ok());
+        assert_eq!(map.get_count(), 2);
+        assert_eq!(map.read(&tuple, read_process_id), Some(20));
     }
 
     #[test]

@@ -273,37 +273,18 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
     if matches!(ale_data.protocol, IpProtocol::Udp)
         && matches!(ale_data.direction, Direction::Outbound)
     {
-        // Only register once. A cached connection may already carry a verdict,
-        // and overwriting it with Undecided would send it for a decision again.
-        // The cache read is live-only, so a retained ended entry cannot suppress
-        // registration of a tuple that has just been reused.
-        let known = if ale_data.is_ipv6 {
-            device
-                .connection_cache
-                .read_connection_v6(&key, |_| -> Option<()> { Some(()) })
-        } else {
-            device
-                .connection_cache
-                .read_connection_v4(&key, |_| -> Option<()> { Some(()) })
-        };
-
-        if known.is_none() {
-            crate::dbg!(
-                "ale layer registering udp connection for packet layer: {} PID: {}",
+        match device.connection_cache.register_connection(
+            &key,
+            ale_data.process_id,
+            ale_data.direction,
+        ) {
+            Ok(true) => crate::dbg!(
+                "ale layer registered udp connection for packet layer: {} PID: {}",
                 key,
                 ale_data.process_id
-            );
-            if ale_data.is_ipv6 {
-                match ConnectionV6::from_key(&key, ale_data.process_id, ale_data.direction) {
-                    Ok(conn) => device.connection_cache.add_connection_v6(conn),
-                    Err(err) => crate::err!("failed to build connection: {}", err),
-                }
-            } else {
-                match ConnectionV4::from_key(&key, ale_data.process_id, ale_data.direction) {
-                    Ok(conn) => device.connection_cache.add_connection_v4(conn),
-                    Err(err) => crate::err!("failed to build connection: {}", err),
-                }
-            }
+            ),
+            Ok(false) => {}
+            Err(err) => crate::err!("failed to build connection: {}", err),
         }
 
         track_udp_endpoint_instance(device, endpoint_handle, key);
@@ -429,34 +410,26 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
             }
         };
 
-        // Connection is not in cache, add it before publishing the request. A
-        // verdict can arrive as soon as the event becomes visible to user space.
-        crate::dbg!(
-            "ale layer adding connection: {} PID: {}",
-            key,
-            ale_data.process_id
-        );
-        if ale_data.is_ipv6 {
-            match ConnectionV6::from_key(&key, ale_data.process_id, ale_data.direction) {
-                Ok(conn) => device.connection_cache.add_connection_v6(conn),
-                Err(err) => {
-                    crate::err!("failed to build connection: {}", err);
-                    if let Err(complete_err) = device.inject_packet(packet, true) {
-                        crate::err!("failed to complete ALE operation: {}", complete_err);
-                    }
-                    return;
+        // Register before publishing the request. The cache performs the live
+        // lookup and insertion under one write guard, so a concurrent classify
+        // callback cannot create another live entry for this tuple.
+        match device.connection_cache.register_connection(
+            &key,
+            ale_data.process_id,
+            ale_data.direction,
+        ) {
+            Ok(true) => crate::dbg!(
+                "ale layer added connection: {} PID: {}",
+                key,
+                ale_data.process_id
+            ),
+            Ok(false) => crate::dbg!("connection registered concurrently: {}", key),
+            Err(err) => {
+                crate::err!("failed to build connection: {}", err);
+                if let Err(complete_err) = device.inject_packet(packet, true) {
+                    crate::err!("failed to complete ALE operation: {}", complete_err);
                 }
-            }
-        } else {
-            match ConnectionV4::from_key(&key, ale_data.process_id, ale_data.direction) {
-                Ok(conn) => device.connection_cache.add_connection_v4(conn),
-                Err(err) => {
-                    crate::err!("failed to build connection: {}", err);
-                    if let Err(complete_err) = device.inject_packet(packet, true) {
-                        crate::err!("failed to complete ALE operation: {}", complete_err);
-                    }
-                    return;
-                }
+                return;
             }
         }
 
