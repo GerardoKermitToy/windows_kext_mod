@@ -318,26 +318,29 @@ impl ConnectionCache {
         connections.read(key, process_connection)
     }
 
-    /// Reads current IPv4 state, falling back to an ended entry only for a late
-    /// packet that has no live connection match.
-    pub fn read_connection_v4_with_ended_fallback<T>(
+    /// Reads IPv4 policy for one packet indication. Inbound lookups use live
+    /// state only so a retained tuple cannot shadow a new flow before ALE
+    /// authorization; outbound lookups may use ended history for packets already
+    /// in flight after closure.
+    pub fn read_connection_v4_for_packet<T>(
         &self,
         key: &Key,
+        packet_direction: Direction,
         process_connection: fn(&ConnectionV4) -> Option<T>,
     ) -> Option<T> {
         let connections = self.connections_v4.read_lock();
-        connections.read_with_ended_fallback(key, process_connection)
+        connections.read_for_packet(key, packet_direction, process_connection)
     }
 
-    /// Reads current IPv6 state, falling back to an ended entry only for a late
-    /// packet that has no live connection match.
-    pub fn read_connection_v6_with_ended_fallback<T>(
+    /// IPv6 counterpart of [`Self::read_connection_v4_for_packet`].
+    pub fn read_connection_v6_for_packet<T>(
         &self,
         key: &Key,
+        packet_direction: Direction,
         process_connection: fn(&ConnectionV6) -> Option<T>,
     ) -> Option<T> {
         let connections = self.connections_v6.read_lock();
-        connections.read_with_ended_fallback(key, process_connection)
+        connections.read_for_packet(key, packet_direction, process_connection)
     }
 
     pub fn end_connection_instance_v4(&self, key: Key, instance_id: u64) -> Option<ConnectionV4> {

@@ -10,7 +10,8 @@ The first callout depends on packet direction and protocol:
 - Outbound UDP is registered at `ALE_AUTH_CONNECT` to capture its PID, but is authorized at the outbound IP packet layer so an ALE pend cannot corrupt the application's send result.
 - Inbound traffic first reaches the inbound IP packet layer.
   - A new TCP or UDP tuple is permitted upward to `ALE_AUTH_RECV_ACCEPT`.
-  - A cached inbound tuple is also permitted while its verdict is still `Undecided` and its PID is unknown (`0`) or System (`4`).
+  - A cached live inbound tuple is also permitted while its verdict is still `Undecided` and its PID is unknown (`0`) or System (`4`).
+  - Retained ended entries are never used as inbound packet policy: the tuple may already belong to a new flow that must receive fresh ALE attribution and authorization.
   - Once a verdict is cached or a concrete application PID is known, the packet layer handles it; received packets belonging to outbound connections remain on this path as before for temporary verdicts and reverse redirect rewriting.
 - ICMP and other protocols are handled at the IP packet layer.
 
@@ -64,8 +65,8 @@ The packet callouts still see every network-layer indication. They defer missing
 
 ### TCP and UDP
 
-- An inbound tuple missing from the cache is permitted to `ALE_AUTH_RECV_ACCEPT`.
-- A cached inbound connection is also permitted while its verdict is `Undecided` and its PID is `0` or `4`.
+- An inbound tuple with no live cache entry is permitted to `ALE_AUTH_RECV_ACCEPT`; all retained ended history is ignored so tuple reuse cannot inherit the previous flow's verdict.
+- A cached live inbound connection is also permitted while its verdict is `Undecided` and its PID is `0` or `4`.
 - Once a verdict or concrete application PID is cached, the existing packet behavior applies regardless of the cached connection direction:
   - permanent accept/block/drop is applied immediately;
   - temporary verdicts create a Portmaster request;
@@ -82,4 +83,4 @@ Individual IP fragments are permitted until WFP presents the reassembled datagra
 
 ## Connection cache
 
-The cache stores TCP and UDP keys, direction, process ID, verdict, redirect state, and activity timestamps. Native WFP flow deletion, endpoint closure, and resource release mark tracked connections as ended and emit their lifecycle event. Cleanup removes ended entries after their one-minute late-packet grace period. A ten-minute inactivity watchdog applies only to live UDP entries: it emits END, removes the endpoint association, and returns the callout-owned WFP context, including when native WFP cleanup is delayed. Live TCP entries are never removed for inactivity; they remain until a native lifecycle signal ends them, the cache is explicitly cleared, or the driver unloads. These cleanup operations are bookkeeping only and do not abort the WFP flow or close the application's socket.
+The cache stores TCP and UDP keys, direction, process ID, verdict, redirect state, and activity timestamps. Native WFP flow deletion, endpoint closure, and resource release mark tracked connections as ended and emit their lifecycle event. Cleanup removes ended entries after their one-minute grace period. During that interval the outbound packet path may use an ended entry for traffic already in flight, but the inbound path never does because the tuple may already identify a new flow awaiting ALE authorization. A ten-minute inactivity watchdog applies only to live UDP entries: it emits END, removes the endpoint association, and returns the callout-owned WFP context, including when native WFP cleanup is delayed. Live TCP entries are never removed for inactivity; they remain until a native lifecycle signal ends them, the cache is explicitly cleared, or the driver unloads. These cleanup operations are bookkeeping only and do not abort the WFP flow or close the application's socket.

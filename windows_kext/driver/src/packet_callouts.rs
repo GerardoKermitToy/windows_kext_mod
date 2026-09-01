@@ -281,7 +281,7 @@ fn ip_packet_layer(
         if matches!(direction, Direction::Outbound)
             && key.protocol == smoltcp::wire::IpProtocol::Tcp
             && is_tcp_reset_from_nbl(&nbl, ipv6)
-            && get_connection_info(&device.connection_cache, &key, ipv6).is_none()
+            && get_connection_info(&device.connection_cache, &key, ipv6, direction).is_none()
         {
             data.action_permit();
             return;
@@ -400,7 +400,9 @@ fn ip_packet_layer(
             key.protocol,
             smoltcp::wire::IpProtocol::Tcp | smoltcp::wire::IpProtocol::Udp
         ) {
-            if let Some(mut conn_info) = get_connection_info(&device.connection_cache, &key, ipv6) {
+            if let Some(mut conn_info) =
+                get_connection_info(&device.connection_cache, &key, ipv6, direction)
+            {
                 // A new inbound connection must reach ALE_AUTH_RECV_ACCEPT so it
                 // can be attributed and authorized there. Keep permitting it while
                 // that authorization is still pending and the owning process is
@@ -591,13 +593,18 @@ fn get_connection_info(
     connection_cache: &ConnectionCache,
     key: &Key,
     ipv6: bool,
+    packet_direction: Direction,
 ) -> Option<ConnectionInfo> {
     // A packet already in flight can arrive after endpoint closure. Preserve the
-    // ended-entry fallback for this packet-level policy path, while ALE and
-    // cache-update callers use live-only lookups.
+    // ended-entry fallback only on the outbound packet path, which TCP/UDP reaches
+    // after ALE has registered any newly reused tuple. On the inbound path an
+    // ended entry is indistinguishable from the first packet of a new inbound flow;
+    // treating it as a miss lets that flow reach ALE_AUTH_RECV_ACCEPT for fresh
+    // attribution and authorization.
     if ipv6 {
-        let conn_info = connection_cache.read_connection_v6_with_ended_fallback(
+        let conn_info = connection_cache.read_connection_v6_for_packet(
             key,
+            packet_direction,
             |conn: &ConnectionV6| -> Option<ConnectionInfo> {
                 // Function is is behind spin lock. Just copy and return.
                 Some(ConnectionInfo::from_connection(conn))
@@ -605,8 +612,9 @@ fn get_connection_info(
         );
         return conn_info;
     } else {
-        let conn_info = connection_cache.read_connection_v4_with_ended_fallback(
+        let conn_info = connection_cache.read_connection_v4_for_packet(
             key,
+            packet_direction,
             |conn: &ConnectionV4| -> Option<ConnectionInfo> {
                 // Function is is behind spin lock. Just copy and return.
                 Some(ConnectionInfo::from_connection(conn))

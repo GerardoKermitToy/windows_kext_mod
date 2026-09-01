@@ -1,6 +1,6 @@
 use core::{fmt::Display, time::Duration};
 
-use crate::connection::{is_redirect_port, Connection};
+use crate::connection::{is_redirect_port, Connection, Direction};
 use alloc::{collections::BTreeMap, vec::Vec};
 use core::ops::Range;
 use smoltcp::wire::{IpAddress, IpProtocol};
@@ -284,6 +284,25 @@ impl<T: Connection + Clone> ConnectionMap<T> {
         self.read_matching(key, read_connection, true)
     }
 
+    /// Reads connection policy for one packet indication.
+    ///
+    /// An inbound packet can be the first packet of a new flow that reused an
+    /// ended tuple before ALE registered its replacement, so it must use live
+    /// state only. Outbound TCP/UDP reaches ALE before the packet layer; when no
+    /// live entry exists there, retained state can still classify a packet that
+    /// was already in flight when its connection closed.
+    pub fn read_for_packet<C>(
+        &self,
+        key: &Key,
+        packet_direction: Direction,
+        read_connection: fn(&T) -> Option<C>,
+    ) -> Option<C> {
+        match packet_direction {
+            Direction::Inbound => self.read(key, read_connection),
+            Direction::Outbound => self.read_with_ended_fallback(key, read_connection),
+        }
+    }
+
     fn read_matching<C>(
         &self,
         key: &Key,
@@ -534,6 +553,12 @@ mod tests {
         conn
     }
 
+    fn ended_in_direction(key: &Key, process_id: u64, direction: Direction) -> ConnectionV4 {
+        let mut conn = ConnectionV4::from_key(key, process_id, direction).expect("IPv4 key");
+        conn.end(1);
+        conn
+    }
+
     fn redirected(mut conn: ConnectionV4) -> ConnectionV4 {
         conn.verdict = Verdict::RedirectNameServer;
         conn
@@ -567,6 +592,21 @@ mod tests {
     }
 
     #[test]
+    fn ended_exact_entry_is_not_inbound_packet_fallback() {
+        let tuple = key([8, 8, 4, 4], 53);
+
+        for connection_direction in [Direction::Inbound, Direction::Outbound] {
+            let mut map = ConnectionMap::new();
+            map.add(ended_in_direction(&tuple, 10, connection_direction));
+
+            assert_eq!(
+                map.read_for_packet(&tuple, Direction::Inbound, read_process_id),
+                None
+            );
+        }
+    }
+
+    #[test]
     fn ended_exact_entry_is_read_only_late_packet_fallback() {
         let tuple = key([8, 8, 4, 4], 53);
         let mut map = ConnectionMap::new();
@@ -575,6 +615,10 @@ mod tests {
         assert_eq!(map.read(&tuple, read_process_id), None);
         assert_eq!(
             map.read_with_ended_fallback(&tuple, read_process_id),
+            Some(10)
+        );
+        assert_eq!(
+            map.read_for_packet(&tuple, Direction::Outbound, read_process_id),
             Some(10)
         );
         assert!(map.get_mut(&tuple).is_none());
@@ -839,5 +883,25 @@ mod tests {
             map.read_with_ended_fallback(&redirect_target, read_process_id),
             Some(10)
         );
+    }
+
+    #[test]
+    fn ended_redirect_is_not_inbound_packet_fallback() {
+        let original = key([8, 8, 8, 8], 53);
+        let redirect_target = key([127, 0, 0, 1], PM_DNS_PORT);
+
+        for connection_direction in [Direction::Inbound, Direction::Outbound] {
+            let mut map = ConnectionMap::new();
+            map.add(redirected(ended_in_direction(
+                &original,
+                10,
+                connection_direction,
+            )));
+
+            assert_eq!(
+                map.read_for_packet(&redirect_target, Direction::Inbound, read_process_id),
+                None
+            );
+        }
     }
 }
