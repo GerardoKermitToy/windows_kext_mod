@@ -12,8 +12,16 @@ pub struct Entry<T> {
     id: u64,
 }
 
+pub struct PendingPacket {
+    pub key: Key,
+    pub packet: Packet,
+    /// Exact live connection that queued this packet. Protocols without
+    /// connection state (for example ICMP) deliberately leave this unset.
+    pub connection_instance_id: Option<u64>,
+}
+
 pub struct IdCache {
-    values: VecDeque<Entry<(Key, Packet)>>,
+    values: VecDeque<Entry<PendingPacket>>,
     lock: RwSpinLock,
     next_id: u64,
 }
@@ -30,6 +38,7 @@ impl IdCache {
     pub fn push(
         &mut self,
         value: (Key, Packet),
+        connection_instance_id: Option<u64>,
         process_id: u64,
         direction: Direction,
         ale_layer: bool,
@@ -37,18 +46,58 @@ impl IdCache {
         let _guard = self.lock.write_lock();
         let id = self.next_id;
         let info = build_info(&value.0, id, process_id, direction, &value.1, ale_layer);
-        self.values.push_back(Entry { value, id });
+        self.values.push_back(Entry {
+            value: PendingPacket {
+                key: value.0,
+                packet: value.1,
+                connection_instance_id,
+            },
+            id,
+        });
         self.next_id = self.next_id.wrapping_add(1); // Assuming this will not overflow.
 
         return info;
     }
 
-    pub fn pop_id(&mut self, id: u64) -> Option<(Key, Packet)> {
+    pub fn pop_id(&mut self, id: u64) -> Option<PendingPacket> {
         let _guard = self.lock.write_lock();
         if let Ok(index) = self.values.binary_search_by_key(&id, |val| val.id) {
             return self.values.remove(index).map(|entry| entry.value);
         }
         None
+    }
+
+    /// Removes every pending packet owned by one of the supplied connection
+    /// instances while preserving the ID order of unrelated requests.
+    ///
+    /// The caller completes the returned ALE operations as blocked after both the
+    /// cache lock and its outer Device lock have been released.
+    pub fn pop_connection_instances(
+        &mut self,
+        sorted_instance_ids: &[u64],
+    ) -> VecDeque<PendingPacket> {
+        if sorted_instance_ids.is_empty() {
+            return VecDeque::new();
+        }
+
+        let _guard = self.lock.write_lock();
+        let mut retained = VecDeque::with_capacity(self.values.len());
+        let mut removed = VecDeque::new();
+
+        while let Some(entry) = self.values.pop_front() {
+            let belongs_to_closed_instance = entry
+                .value
+                .connection_instance_id
+                .map(|instance_id| sorted_instance_ids.binary_search(&instance_id).is_ok())
+                .unwrap_or(false);
+            if belongs_to_closed_instance {
+                removed.push_back(entry.value);
+            } else {
+                retained.push_back(entry);
+            }
+        }
+        self.values = retained;
+        removed
     }
 
     #[allow(dead_code)]
@@ -57,7 +106,7 @@ impl IdCache {
         return self.values.len();
     }
 
-    pub fn pop_all(&mut self) -> VecDeque<Entry<(Key, Packet)>> {
+    pub fn pop_all(&mut self) -> VecDeque<Entry<PendingPacket>> {
         let mut values = VecDeque::with_capacity(1);
         let _guard = self.lock.write_lock();
         mem::swap(&mut self.values, &mut values);

@@ -2,7 +2,7 @@ use crate::connection::{Connection, ConnectionV4, ConnectionV6, Direction, Verdi
 use crate::connection_map::Key;
 use crate::device::{Device, Packet};
 use crate::udp_flow_cache::UdpFlowRegistration;
-use alloc::{boxed::Box, string::String};
+use alloc::{boxed::Box, string::String, vec::Vec};
 
 use crate::info;
 use smoltcp::wire::{
@@ -192,11 +192,13 @@ fn udp_endpoint_handle(data: &CalloutData) -> Option<u64> {
 /// Associates an endpoint only after a concrete live connection-cache instance
 /// exists. This avoids unbound peers that no flow callback or periodic cleanup can
 /// identify precisely.
-fn track_udp_endpoint_instance(device: &Device, endpoint_handle: Option<u64>, key: Key) {
-    let (Some(endpoint_handle), Some(instance_id)) = (
-        endpoint_handle,
-        device.connection_cache.get_connection_instance_id(&key),
-    ) else {
+fn track_udp_endpoint_instance(
+    device: &Device,
+    endpoint_handle: Option<u64>,
+    key: Key,
+    instance_id: u64,
+) {
+    let Some(endpoint_handle) = endpoint_handle else {
         return;
     };
     let mut endpoint_cache = device.udp_endpoint_cache.write_lock();
@@ -278,16 +280,19 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
             ale_data.process_id,
             ale_data.direction,
         ) {
-            Ok(true) => crate::dbg!(
-                "ale layer registered udp connection for packet layer: {} PID: {}",
-                key,
-                ale_data.process_id
-            ),
-            Ok(false) => {}
+            Ok(registration) => {
+                if registration.inserted {
+                    crate::dbg!(
+                        "ale layer registered udp connection for packet layer: {} PID: {}",
+                        key,
+                        ale_data.process_id
+                    );
+                }
+                track_udp_endpoint_instance(device, endpoint_handle, key, registration.instance_id);
+            }
             Err(err) => crate::err!("failed to build connection: {}", err),
         }
 
-        track_udp_endpoint_instance(device, endpoint_handle, key);
         data.action_permit();
 
         if device.is_owner_pid(ale_data.process_id as u32) {
@@ -299,25 +304,25 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
     }
 
     // Check if connection is already in cache.
-    let verdict = if ale_data.is_ipv6 {
+    let cached = if ale_data.is_ipv6 {
         device
             .connection_cache
-            .read_connection_v6(&key, |conn| -> Option<Verdict> {
+            .read_connection_v6(&key, |conn| -> Option<(Verdict, u64)> {
                 // Function is behind spin lock, just copy and return.
-                Some(conn.verdict)
+                Some((conn.verdict, conn.get_instance_id()))
             })
     } else {
         device
             .connection_cache
-            .read_connection_v4(&ale_data.as_key(), |conn| -> Option<Verdict> {
+            .read_connection_v4(&key, |conn| -> Option<(Verdict, u64)> {
                 // Function is behind spin lock, just copy and return.
-                Some(conn.verdict)
+                Some((conn.verdict, conn.get_instance_id()))
             })
     };
 
     // Connection already in cache.
-    if let Some(verdict) = verdict {
-        track_udp_endpoint_instance(device, endpoint_handle, key);
+    if let Some((verdict, connection_instance_id)) = cached {
+        track_udp_endpoint_instance(device, endpoint_handle, key, connection_instance_id);
         crate::dbg!("processing existing connection: {} {}", key, verdict);
         match verdict {
             // No verdict yet
@@ -330,6 +335,7 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
                             let mut packet_cache = device.packet_cache.write_lock();
                             packet_cache.push(
                                 (key, packet),
+                                Some(connection_instance_id),
                                 ale_data.process_id,
                                 ale_data.direction,
                                 true,
@@ -413,17 +419,23 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
         // Register before publishing the request. The cache performs the live
         // lookup and insertion under one write guard, so a concurrent classify
         // callback cannot create another live entry for this tuple.
-        match device.connection_cache.register_connection(
+        let registration = match device.connection_cache.register_connection(
             &key,
             ale_data.process_id,
             ale_data.direction,
         ) {
-            Ok(true) => crate::dbg!(
-                "ale layer added connection: {} PID: {}",
-                key,
-                ale_data.process_id
-            ),
-            Ok(false) => crate::dbg!("connection registered concurrently: {}", key),
+            Ok(registration) => {
+                if registration.inserted {
+                    crate::dbg!(
+                        "ale layer added connection: {} PID: {}",
+                        key,
+                        ale_data.process_id
+                    );
+                } else {
+                    crate::dbg!("connection registered concurrently: {}", key);
+                }
+                registration
+            }
             Err(err) => {
                 crate::err!("failed to build connection: {}", err);
                 if let Err(complete_err) = device.inject_packet(packet, true) {
@@ -431,12 +443,18 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
                 }
                 return;
             }
-        }
+        };
 
-        track_udp_endpoint_instance(device, endpoint_handle, key);
+        track_udp_endpoint_instance(device, endpoint_handle, key, registration.instance_id);
         let info = {
             let mut packet_cache = device.packet_cache.write_lock();
-            packet_cache.push((key, packet), ale_data.process_id, ale_data.direction, true)
+            packet_cache.push(
+                (key, packet),
+                Some(registration.instance_id),
+                ale_data.process_id,
+                ale_data.direction,
+                true,
+            )
         };
         if let Some(info) = info {
             let _ = device.event_queue.push(info);
@@ -553,6 +571,14 @@ fn create_packet_list(
     )?))
 }
 
+fn discard_pending_connections<T: Connection>(device: &Device, connections: &[T]) {
+    let instance_ids: Vec<u64> = connections
+        .iter()
+        .map(Connection::get_instance_id)
+        .collect();
+    device.discard_pending_connection_instances(&instance_ids);
+}
+
 pub(crate) fn emit_connection_end_v4(device: &Device, conn: ConnectionV4, process_id: u64) {
     let info = protocol::info::connection_end_event_v4_info(
         if conn.process_id == 0 {
@@ -611,6 +637,9 @@ pub(crate) fn reclaim_udp_flow_context(
 
 /// Associates the cached UDP tuple with WFP's native ALE-flow lifetime.
 ///
+/// Endpoint lifetime tracking is established independently at authorization and
+/// remains valid even if WFP rejects this flow-context association.
+///
 /// The registration table owns the identifiers needed to retire stale contexts
 /// during periodic cleanup and to remove every remaining context during unload.
 /// WFP owns `flow_context` after association succeeds and returns it exactly once
@@ -620,6 +649,7 @@ fn associate_udp_flow_context(
     data: &CalloutData,
     key: Key,
     endpoint_handle: Option<u64>,
+    connection_instance_id: u64,
 ) {
     if data.has_flow_context() {
         return;
@@ -629,16 +659,9 @@ fn associate_udp_flow_context(
         return;
     };
 
-    let Some(connection_instance_id) = device.connection_cache.get_connection_instance_id(&key)
-    else {
+    if connection_instance_id == 0 {
         return;
-    };
-    let endpoint_association_added = endpoint_handle
-        .map(|endpoint_handle| {
-            let mut endpoint_cache = device.udp_endpoint_cache.write_lock();
-            endpoint_cache.associate_instance(endpoint_handle, key, connection_instance_id)
-        })
-        .unwrap_or(false);
+    }
     let registration = UdpFlowRegistration::new(
         flow_id,
         data.get_layer_id(),
@@ -656,16 +679,6 @@ fn associate_udp_flow_context(
         unsafe {
             drop(Box::from_raw(flow_context as *mut UdpFlowContext));
         }
-        if endpoint_association_added {
-            if let Some(endpoint_handle) = endpoint_handle {
-                let mut endpoint_cache = device.udp_endpoint_cache.write_lock();
-                let _ = endpoint_cache.dissociate(
-                    endpoint_handle,
-                    key,
-                    connection_instance_id,
-                );
-            }
-        }
         return;
     }
 
@@ -674,16 +687,6 @@ fn associate_udp_flow_context(
         // ownership to WFP. Keep the conditional as a guard for the termination
         // race where flowDeleteFn has already claimed the registration.
         reclaim_udp_flow_context(device, flow_context, connection_instance_id);
-        if endpoint_association_added {
-            if let Some(endpoint_handle) = endpoint_handle {
-                let mut endpoint_cache = device.udp_endpoint_cache.write_lock();
-                let _ = endpoint_cache.dissociate(
-                    endpoint_handle,
-                    key,
-                    connection_instance_id,
-                );
-            }
-        }
         crate::err!("failed to associate UDP flow {}: {}", key, err);
         return;
     }
@@ -716,8 +719,7 @@ pub(crate) unsafe extern "system" fn udp_flow_delete(
     // dereferencing either Device or the opaque flow context.  During unload
     // classify admission is closed first, but this half remains open while
     // prepare_unload removes WFP contexts and receives their callbacks.
-    let Some(callback_admission) =
-        wdk::callback_barrier::CALLBACK_BARRIER.enter_flow_delete()
+    let Some(callback_admission) = wdk::callback_barrier::CALLBACK_BARRIER.enter_flow_delete()
     else {
         return;
     };
@@ -743,9 +745,10 @@ pub(crate) unsafe extern "system" fn udp_flow_delete(
         return;
     };
 
-    let Some(reclaim_only) = device
-        .udp_flow_cache
-        .begin_callback(flow_context, layer_id, callout_id)
+    let Some(reclaim_only) =
+        device
+            .udp_flow_cache
+            .begin_callback(flow_context, layer_id, callout_id)
     else {
         // A duplicate, mismatched, or already-reclaimed callback has no
         // ownership left to release. In particular, never reconstruct a Box for
@@ -765,11 +768,8 @@ pub(crate) unsafe extern "system" fn udp_flow_delete(
 
     if let Some(endpoint_handle) = context.endpoint_handle {
         let mut endpoint_cache = device.udp_endpoint_cache.write_lock();
-        let _ = endpoint_cache.dissociate(
-            endpoint_handle,
-            context.key,
-            context.connection_instance_id,
-        );
+        let _ =
+            endpoint_cache.dissociate(endpoint_handle, context.key, context.connection_instance_id);
     }
 
     let key = context.key;
@@ -778,12 +778,14 @@ pub(crate) unsafe extern "system" fn udp_flow_delete(
             .connection_cache
             .end_connection_instance_v6(key, context.connection_instance_id)
         {
+            discard_pending_connections(device, core::slice::from_ref(&conn));
             emit_connection_end_v6(device, conn, context.process_id);
         }
     } else if let Some(conn) = device
         .connection_cache
         .end_connection_instance_v4(key, context.connection_instance_id)
     {
+        discard_pending_connections(device, core::slice::from_ref(&conn));
         emit_connection_end_v4(device, conn, context.process_id);
     }
 
@@ -799,6 +801,8 @@ fn end_udp_endpoint(device: &Device, endpoint_handle: u64, process_id: u64) {
         return;
     };
 
+    let mut ended_v4 = Vec::new();
+    let mut ended_v6 = Vec::new();
     for peer in endpoint {
         let key = peer.key;
         if key.is_ipv6() {
@@ -806,14 +810,23 @@ fn end_udp_endpoint(device: &Device, endpoint_handle: u64, process_id: u64) {
                 .connection_cache
                 .end_connection_instance_v6(key, peer.instance_id)
             {
-                emit_connection_end_v6(device, conn, process_id);
+                ended_v6.push(conn);
             }
         } else if let Some(conn) = device
             .connection_cache
             .end_connection_instance_v4(key, peer.instance_id)
         {
-            emit_connection_end_v4(device, conn, process_id);
+            ended_v4.push(conn);
         }
+    }
+
+    discard_pending_connections(device, &ended_v4);
+    discard_pending_connections(device, &ended_v6);
+    for conn in ended_v4 {
+        emit_connection_end_v4(device, conn, process_id);
+    }
+    for conn in ended_v6 {
+        emit_connection_end_v6(device, conn, process_id);
     }
 }
 
@@ -829,6 +842,7 @@ fn end_local_endpoint_v4(
         local_address,
         (process_id != 0).then_some(process_id),
     ) {
+        discard_pending_connections(device, &conns);
         for conn in conns {
             emit_connection_end_v4(device, conn, process_id);
         }
@@ -847,6 +861,7 @@ fn end_local_endpoint_v6(
         local_address,
         (process_id != 0).then_some(process_id),
     ) {
+        discard_pending_connections(device, &conns);
         for conn in conns {
             emit_connection_end_v6(device, conn, process_id);
         }
@@ -913,6 +928,7 @@ pub fn endpoint_closure_v4(data: CalloutData) {
     };
 
     if let Some(conn) = device.connection_cache.end_connection_v4(key) {
+        discard_pending_connections(device, core::slice::from_ref(&conn));
         emit_connection_end_v4(device, conn, process_id);
     }
 }
@@ -971,6 +987,7 @@ pub fn endpoint_closure_v6(data: CalloutData) {
     };
 
     if let Some(conn) = device.connection_cache.end_connection_v6(key) {
+        discard_pending_connections(device, core::slice::from_ref(&conn));
         emit_connection_end_v6(device, conn, process_id);
     }
 }
@@ -1055,14 +1072,41 @@ pub fn ale_flow_established_monitor(data: CalloutData) {
         _ => return,
     };
 
-    // Refresh attribution before exposing the context to WFP: a flow can begin
-    // terminating as soon as it has been associated.
-    if let Some(process_id) = process_id {
-        device.connection_cache.update_process_id(&key, process_id);
-    }
-
     if matches!(key.protocol, IpProtocol::Udp) {
-        associate_udp_flow_context(device, &data, key, udp_endpoint_handle(&data));
+        let endpoint_handle = udp_endpoint_handle(&data);
+        // Authorization records the exact cache instance under the endpoint
+        // handle. Resolve and validate it while both endpoint and connection
+        // guards are held, so endpoint closure cannot turn an old flow callback
+        // into a tuple-only match against a replacement connection.
+        let connection_instance_id = if let Some(endpoint_handle) = endpoint_handle {
+            let endpoint_cache = device.udp_endpoint_cache.read_lock();
+            endpoint_cache.with_instance_id(endpoint_handle, &key, |instance_id| {
+                device
+                    .connection_cache
+                    .with_live_connection_instance(&key, instance_id, Some)
+            })
+        } else {
+            device.connection_cache.get_connection_instance_id(&key)
+        };
+        let Some(connection_instance_id) = connection_instance_id else {
+            return;
+        };
+
+        // Refresh attribution before exposing the context to WFP: a flow can begin
+        // terminating as soon as it has been associated. Use the same exact
+        // instance selected above rather than a second tuple-only update.
+        if let Some(process_id) = process_id {
+            device.connection_cache.update_process_id_instance(
+                &key,
+                connection_instance_id,
+                process_id,
+            );
+        }
+        associate_udp_flow_context(device, &data, key, endpoint_handle, connection_instance_id);
+    } else if let Some(process_id) = process_id {
+        // TCP has no endpoint-peer map; preserve its existing tuple attribution
+        // path. The UDP path above is protected by the endpoint instance identity.
+        device.connection_cache.update_process_id(&key, process_id);
     }
 }
 
@@ -1089,6 +1133,7 @@ pub fn ale_resource_monitor(data: CalloutData) {
                     get_protocol(&data, Fields::IpProtocol as usize),
                     process_id,
                 );
+                discard_pending_connections(device, &conns);
                 for conn in conns {
                     emit_connection_end_v4(device, conn, process_id);
                 }
@@ -1111,6 +1156,7 @@ pub fn ale_resource_monitor(data: CalloutData) {
                     get_protocol(&data, Fields::IpProtocol as usize),
                     process_id,
                 );
+                discard_pending_connections(device, &conns);
                 for conn in conns {
                     emit_connection_end_v6(device, conn, process_id);
                 }
@@ -1143,6 +1189,7 @@ pub fn ale_resource_monitor(data: CalloutData) {
                     get_protocol(&data, Fields::IpProtocol as usize),
                     process_id,
                 );
+                discard_pending_connections(device, &conns);
                 for conn in conns {
                     emit_connection_end_v4(device, conn, process_id);
                 }
@@ -1175,6 +1222,7 @@ pub fn ale_resource_monitor(data: CalloutData) {
                     get_protocol(&data, Fields::IpProtocol as usize),
                     process_id,
                 );
+                discard_pending_connections(device, &conns);
                 for conn in conns {
                     emit_connection_end_v6(device, conn, process_id);
                 }

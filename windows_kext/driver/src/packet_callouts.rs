@@ -7,7 +7,7 @@ use wdk::filter_engine::packet::InjectInfo;
 
 use crate::connection::{
     Connection, ConnectionV4, ConnectionV6, Direction, RedirectInfo, Verdict, PM_DNS_PORT,
-    PM_SPN_PORT, PM_SPLIT_TUN_PORT,
+    PM_SPLIT_TUN_PORT, PM_SPN_PORT,
 };
 use crate::connection_cache::ConnectionCache;
 use crate::connection_map::Key;
@@ -154,6 +154,7 @@ struct ConnectionInfo {
     verdict: Verdict,
     process_id: u64,
     direction: Direction,
+    instance_id: u64,
     redirect_info: Option<RedirectInfo>,
 }
 
@@ -163,6 +164,7 @@ impl ConnectionInfo {
             verdict: conn.get_verdict(),
             process_id: conn.get_process_id(),
             direction: conn.get_direction(),
+            instance_id: conn.get_instance_id(),
             redirect_info: conn.redirect_info(),
         }
     }
@@ -276,6 +278,7 @@ fn ip_packet_layer(
 
         let mut send_request_to_portmaster = true;
         let mut process_id = 0;
+        let mut connection_instance_id = None;
 
         // For loopback ICMP echo reply, WFP reports it as OUTBOUND but it is
         // semantically INBOUND. Track the effective direction separately.
@@ -386,9 +389,7 @@ fn ip_packet_layer(
             key.protocol,
             smoltcp::wire::IpProtocol::Tcp | smoltcp::wire::IpProtocol::Udp
         ) {
-            if let Some(mut conn_info) =
-                get_connection_info(&device.connection_cache, &key, ipv6)
-            {
+            if let Some(mut conn_info) = get_connection_info(&device.connection_cache, &key, ipv6) {
                 // A new inbound connection must reach ALE_AUTH_RECV_ACCEPT so it
                 // can be attributed and authorized there. Keep permitting it while
                 // that authorization is still pending and the owning process is
@@ -407,6 +408,7 @@ fn ip_packet_layer(
                 }
 
                 process_id = conn_info.process_id;
+                connection_instance_id = Some(conn_info.instance_id);
                 // Check if there is action for this connection.
                 match conn_info.verdict {
                     Verdict::Undecided | Verdict::Accept | Verdict::Block | Verdict::Drop => {}
@@ -474,10 +476,18 @@ fn ip_packet_layer(
                     process_id,
                     effective_direction,
                 ) {
-                    Ok(true) => {
-                        crate::dbg!("packet layer added connection: {} PID: {}", key, process_id)
+                    Ok(registration) => {
+                        connection_instance_id = Some(registration.instance_id);
+                        if registration.inserted {
+                            crate::dbg!(
+                                "packet layer added connection: {} PID: {}",
+                                key,
+                                process_id
+                            );
+                        } else {
+                            crate::dbg!("connection registered concurrently: {}", key);
+                        }
                     }
-                    Ok(false) => crate::dbg!("connection registered concurrently: {}", key),
                     Err(err) => {
                         crate::err!("failed to build connection: {}", err);
                         return;
@@ -506,7 +516,13 @@ fn ip_packet_layer(
 
             let info = {
                 let mut packet_cache = device.packet_cache.write_lock();
-                packet_cache.push((key, packet), process_id, effective_direction, false)
+                packet_cache.push(
+                    (key, packet),
+                    connection_instance_id,
+                    process_id,
+                    effective_direction,
+                    false,
+                )
             };
 
             // Send to Portmaster

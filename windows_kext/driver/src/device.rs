@@ -28,11 +28,12 @@ use crate::{
     array_holder::ArrayHolder,
     bandwidth::Bandwidth,
     callouts,
+    connection::Connection,
     connection_cache::ConnectionCache,
     connection_map::Key,
     dbg, err,
     icmp_echo_cache::IcmpEchoCache,
-    id_cache::IdCache,
+    id_cache::{IdCache, PendingPacket},
     logger,
     packet_util::Redirect,
     udp_endpoint_cache::UdpEndpointCache,
@@ -326,10 +327,39 @@ impl Device {
                     let mut packet_cache = self.packet_cache.write_lock();
                     packet_cache.pop_id(verdict.id)
                 };
-                if let Some((key, mut packet)) = packet {
+                if let Some(PendingPacket {
+                    key,
+                    mut packet,
+                    connection_instance_id,
+                }) = packet
+                {
                     dbg!("Verdict received {}: {}", key, action);
-                    // Add verdict in the cache.
-                    let redirect_info = self.connection_cache.update_connection(key, action);
+                    // A connection verdict belongs to the exact cache instance that
+                    // queued this packet. If endpoint/flow cleanup already ended it,
+                    // complete the saved operation as blocked instead of applying a
+                    // stale decision to a tuple replacement or reinjecting into a
+                    // closed endpoint. Protocols without connection state have no
+                    // instance and continue to use packet-only verdict handling.
+                    let redirect_info = if let Some(instance_id) = connection_instance_id {
+                        let Some(update) = self.connection_cache.update_connection_instance(
+                            key,
+                            instance_id,
+                            action,
+                        ) else {
+                            dbg!(
+                                "discarding stale verdict for ended connection instance {}: {}",
+                                instance_id,
+                                key
+                            );
+                            if let Err(err) = self.inject_packet(packet, true) {
+                                err!("failed to complete stale packet: {}", err);
+                            }
+                            return Ok(());
+                        };
+                        update.redirect_info
+                    } else {
+                        None
+                    };
 
                     match action {
                         crate::connection::Verdict::Accept
@@ -518,6 +548,11 @@ impl Device {
             CommandType::CleanEndedConnections => {
                 wdk::dbg!("CleanEndedConnections command");
                 let (inactive_v4, inactive_v6) = self.connection_cache.clean_ended_connections();
+                let mut inactive_instance_ids =
+                    Vec::with_capacity(inactive_v4.len() + inactive_v6.len());
+                inactive_instance_ids.extend(inactive_v4.iter().map(Connection::get_instance_id));
+                inactive_instance_ids.extend(inactive_v6.iter().map(Connection::get_instance_id));
+                self.discard_pending_connection_instances(&inactive_instance_ids);
                 // Native flow deletion emits promptly when WFP actually reclaims
                 // the ALE flow. This ten-minute watchdog also covers associated UDP
                 // flows whose Windows cleanup callback is delayed until socket close.
@@ -719,17 +754,51 @@ impl Device {
             packet_cache.pop_all()
         };
         for el in pending_packets {
-            let key = el.value.0;
-            let packet = el.value.1;
+            let pending = el.value;
             // Set any verdict. Driver will unload after that and the filter will not be active.
-            _ = self
-                .connection_cache
-                .update_connection(key, crate::connection::Verdict::PermanentBlock);
-            _ = self.inject_packet(packet, true); // Complete ALE pends and discard all packet clones.
+            if let Some(instance_id) = pending.connection_instance_id {
+                _ = self.connection_cache.update_connection_instance(
+                    pending.key,
+                    instance_id,
+                    crate::connection::Verdict::PermanentBlock,
+                );
+            }
+            _ = self.inject_packet(pending.packet, true); // Complete ALE pends and discard all packet clones.
         }
 
         let mut endpoint_cache = self.udp_endpoint_cache.write_lock();
         endpoint_cache.clear();
+    }
+
+    /// Cancels queued decisions for connection instances whose native lifetime has
+    /// ended. Packet ownership is removed under the cache lock, then every ALE pend
+    /// is completed as blocked after the lock has been released.
+    pub(crate) fn discard_pending_connection_instances(&self, instance_ids: &[u64]) {
+        if instance_ids.is_empty() {
+            return;
+        }
+
+        let mut sorted_instance_ids = instance_ids.to_vec();
+        sorted_instance_ids.retain(|instance_id| *instance_id != 0);
+        sorted_instance_ids.sort_unstable();
+        sorted_instance_ids.dedup();
+        if sorted_instance_ids.is_empty() {
+            return;
+        }
+
+        let pending_packets = {
+            let mut packet_cache = self.packet_cache.write_lock();
+            packet_cache.pop_connection_instances(&sorted_instance_ids)
+        };
+        for pending in pending_packets {
+            if let Err(err) = self.inject_packet(pending.packet, true) {
+                crate::err!(
+                    "failed to discard pending packet for ended connection {}: {}",
+                    pending.key,
+                    err
+                );
+            }
+        }
     }
 
     pub fn inject_packet(&self, packet: Packet, blocked: bool) -> Result<(), String> {

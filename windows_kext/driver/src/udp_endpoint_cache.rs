@@ -75,6 +75,34 @@ impl UdpEndpointCache {
         true
     }
 
+    /// Atomically resolves one exact endpoint/tuple association and ensures its
+    /// connection instance is still live through `accept_instance`.
+    ///
+    /// The callback executes while the endpoint map is locked. Endpoint closure
+    /// therefore cannot consume the association between the lookup and the live
+    /// connection check, which prevents a flow-established callback for an old
+    /// socket from falling through to a tuple replacement.
+    pub fn with_instance_id<T>(
+        &self,
+        endpoint_handle: u64,
+        key: &Key,
+        mut accept_instance: impl FnMut(u64) -> Option<T>,
+    ) -> Option<T> {
+        if endpoint_handle == 0 {
+            return None;
+        }
+
+        let _guard = self.lock.read_lock();
+        for peer in self.endpoints.get(&endpoint_handle)? {
+            if peer.key == *key {
+                if let Some(value) = accept_instance(peer.instance_id) {
+                    return Some(value);
+                }
+            }
+        }
+        None
+    }
+
     /// Removes a peer whose WFP ALE flow has ended. Empty endpoint entries are
     /// dropped with their peer allocation; unknown/repeated lifetime indications
     /// are safe to ignore and therefore need neither empty sentinels nor tombstones.
@@ -198,6 +226,40 @@ mod tests {
         let closed = cache.take(10).expect("endpoint was not tracked");
         assert_eq!(closed.len(), 2);
         assert!(cache.take(10).is_none());
+    }
+
+    #[test]
+    fn resolves_only_an_accepted_exact_instance_for_a_flow_callback() {
+        let mut cache = UdpEndpointCache::new();
+        let peer = key(1000);
+        assert!(cache.associate_instance(10, peer, 100));
+        assert!(cache.associate_instance(10, peer, 300));
+        assert!(cache.associate_instance(20, peer, 200));
+
+        assert_eq!(
+            cache.with_instance_id(10, &peer, |instance_id| {
+                (instance_id == 300).then_some(instance_id)
+            }),
+            Some(300)
+        );
+        assert_eq!(
+            cache.with_instance_id(20, &peer, |instance_id| Some(instance_id)),
+            Some(200)
+        );
+        assert_eq!(
+            cache.with_instance_id(10, &peer, |instance_id| {
+                (instance_id == 200).then_some(instance_id)
+            }),
+            None
+        );
+        assert_eq!(
+            cache.with_instance_id(30, &peer, |instance_id| Some(instance_id)),
+            None
+        );
+        assert_eq!(
+            cache.with_instance_id(10, &key(1001), |instance_id| Some(instance_id)),
+            None
+        );
     }
 
     #[test]

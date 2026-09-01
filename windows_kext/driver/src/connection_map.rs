@@ -163,22 +163,23 @@ impl<T: Connection + Clone> ConnectionMap<T> {
     /// The caller owns the map exclusively for this entire check-and-insert, so
     /// two classify callbacks cannot both observe absence and create duplicate
     /// live entries. Retained ended history deliberately does not block tuple
-    /// reuse. On a duplicate, ownership of the rejected candidate is returned so
-    /// its destructor can run after the caller releases any surrounding spin lock.
-    pub(crate) fn insert_if_absent(&mut self, conn: T) -> Result<(), T> {
+    /// reuse. The live instance ID is returned on both paths so callers can bind
+    /// follow-up state to the same entry without a second tuple lookup.
+    pub(crate) fn insert_if_absent(&mut self, conn: T) -> Result<u64, (T, u64)> {
         let key = conn.get_key();
         if let Some(connections) = self.0.get(&key.small()) {
             let range = equal_range(connections, (key.remote_address, key.remote_port));
-            if connections[range]
+            if let Some(existing) = connections[range]
                 .iter()
-                .any(|existing| existing.remote_equals(&key) && !existing.has_ended())
+                .find(|existing| existing.remote_equals(&key) && !existing.has_ended())
             {
-                return Err(conn);
+                return Err((conn, existing.get_instance_id()));
             }
         }
 
+        let instance_id = conn.get_instance_id();
         self.add(conn);
-        Ok(())
+        Ok(instance_id)
     }
 
     /// Returns the live connection matching `key` for mutation.
@@ -193,6 +194,66 @@ impl<T: Connection + Clone> ConnectionMap<T> {
             for conn in &mut connections[range] {
                 if conn.remote_equals(key) && !conn.has_ended() {
                     conn.set_last_accessed_time(get_monotonic_timestamp_ms());
+                    return Some(conn);
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Returns whether one exact connection-cache instance is still live.
+    ///
+    /// Unlike `read`, this check does not refresh activity and never falls back to
+    /// redirected or ended state. It is used to validate endpoint-owned identity.
+    pub fn has_live_instance(&self, key: &Key, instance_id: u64) -> bool {
+        if instance_id == 0 {
+            return false;
+        }
+
+        if let Some(connections) = self.0.get(&key.small()) {
+            let range = equal_range(connections, (key.remote_address, key.remote_port));
+            return connections[range].iter().any(|conn| {
+                conn.remote_equals(key)
+                    && conn.get_instance_id() == instance_id
+                    && !conn.has_ended()
+            });
+        }
+        false
+    }
+
+    /// Returns the exact live cache instance for mutation.
+    ///
+    /// Pending verdicts carry the instance that existed when their packet was
+    /// queued. Requiring both identities prevents a delayed verdict from mutating
+    /// a replacement connection that reused the same tuple. Redirected packet keys
+    /// are supported for the packet-layer path in the same way as `read_matching`.
+    pub fn get_mut_instance(&mut self, key: &Key, instance_id: u64) -> Option<&mut T> {
+        if instance_id == 0 {
+            return None;
+        }
+
+        let timestamp = get_monotonic_timestamp_ms();
+        if let Some(connections) = self.0.get_mut(&key.small()) {
+            let range = equal_range(connections, (key.remote_address, key.remote_port));
+            if let Some(index) = range.clone().find(|index| {
+                let conn = &connections[*index];
+                conn.remote_equals(key)
+                    && conn.get_instance_id() == instance_id
+                    && !conn.has_ended()
+            }) {
+                let conn = &mut connections[index];
+                conn.set_last_accessed_time(timestamp);
+                return Some(conn);
+            }
+
+            if is_redirect_port(key.remote_port) {
+                if let Some(conn) = connections.iter_mut().find(|conn| {
+                    conn.redirect_equals(key)
+                        && conn.get_instance_id() == instance_id
+                        && !conn.has_ended()
+                }) {
+                    conn.set_last_accessed_time(timestamp);
                     return Some(conn);
                 }
             }
@@ -523,11 +584,17 @@ mod tests {
     fn insert_if_absent_rejects_duplicate_live_tuple() {
         let tuple = key([8, 8, 8, 8], 443);
         let mut map = ConnectionMap::new();
-        map.add(live(&tuple, 10));
+        let existing = live(&tuple, 10);
+        let existing_instance_id = existing.get_instance_id();
+        map.add(existing);
 
         let rejected = match map.insert_if_absent(live(&tuple, 20)) {
-            Ok(()) => panic!("duplicate live tuple was inserted"),
-            Err(connection) => connection,
+            Ok(_) => panic!("duplicate live tuple was inserted"),
+            Err((connection, returned_instance_id)) => {
+                assert_eq!(returned_instance_id, existing_instance_id);
+                assert_ne!(returned_instance_id, connection.get_instance_id());
+                connection
+            }
         };
 
         assert_eq!(rejected.process_id, 20);
@@ -707,6 +774,43 @@ mod tests {
         let mut instance_ids = alloc::vec::Vec::new();
         map.append_live_udp_instance_ids(&mut instance_ids);
         assert_eq!(instance_ids, alloc::vec![live_udp_instance_id]);
+    }
+
+    #[test]
+    fn stale_instance_cannot_mutate_reused_tuple() {
+        let tuple = key([198, 51, 100, 7], 443);
+        let old = live(&tuple, 10);
+        let old_instance_id = old.get_instance_id();
+        let mut map = ConnectionMap::new();
+        map.add(old);
+        map.clear();
+
+        let replacement = live(&tuple, 20);
+        let replacement_instance_id = replacement.get_instance_id();
+        map.add(replacement);
+
+        assert!(!map.has_live_instance(&tuple, old_instance_id));
+        assert!(map.has_live_instance(&tuple, replacement_instance_id));
+        assert!(map.get_mut_instance(&tuple, old_instance_id).is_none());
+        map.get_mut_instance(&tuple, replacement_instance_id)
+            .expect("replacement instance")
+            .process_id = 30;
+        assert_eq!(map.read(&tuple, read_process_id), Some(30));
+    }
+
+    #[test]
+    fn exact_instance_update_resolves_redirected_packet_key() {
+        let original = key([198, 51, 100, 8], 53);
+        let redirect_target = key([127, 0, 0, 1], PM_DNS_PORT);
+        let connection = redirected(live(&original, 10));
+        let instance_id = connection.get_instance_id();
+        let mut map = ConnectionMap::new();
+        map.add(connection);
+
+        map.get_mut_instance(&redirect_target, instance_id)
+            .expect("redirected instance")
+            .process_id = 40;
+        assert_eq!(map.read(&original, read_process_id), Some(40));
     }
 
     #[test]

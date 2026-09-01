@@ -16,6 +16,17 @@ pub struct ConnectionCache {
     connections_v6: RwSpinLock<ConnectionMap<ConnectionV6>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConnectionRegistration {
+    pub inserted: bool,
+    pub instance_id: u64,
+}
+
+/// Result of applying a verdict to one exact live cache instance.
+pub struct ConnectionUpdate {
+    pub redirect_info: Option<RedirectInfo>,
+}
+
 /// Merges process attribution using the same precedence for registration and
 /// later flow-established updates.
 fn merge_process_id(stored: &mut u64, incoming: u64) -> bool {
@@ -45,13 +56,15 @@ impl ConnectionCache {
     /// callback won the race, preserve its verdict and instance ID while merging
     /// any more useful process attribution from the rejected candidate.
     ///
-    /// Returns `true` only when this call inserted the connection.
+    /// The returned instance ID belongs to the entry selected under that same map
+    /// guard. Callers must carry it into endpoint and pending-packet state rather
+    /// than looking the tuple up again after the guard has been released.
     pub fn register_connection(
         &self,
         key: &Key,
         process_id: u64,
         direction: Direction,
-    ) -> Result<bool, String> {
+    ) -> Result<ConnectionRegistration, String> {
         if key.is_ipv6() {
             let connection = ConnectionV6::from_key(key, process_id, direction)?;
             Ok(self.register_connection_v6(connection))
@@ -61,48 +74,70 @@ impl ConnectionCache {
         }
     }
 
-    fn register_connection_v4(&self, connection: ConnectionV4) -> bool {
+    fn register_connection_v4(&self, connection: ConnectionV4) -> ConnectionRegistration {
         let key = connection.get_key();
         let process_id = connection.process_id;
-        let rejected = {
+        let (rejected, registration) = {
             let mut connections = self.connections_v4.write_lock();
             match connections.insert_if_absent(connection) {
-                Ok(()) => None,
-                Err(connection) => {
-                    if let Some(existing) = connections.get_mut(&key) {
+                Ok(instance_id) => (
+                    None,
+                    ConnectionRegistration {
+                        inserted: true,
+                        instance_id,
+                    },
+                ),
+                Err((connection, instance_id)) => {
+                    if let Some(existing) = connections.get_mut_instance(&key, instance_id) {
                         merge_process_id(&mut existing.process_id, process_id);
                     }
-                    Some(connection)
+                    (
+                        Some(connection),
+                        ConnectionRegistration {
+                            inserted: false,
+                            instance_id,
+                        },
+                    )
                 }
             }
         };
 
         // A Connection owns heap state. Drop a rejected candidate only after the
         // map guard has restored the caller's original IRQL.
-        let inserted = rejected.is_none();
         drop(rejected);
-        inserted
+        registration
     }
 
-    fn register_connection_v6(&self, connection: ConnectionV6) -> bool {
+    fn register_connection_v6(&self, connection: ConnectionV6) -> ConnectionRegistration {
         let key = connection.get_key();
         let process_id = connection.process_id;
-        let rejected = {
+        let (rejected, registration) = {
             let mut connections = self.connections_v6.write_lock();
             match connections.insert_if_absent(connection) {
-                Ok(()) => None,
-                Err(connection) => {
-                    if let Some(existing) = connections.get_mut(&key) {
+                Ok(instance_id) => (
+                    None,
+                    ConnectionRegistration {
+                        inserted: true,
+                        instance_id,
+                    },
+                ),
+                Err((connection, instance_id)) => {
+                    if let Some(existing) = connections.get_mut_instance(&key, instance_id) {
                         merge_process_id(&mut existing.process_id, process_id);
                     }
-                    Some(connection)
+                    (
+                        Some(connection),
+                        ConnectionRegistration {
+                            inserted: false,
+                            instance_id,
+                        },
+                    )
                 }
             }
         };
 
-        let inserted = rejected.is_none();
         drop(rejected);
-        inserted
+        registration
     }
 
     /// Updates the owning process of a connection when the incoming PID is usable.
@@ -133,6 +168,60 @@ impl ConnectionCache {
         } else {
             let mut connections = self.connections_v4.write_lock();
             if let Some(conn) = connections.get_mut(key) {
+                return merge_process_id(&mut conn.process_id, process_id);
+            }
+        }
+        false
+    }
+
+    /// Runs `use_instance` only while the exact cache instance is still live.
+    ///
+    /// Endpoint tracking holds its own read guard around this call. The nested
+    /// endpoint -> connection lock order matches authorization and cleanup paths,
+    /// so endpoint closure cannot consume the association between identity lookup
+    /// and the live-instance check.
+    pub fn with_live_connection_instance<T>(
+        &self,
+        key: &Key,
+        instance_id: u64,
+        use_instance: impl FnOnce(u64) -> Option<T>,
+    ) -> Option<T> {
+        if instance_id == 0 {
+            return None;
+        }
+
+        if key.is_ipv6() {
+            let connections = self.connections_v6.read_lock();
+            if connections.has_live_instance(key, instance_id) {
+                return use_instance(instance_id);
+            }
+        } else {
+            let connections = self.connections_v4.read_lock();
+            if connections.has_live_instance(key, instance_id) {
+                return use_instance(instance_id);
+            }
+        }
+        None
+    }
+
+    /// Updates attribution on one exact live cache instance.
+    ///
+    /// A flow-established callback may arrive after the tuple has been reused.
+    /// When its instance was learned from endpoint state, it must not update the
+    /// replacement entry selected by a tuple-only lookup.
+    pub fn update_process_id_instance(&self, key: &Key, instance_id: u64, process_id: u64) -> bool {
+        if process_id == 0 {
+            return false;
+        }
+
+        if key.is_ipv6() {
+            let mut connections = self.connections_v6.write_lock();
+            if let Some(conn) = connections.get_mut_instance(key, instance_id) {
+                return merge_process_id(&mut conn.process_id, process_id);
+            }
+        } else {
+            let mut connections = self.connections_v4.write_lock();
+            if let Some(conn) = connections.get_mut_instance(key, instance_id) {
                 return merge_process_id(&mut conn.process_id, process_id);
             }
         }
@@ -171,6 +260,37 @@ impl ConnectionCache {
             if let Some(conn) = connections.get_mut(&key) {
                 conn.verdict = verdict;
                 return conn.redirect_info();
+            }
+        }
+        None
+    }
+
+    /// Applies a pending verdict only to the cache instance that queued it.
+    ///
+    /// An endpoint can close while user space is deciding, and the same five-tuple
+    /// can then be reused. Matching the instance ID prevents that delayed verdict
+    /// from changing the replacement connection's policy.
+    pub fn update_connection_instance(
+        &self,
+        key: Key,
+        instance_id: u64,
+        verdict: Verdict,
+    ) -> Option<ConnectionUpdate> {
+        if key.is_ipv6() {
+            let mut connections = self.connections_v6.write_lock();
+            if let Some(conn) = connections.get_mut_instance(&key, instance_id) {
+                conn.verdict = verdict;
+                return Some(ConnectionUpdate {
+                    redirect_info: conn.redirect_info(),
+                });
+            }
+        } else {
+            let mut connections = self.connections_v4.write_lock();
+            if let Some(conn) = connections.get_mut_instance(&key, instance_id) {
+                conn.verdict = verdict;
+                return Some(ConnectionUpdate {
+                    redirect_info: conn.redirect_info(),
+                });
             }
         }
         None
@@ -220,20 +340,12 @@ impl ConnectionCache {
         connections.read_with_ended_fallback(key, process_connection)
     }
 
-    pub fn end_connection_instance_v4(
-        &self,
-        key: Key,
-        instance_id: u64,
-    ) -> Option<ConnectionV4> {
+    pub fn end_connection_instance_v4(&self, key: Key, instance_id: u64) -> Option<ConnectionV4> {
         let mut connections = self.connections_v4.write_lock();
         connections.end_instance(key, instance_id)
     }
 
-    pub fn end_connection_instance_v6(
-        &self,
-        key: Key,
-        instance_id: u64,
-    ) -> Option<ConnectionV6> {
+    pub fn end_connection_instance_v6(&self, key: Key, instance_id: u64) -> Option<ConnectionV6> {
         let mut connections = self.connections_v6.write_lock();
         connections.end_instance(key, instance_id)
     }
