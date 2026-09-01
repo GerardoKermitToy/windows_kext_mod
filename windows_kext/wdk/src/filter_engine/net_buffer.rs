@@ -33,7 +33,17 @@ pub struct NetBufferList {
 unsafe impl Send for NetBufferList {}
 
 impl NetBufferList {
-    pub fn new(nbl: *mut NET_BUFFER_LIST) -> NetBufferList {
+    /// Wraps a native net-buffer list without taking ownership of it.
+    ///
+    /// # Safety
+    ///
+    /// `nbl` may be null. Otherwise it must point to a live, properly aligned
+    /// `NET_BUFFER_LIST` whose net buffers and MDLs remain valid for every use
+    /// of the returned wrapper. If [`Self::retreat`] enables automatic advance,
+    /// the NBL must also remain valid through this value's drop. The caller must
+    /// synchronize native mutation and must not let this wrapper, or any iterator
+    /// or wrapper derived from it, outlive the native NBL chain.
+    pub unsafe fn new(nbl: *mut NET_BUFFER_LIST) -> NetBufferList {
         NetBufferList {
             nbl,
             data: None,
@@ -41,8 +51,17 @@ impl NetBufferList {
         }
     }
 
-    pub fn iter(&self) -> NetBufferListIter {
-        NetBufferListIter(self.nbl)
+    /// Iterates the native NBL chain beginning at this wrapper.
+    ///
+    /// # Safety
+    ///
+    /// The chain must remain live and unmodified until the iterator and every
+    /// wrapper yielded by it are no longer used. In particular, yielded wrappers
+    /// must not outlive an owning `NetBufferList` that will free the chain.
+    pub unsafe fn iter(&self) -> NetBufferListIter {
+        // SAFETY: The caller accepts the lifetime and synchronization contract
+        // above for the same native chain represented by this wrapper.
+        unsafe { NetBufferListIter::new(self.nbl) }
     }
 
     pub fn read_bytes(&self, buffer: &mut [u8]) -> Result<(), ()> {
@@ -109,7 +128,10 @@ impl NetBufferList {
                     buffer.copy_from_slice(core::slice::from_raw_parts(ptr, data_length as usize));
                 }
 
-                let new_nbl = net_allocator.wrap_packet_in_nbl(&buffer)?;
+                // SAFETY: The global allocator returns nonpaged storage, and
+                // `buffer` is moved into the wrapper without changing its backing
+                // allocation. The wrapper frees the NBL before dropping the Vec.
+                let new_nbl = net_allocator.wrap_packet_in_nbl(&mut buffer)?;
 
                 return Ok(NetBufferList {
                     nbl: new_nbl,
@@ -150,7 +172,10 @@ impl NetBufferList {
                     buffer.copy_from_slice(core::slice::from_raw_parts(ptr, data_length as usize));
                 }
 
-                let new_nbl = net_allocator.wrap_packet_in_nbl(&buffer)?;
+                // SAFETY: The global allocator returns nonpaged storage, and
+                // `buffer` is moved into the wrapper without changing its backing
+                // allocation. The wrapper frees the NBL before dropping the Vec.
+                let new_nbl = net_allocator.wrap_packet_in_nbl(&mut buffer)?;
                 packets.push(NetBufferList {
                     nbl: new_nbl,
                     data: Some(buffer),
@@ -269,7 +294,10 @@ impl Drop for NetBufferList {
             self.advance(advance_amount);
         }
         if self.data.is_some() {
-            NetworkAllocator::free_net_buffer(self.nbl);
+            // SAFETY: `data` is set only by `clone` and `clone_all`, which pair
+            // this NBL with the backing allocation used to build its MDL. This
+            // wrapper has exclusive ownership and is consuming that pair now.
+            unsafe { NetworkAllocator::free_net_buffer(self.nbl) };
         }
     }
 }
@@ -277,7 +305,16 @@ impl Drop for NetBufferList {
 pub struct NetBufferListIter(*mut NET_BUFFER_LIST);
 
 impl NetBufferListIter {
-    pub fn new(nbl: *mut NET_BUFFER_LIST) -> Self {
+    /// Creates an iterator over a native NBL chain.
+    ///
+    /// # Safety
+    ///
+    /// `nbl` may be null. Otherwise it and every non-null pointer reachable
+    /// through `NET_BUFFER_LIST::Header.next` must identify a live, properly
+    /// aligned NBL. The chain must remain stable until this iterator and every
+    /// `NetBufferList` it yields are no longer used, and the caller must
+    /// synchronize any native mutation for that entire interval.
+    pub unsafe fn new(nbl: *mut NET_BUFFER_LIST) -> Self {
         Self(nbl)
     }
 }
@@ -300,7 +337,15 @@ impl Iterator for NetBufferListIter {
     }
 }
 
-pub fn read_packet_partial(nbl: *mut NET_BUFFER_LIST, buffer: &mut [u8]) -> Result<(), ()> {
+/// Copies a prefix from the first net buffer in a native NBL.
+///
+/// # Safety
+///
+/// `nbl` may be null. Otherwise it must point to a live, properly aligned
+/// `NET_BUFFER_LIST` whose first net buffer and backing MDLs remain valid and
+/// readable for the duration of this call. The caller must prevent concurrent
+/// mutation that would invalidate those objects while NDIS reads them.
+pub unsafe fn read_packet_partial(nbl: *mut NET_BUFFER_LIST, buffer: &mut [u8]) -> Result<(), ()> {
     unsafe {
         let Some(nbl) = nbl.as_ref() else {
             return Err(());
@@ -354,14 +399,25 @@ impl NetworkAllocator {
         }
     }
 
-    pub fn wrap_packet_in_nbl(&self, packet_data: &[u8]) -> Result<*mut NET_BUFFER_LIST, String> {
+    /// Builds an NBL whose MDL describes caller-owned packet storage.
+    ///
+    /// # Safety
+    ///
+    /// `packet_data` must reside in nonpaged memory and its allocation must remain
+    /// at the same address and stay live until the returned NBL and its MDL are
+    /// freed with [`Self::free_net_buffer`]. No Rust access to the storage may race
+    /// native access through the MDL.
+    pub unsafe fn wrap_packet_in_nbl(
+        &self,
+        packet_data: &mut [u8],
+    ) -> Result<*mut NET_BUFFER_LIST, String> {
         if self.pool_handle.is_null() {
             return Err("allocator not initialized".to_string());
         }
         unsafe {
             // Create MDL struct that will hold the buffer.
             let mdl = IoAllocateMdl(
-                packet_data.as_ptr() as _,
+                packet_data.as_mut_ptr() as _,
                 packet_data.len() as u32,
                 0,
                 0,
@@ -397,8 +453,21 @@ impl NetworkAllocator {
         }
     }
 
-    pub fn free_net_buffer(nbl: *mut NET_BUFFER_LIST) {
-        NetBufferListIter::new(nbl).for_each(|nbl| unsafe {
+    /// Frees an NBL/MDL pair created by [`Self::wrap_packet_in_nbl`].
+    ///
+    /// # Safety
+    ///
+    /// `nbl` may be null. Otherwise ownership of the complete chain must be
+    /// transferred to this function, every NBL must have been returned by
+    /// `wrap_packet_in_nbl`, and no native or Rust code may access the NBLs or
+    /// their MDLs after this call. Each packet's backing storage must remain live
+    /// until this function returns; this function frees the native objects but
+    /// not that storage.
+    pub unsafe fn free_net_buffer(nbl: *mut NET_BUFFER_LIST) {
+        // SAFETY: The caller guarantees that the complete owned chain remains
+        // valid until it is consumed by the loop.
+        let nbls = unsafe { NetBufferListIter::new(nbl) };
+        nbls.for_each(|nbl| unsafe {
             if let Some(nbl) = nbl.nbl.as_mut() {
                 // FwpsFreeNetBufferList0 destroys the NBL/NB objects, which
                 // still contain the caller-owned MDL pointer. Release the

@@ -169,7 +169,15 @@ unsafe extern "system" fn generic_notify(
     STATUS_SUCCESS
 }
 
-pub(crate) fn register_runtime_callout(
+/// Registers a runtime callout against a native WDM device object.
+///
+/// # Safety
+///
+/// `device_object` must identify a live device object belonging to this driver
+/// and remain valid until the callout is unregistered. All supplied callback
+/// functions and the driver image containing them must remain executable for the
+/// same interval.
+pub(crate) unsafe fn register_runtime_callout(
     device_object: *mut c_void,
     guid: u128,
     callout_fn: FwpsCalloutClassifyFn,

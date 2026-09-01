@@ -26,7 +26,17 @@ pub fn dbg_print(str: String) {
     }
 }
 
-pub fn init_driver_object(
+/// Creates the KMDF driver and control-device objects for a WDM `DriverEntry`.
+///
+/// # Safety
+///
+/// This must be called only from the driver's `DriverEntry`, at PASSIVE_LEVEL.
+/// `driver_object` must be the live I/O-manager-owned driver object supplied to
+/// that invocation. `registry_path` must point to the valid `UNICODE_STRING`
+/// supplied with it, including a readable backing buffer, for the duration of
+/// this call. Every callback must have the declared WDF ABI and remain executable
+/// until KMDF has completed driver teardown.
+pub unsafe fn init_driver_object(
     driver_object: *mut DRIVER_OBJECT,
     registry_path: *mut UNICODE_STRING,
     driver_name: &str,
@@ -77,12 +87,18 @@ pub fn init_driver_object(
             return Err("KMDF returned an invalid driver or device handle".to_owned());
         }
 
+        // SAFETY: `pm_InitDriverObject` succeeded and both output handles were
+        // checked above. KMDF owns them until driver teardown.
         return Ok(Driver::new(wdf_driver_handle, wdf_device_handle));
     }
 }
 
-pub(crate) fn wdf_device_wdm_get_device_object(wdf_device: HANDLE) -> *mut c_void {
-    unsafe {
-        return pm_GetDeviceObject(wdf_device);
-    }
+/// Returns the WDM device object backing a KMDF device.
+///
+/// # Safety
+///
+/// `wdf_device` must be a live WDFDEVICE handle. Its backing device object must
+/// remain valid for every use of the returned pointer.
+pub(crate) unsafe fn wdf_device_wdm_get_device_object(wdf_device: HANDLE) -> *mut c_void {
+    unsafe { pm_GetDeviceObject(wdf_device) }
 }

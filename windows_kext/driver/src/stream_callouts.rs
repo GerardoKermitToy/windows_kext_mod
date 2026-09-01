@@ -119,7 +119,11 @@ pub fn stream_layer_tcp_v6(mut data: CalloutData) {
 /// datagrams.
 fn get_datagram_payload_length(data: &CalloutData, direction: Direction) -> usize {
     let mut length: usize = 0;
-    for nbl in NetBufferListIter::new(data.get_layer_data() as _) {
+    // SAFETY: This helper is called only from datagram-data classify handlers.
+    // WFP owns the layer-data NBL chain and keeps it stable for the callback;
+    // every yielded wrapper is consumed by this loop.
+    let nbls = unsafe { NetBufferListIter::new(data.get_layer_data() as _) };
+    for nbl in nbls {
         length += match direction {
             Direction::Outbound => nbl.get_data_length_excluding_header(8),
             Direction::Inbound => nbl.get_data_length() as usize,
@@ -149,9 +153,13 @@ fn get_datagram_payload_length(data: &CalloutData, direction: Direction) -> usiz
 /// a remote host: `rx` dropped to 0 because that packet opened the connection and
 /// was therefore pended and re-injected.
 fn is_self_injected(device: &Device, data: &CalloutData, ipv6: bool) -> bool {
-    device
-        .injector
-        .was_network_packet_injected_by_self(data.get_layer_data() as _, ipv6)
+    // SAFETY: Both callers are datagram-data classify handlers. Their layer data
+    // is a WFP-owned NBL that remains live through this synchronous query.
+    unsafe {
+        device
+            .injector
+            .was_network_packet_injected_by_self(data.get_layer_data() as _, ipv6)
+    }
 }
 
 pub fn stream_layer_udp_v4(data: CalloutData) {

@@ -19,12 +19,37 @@ use windows_sys::Win32::{
     Networking::WinSock::SCOPE_ID,
 };
 
-pub enum ClassifyDefer {
-    Initial(HANDLE, Option<TransportPacketList>),
-    Reauthorization(u32, Option<TransportPacketList>),
+enum ClassifyDeferKind {
+    Initial(HANDLE),
+    Reauthorization,
+}
+
+/// An ALE operation whose native completion context is owned by this wrapper.
+///
+/// The private representation prevents safe code from manufacturing a WFP
+/// completion context. Values can be created only from a live [`CalloutData`]
+/// indication through [`CalloutData::pend_operation`] or
+/// [`CalloutData::pend_filter_rest`].
+pub struct ClassifyDefer {
+    kind: ClassifyDeferKind,
+    packet_list: Option<TransportPacketList>,
 }
 
 impl ClassifyDefer {
+    fn initial(context: HANDLE, packet_list: Option<TransportPacketList>) -> Self {
+        Self {
+            kind: ClassifyDeferKind::Initial(context),
+            packet_list,
+        }
+    }
+
+    fn reauthorization(packet_list: Option<TransportPacketList>) -> Self {
+        Self {
+            kind: ClassifyDeferKind::Reauthorization,
+            packet_list,
+        }
+    }
+
     /// Completes an ALE operation or returns a saved reauthorization packet.
     ///
     /// This method is callable from a classify callback, including at
@@ -32,59 +57,84 @@ impl ClassifyDefer {
     /// the caller must invoke the WFP management operation from a
     /// PASSIVE_LEVEL path after this method returns.
     pub fn complete(self, inject_packet: bool) -> Result<Option<TransportPacketList>, String> {
-        unsafe {
-            match self {
-                ClassifyDefer::Initial(context, packet_list) => {
-                    // An inbound packet that will be injected from
-                    // ALE_AUTH_RECV_ACCEPT must also be supplied to
-                    // FwpsCompleteOperation. A denied packet is completed with a
-                    // null NBL and the owned clone is discarded by the caller.
-                    let nbl = if inject_packet {
-                        packet_list
-                            .as_ref()
-                            .map(|packet| packet.net_buffer_list.nbl)
-                            .unwrap_or(core::ptr::null_mut())
-                    } else {
-                        core::ptr::null_mut()
-                    };
-                    FwpsCompleteOperation0(context, nbl);
-                    return Ok(packet_list);
-                }
-                ClassifyDefer::Reauthorization(_, packet_list) => {
-                    return Ok(packet_list);
-                }
+        match self.kind {
+            ClassifyDeferKind::Initial(context) => {
+                // An inbound packet that will be injected from
+                // ALE_AUTH_RECV_ACCEPT must also be supplied to
+                // FwpsCompleteOperation. A denied packet is completed with a
+                // null NBL and the owned clone is discarded by the caller.
+                let nbl = if inject_packet {
+                    self.packet_list
+                        .as_ref()
+                        .map(|packet| packet.net_buffer_list.nbl)
+                        .unwrap_or(core::ptr::null_mut())
+                } else {
+                    core::ptr::null_mut()
+                };
+                // SAFETY: Only `CalloutData::pend_operation` can construct this
+                // variant, and it stores the non-null context returned by
+                // `FwpsPendOperation0`. This value owns that context until this
+                // one completion call.
+                unsafe { FwpsCompleteOperation0(context, nbl) };
+                Ok(self.packet_list)
             }
+            ClassifyDeferKind::Reauthorization => Ok(self.packet_list),
         }
     }
 
     /// Returns whether completing this value requires a PASSIVE_LEVEL WFP
     /// management operation to reauthorize existing flows.
     pub fn is_reauthorization(&self) -> bool {
-        matches!(self, ClassifyDefer::Reauthorization(_, _))
+        matches!(self.kind, ClassifyDeferKind::Reauthorization)
     }
 
-    // pub fn add_net_buffer(&mut self, nbl: NetBufferList) {
-    //     if let Some(packet_list) = match self {
-    //         ClassifyDefer::Initial(_, packet_list) => packet_list,
-    //         ClassifyDefer::Reauthorization(_, packet_list) => packet_list,
-    //     } {
-    //         packet_list.net_buffer_list_queue.push(nbl);
-    //     }
-    // }
+    /// Returns the saved packet list, if this defer carries one.
+    pub fn packet_list(&self) -> Option<&TransportPacketList> {
+        self.packet_list.as_ref()
+    }
 }
 
-pub struct CalloutData<'a> {
+pub(super) struct CalloutDataParts<'a> {
     pub layer: Layer,
-    pub(crate) layer_id: u16,
-    pub(crate) callout_id: u32,
-    pub(crate) flow_context: u64,
-    pub(crate) values: &'a [Value],
-    pub(crate) metadata: &'a FwpsIncomingMetadataValues,
-    pub(crate) classify_out: &'a mut ClassifyOut,
-    pub(crate) layer_data: *mut c_void,
+    pub layer_id: u16,
+    pub callout_id: u32,
+    pub flow_context: u64,
+    pub values: &'a [Value],
+    pub metadata: &'a FwpsIncomingMetadataValues,
+    pub classify_out: &'a mut ClassifyOut,
+    pub layer_data: *mut c_void,
+}
+
+/// Borrowed access to one WFP classify indication.
+///
+/// Only the validated classify trampoline can construct this type. Its native
+/// pointers and borrowed views remain valid only for the callback lifetime `'a`;
+/// methods that expose a raw layer-data pointer do not extend that lifetime.
+pub struct CalloutData<'a> {
+    layer: Layer,
+    layer_id: u16,
+    callout_id: u32,
+    flow_context: u64,
+    values: &'a [Value],
+    metadata: &'a FwpsIncomingMetadataValues,
+    classify_out: &'a mut ClassifyOut,
+    layer_data: *mut c_void,
 }
 
 impl<'a> CalloutData<'a> {
+    pub(super) fn from_parts(parts: CalloutDataParts<'a>) -> Self {
+        Self {
+            layer: parts.layer,
+            layer_id: parts.layer_id,
+            callout_id: parts.callout_id,
+            flow_context: parts.flow_context,
+            values: parts.values,
+            metadata: parts.metadata,
+            classify_out: parts.classify_out,
+            layer_data: parts.layer_data,
+        }
+    }
+
     pub fn get_value_type(&self, index: usize) -> ValueType {
         self.values
             .get(index)
@@ -144,6 +194,10 @@ impl<'a> CalloutData<'a> {
 
     pub fn has_flow_context(&self) -> bool {
         self.flow_context != 0
+    }
+
+    pub fn get_layer(&self) -> Layer {
+        self.layer
     }
 
     pub fn get_layer_id(&self) -> u16 {
@@ -238,14 +292,14 @@ impl<'a> CalloutData<'a> {
                 return Err("WFP returned a null completion context".to_string());
             }
 
-            return Ok(ClassifyDefer::Initial(completion_context, packet_list));
+            return Ok(ClassifyDefer::initial(completion_context, packet_list));
         }
 
         Err("callout not supported".to_string())
     }
 
     pub fn pend_filter_rest(&mut self, packet_list: Option<TransportPacketList>) -> ClassifyDefer {
-        ClassifyDefer::Reauthorization(self.callout_id, packet_list)
+        ClassifyDefer::reauthorization(packet_list)
     }
 
     pub fn action_permit(&mut self) {

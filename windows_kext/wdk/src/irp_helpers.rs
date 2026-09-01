@@ -70,7 +70,13 @@ impl IrpPtr {
 /// A zero-byte request is allowed to carry a null `SystemBuffer`. Rust slices,
 /// however, require a non-null pointer even when empty, so request wrappers keep
 /// a raw pointer and normalize every null pointer to an empty range.
-fn normalize_buffer(buffer: *mut u8, length: u32) -> (*mut u8, usize) {
+///
+/// # Safety
+///
+/// If `buffer` is non-null and `length` is non-zero, it must identify a live,
+/// writable allocation of at least `length` bytes that remains valid until the
+/// request wrapper using the returned range is completed.
+unsafe fn normalize_buffer(buffer: *mut u8, length: u32) -> (*mut u8, usize) {
     if buffer.is_null() || length == 0 {
         (core::ptr::null_mut(), 0)
     } else {
@@ -203,7 +209,11 @@ impl ReadRequest {
         } else {
             (*irp_sp).Parameters.Read.Length
         };
-        let (buffer, buffer_len) = normalize_buffer(irp.system_buffer(), length);
+        let (buffer, buffer_len) = unsafe {
+            // SAFETY: The constructor's IRP contract guarantees that its buffered
+            // system allocation covers the length reported by this stack entry.
+            normalize_buffer(irp.system_buffer(), length)
+        };
 
         Some(Self {
             irp,
@@ -276,7 +286,11 @@ impl WriteRequest {
         } else {
             (*irp_sp).Parameters.Write.Length
         };
-        let (buffer, buffer_len) = normalize_buffer(irp.system_buffer(), length);
+        let (buffer, buffer_len) = unsafe {
+            // SAFETY: The constructor's IRP contract guarantees that its buffered
+            // system allocation covers the length reported by this stack entry.
+            normalize_buffer(irp.system_buffer(), length)
+        };
 
         Some(Self {
             irp,
@@ -386,8 +400,11 @@ impl DeviceControlRequest {
                 &*core::ptr::addr_of!((*irp_sp).Parameters).cast::<DeviceIOControlParams>();
             (device_io.output_buffer_length, device_io.io_control_code)
         };
-        let (buffer, buffer_len) =
-            normalize_buffer(irp.system_buffer(), output_buffer_length);
+        let (buffer, buffer_len) = unsafe {
+            // SAFETY: The constructor's METHOD_BUFFERED IRP contract guarantees
+            // that SystemBuffer covers the advertised output length.
+            normalize_buffer(irp.system_buffer(), output_buffer_length)
+        };
 
         Some(Self {
             irp,

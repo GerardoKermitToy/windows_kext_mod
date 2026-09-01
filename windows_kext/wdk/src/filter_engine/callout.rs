@@ -86,17 +86,23 @@ impl Callout {
 
     /// Registers the runtime FWPS callout and records its ID immediately.
     /// Runtime registration is not covered by the FWPM transaction.
-    pub(crate) fn register_runtime_callout(
+    ///
+    /// # Safety
+    ///
+    /// `device_object` must be the live WDM device object owned by this driver and
+    /// must remain valid until the runtime callout is unregistered. The callback
+    /// functions and their backing driver image must remain live over the same
+    /// interval.
+    pub(crate) unsafe fn register_runtime_callout(
         &mut self,
         device_object: *mut c_void,
         callout_fn: FwpsCalloutClassifyFn,
     ) -> Result<(), String> {
-        match ffi::register_runtime_callout(
-            device_object,
-            self.guid,
-            callout_fn,
-            self.flow_delete_fn,
-        ) {
+        // SAFETY: The caller supplies the device-object and callback lifetime
+        // guarantees required by the lower-level registration wrapper.
+        match unsafe {
+            ffi::register_runtime_callout(device_object, self.guid, callout_fn, self.flow_delete_fn)
+        } {
             Ok(id) => {
                 self.registered = true;
                 self.id = id;

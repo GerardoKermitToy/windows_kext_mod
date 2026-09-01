@@ -132,7 +132,11 @@ fn is_ip_fragment(
     direction: Direction,
     wfp_ip_header_size: Option<u32>,
 ) -> bool {
-    let Some(mut nbl) = NetBufferListIter::new(data.get_layer_data() as _).next() else {
+    // SAFETY: This helper is reached only from the IP-packet classify functions.
+    // WFP owns their layer-data NBL chain and keeps it stable until the callback
+    // returns; the iterator and every yielded wrapper remain inside this call.
+    let mut nbls = unsafe { NetBufferListIter::new(data.get_layer_data() as _) };
+    let Some(mut nbl) = nbls.next() else {
         return false;
     };
 
@@ -225,15 +229,22 @@ fn ip_packet_layer(
     let Some(device) = crate::entry::get_device() else {
         return;
     };
-    if device
-        .injector
-        .was_network_packet_injected_by_self(data.get_layer_data() as _, ipv6)
-    {
+    // SAFETY: `ip_packet_layer` is called only by IP-packet classify handlers.
+    // Their layer data is a WFP-owned NBL chain that stays live throughout this
+    // callback, and the injection-state query is synchronous.
+    if unsafe {
+        device
+            .injector
+            .was_network_packet_injected_by_self(data.get_layer_data() as _, ipv6)
+    } {
         data.action_permit();
         return;
     }
 
-    for mut nbl in NetBufferListIter::new(data.get_layer_data() as _) {
+    // SAFETY: The same WFP callback contract keeps the complete NBL chain stable;
+    // all yielded wrappers are consumed by this loop before the callback returns.
+    let nbls = unsafe { NetBufferListIter::new(data.get_layer_data() as _) };
+    for mut nbl in nbls {
         if let Direction::Inbound = direction {
             // The header is not part of the NBL for incoming packets. Move the beginning of the buffer back so we get access to it.
             // The NBL will auto advance after it loses scope.

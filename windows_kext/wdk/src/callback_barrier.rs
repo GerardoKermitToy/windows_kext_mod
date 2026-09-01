@@ -178,7 +178,7 @@ impl CallbackBarrier {
             return None;
         }
         let generation = state_generation(initial_token);
-        let lifetime = self.acquire(self.callback_lifetime.get())?;
+        let lifetime = self.acquire(&self.callback_lifetime)?;
         let current_token = self.state.load(Ordering::Acquire);
         if state_generation(current_token) != generation {
             return None;
@@ -216,7 +216,7 @@ impl CallbackBarrier {
         }
         let generation = state_generation(initial_token);
 
-        let lifetime = self.acquire(self.callback_lifetime.get())?;
+        let lifetime = self.acquire(&self.callback_lifetime)?;
         let current_token = self.state.load(Ordering::Acquire);
         if state_generation(current_token) != generation {
             // The static barrier was reused for a newer driver instance while
@@ -227,7 +227,7 @@ impl CallbackBarrier {
 
         match state_phase(current_token) {
             OPEN => {
-                let device_access = self.acquire(self.classify.get());
+                let device_access = self.acquire(&self.classify);
                 let active = device_access.is_some()
                     && state_phase(self.state.load(Ordering::Acquire)) == OPEN;
                 Some(ClassifyAdmission {
@@ -266,7 +266,7 @@ impl CallbackBarrier {
         }
         let generation = state_generation(initial_token);
 
-        let lifetime = self.acquire(self.callback_lifetime.get())?;
+        let lifetime = self.acquire(&self.callback_lifetime)?;
         let current_token = self.state.load(Ordering::Acquire);
         if state_generation(current_token) != generation {
             // See the corresponding classify path. Do not let a delayed callback
@@ -276,7 +276,7 @@ impl CallbackBarrier {
 
         match state_phase(current_token) {
             OPEN | CLASSIFY_CLOSING | CLASSIFY_CLOSED => {
-                let device_access = self.acquire(self.flow_delete.get());
+                let device_access = self.acquire(&self.flow_delete);
                 let state = state_phase(self.state.load(Ordering::Acquire));
                 let active = device_access.is_some()
                     && matches!(state, OPEN | CLASSIFY_CLOSING | CLASSIFY_CLOSED);
@@ -296,7 +296,11 @@ impl CallbackBarrier {
         }
     }
 
-    fn acquire(&self, rundown: *mut EX_RUNDOWN_REF) -> Option<CallbackGuard<'_>> {
+    fn acquire<'a>(
+        &'a self,
+        rundown: &'a UnsafeCell<EX_RUNDOWN_REF>,
+    ) -> Option<CallbackGuard<'a>> {
+        let rundown = rundown.get();
         let acquired = unsafe { ExAcquireRundownProtection(rundown) } != 0;
         acquired.then_some(CallbackGuard {
             rundown,

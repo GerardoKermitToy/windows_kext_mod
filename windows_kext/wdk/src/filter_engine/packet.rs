@@ -389,7 +389,15 @@ impl Injector {
         return Ok(());
     }
 
-    pub fn was_network_packet_injected_by_self(
+    /// Returns whether WFP identifies this network-layer NBL as self-injected.
+    ///
+    /// # Safety
+    ///
+    /// `nbl` may be null. Otherwise it must point to a live `NET_BUFFER_LIST`
+    /// supplied by WFP and remain valid and readable for the duration of the
+    /// synchronous query. The caller must obey WFP's IRQL and synchronization
+    /// requirements for `FwpsQueryPacketInjectionState0`.
+    pub unsafe fn was_network_packet_injected_by_self(
         &self,
         nbl: *const NET_BUFFER_LIST,
         ipv6: bool,
@@ -417,7 +425,18 @@ impl Injector {
         }
     }
 
-    pub fn was_transport_packet_injected_by_self(&self, nbl: *const NET_BUFFER_LIST) -> bool {
+    /// Returns whether WFP identifies this transport-layer NBL as self-injected.
+    ///
+    /// # Safety
+    ///
+    /// `nbl` may be null. Otherwise it must point to a live `NET_BUFFER_LIST`
+    /// supplied by WFP and remain valid and readable for the duration of the
+    /// synchronous query. The caller must obey WFP's IRQL and synchronization
+    /// requirements for `FwpsQueryPacketInjectionState0`.
+    pub unsafe fn was_transport_packet_injected_by_self(
+        &self,
+        nbl: *const NET_BUFFER_LIST,
+    ) -> bool {
         let transport_inject_handle = self
             .transport_inject_handle
             .load(Ordering::Acquire);

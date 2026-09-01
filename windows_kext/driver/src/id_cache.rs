@@ -118,17 +118,9 @@ impl IdCache {
 fn get_payload(packet: &Packet) -> Option<&[u8]> {
     match packet {
         Packet::PacketLayer(nbls, _) => nbls.first().and_then(|nbl| nbl.get_data()),
-        Packet::AleLayer(defer) => {
-            let p = match defer {
-                wdk::filter_engine::callout_data::ClassifyDefer::Initial(_, p) => p,
-                wdk::filter_engine::callout_data::ClassifyDefer::Reauthorization(_, p) => p,
-            };
-            if let Some(tpl) = p {
-                tpl.get_event_data()
-            } else {
-                None
-            }
-        }
+        Packet::AleLayer(defer) => defer
+            .packet_list()
+            .and_then(|packet_list| packet_list.get_event_data()),
     }
 }
 

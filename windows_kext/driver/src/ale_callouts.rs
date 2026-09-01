@@ -217,14 +217,19 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
     // ALE receive/accept are returned with the transport injector. Either kind can
     // be indicated here again and must be permitted without creating another pend.
     let layer_data = data.get_layer_data();
-    if !layer_data.is_null()
-        && (device
-            .injector
-            .was_network_packet_injected_by_self(layer_data as _, ale_data.is_ipv6)
-            || device
+    // SAFETY: A non-null ALE layer-data value is a WFP-owned NBL that remains
+    // live for this classify callback. Both injection-state queries are
+    // synchronous and do not retain it.
+    let injected_by_self = !layer_data.is_null()
+        && unsafe {
+            device
                 .injector
-                .was_transport_packet_injected_by_self(layer_data as _))
-    {
+                .was_network_packet_injected_by_self(layer_data as _, ale_data.is_ipv6)
+                || device
+                    .injector
+                    .was_transport_packet_injected_by_self(layer_data as _)
+        };
+    if injected_by_self {
         data.action_permit();
         return;
     }
@@ -505,7 +510,10 @@ fn create_packet_list(
         return Ok(None);
     }
 
-    let mut nbl = NetBufferList::new(callout_data.get_layer_data() as _);
+    // SAFETY: This function runs synchronously inside an ALE classify callback.
+    // WFP owns the non-null layer-data NBL and keeps it live through callback
+    // return; this borrowed wrapper is dropped after cloning and never escapes.
+    let mut nbl = unsafe { NetBufferList::new(callout_data.get_layer_data() as _) };
     let mut inbound = false;
     let mut event_data_offset = 0;
     if let Direction::Inbound = ale_data.direction {
@@ -1014,7 +1022,7 @@ pub fn ale_flow_established_monitor(data: CalloutData) {
     };
     let process_id = data.get_process_id().filter(|pid| *pid != 0);
 
-    let key = match data.layer {
+    let key = match data.get_layer() {
         layer::Layer::AleFlowEstablishedV4 => {
             type Fields = layer::FieldsAleFlowEstablishedV4;
 
@@ -1115,7 +1123,7 @@ pub fn ale_resource_monitor(data: CalloutData) {
         return;
     };
 
-    match data.layer {
+    match data.get_layer() {
         layer::Layer::AleResourceAssignmentV4Discard => {
             type Fields = layer::FieldsAleResourceAssignmentV4;
             if let Some(conns) = device.connection_cache.end_all_on_endpoint_v4(

@@ -332,8 +332,14 @@ pub fn get_device() -> Option<&'static device::Device> {
 
 // DriverEntry is the entry point of the driver (main function). Will be called when driver is loaded.
 // Name should not be changed
+///
+/// # Safety
+///
+/// `driver_object` and `registry_path` must be the live kernel objects supplied
+/// by the I/O manager for this DriverEntry invocation and remain valid for the
+/// duration required by the WDM initialization contract.
 #[export_name = "DriverEntry"]
-pub extern "system" fn driver_entry(
+pub unsafe extern "system" fn driver_entry(
     driver_object: *mut windows_sys::Wdk::Foundation::DRIVER_OBJECT,
     registry_path: *mut windows_sys::Win32::Foundation::UNICODE_STRING,
 ) -> windows_sys::Win32::Foundation::NTSTATUS {
@@ -345,18 +351,23 @@ pub extern "system" fn driver_entry(
     DISPATCH_GATE.reopen();
 
     // Initialize driver object.
-    let driver = match interface::init_driver_object(
-        driver_object,
-        registry_path,
-        "PortmasterKext",
-        driver_unload,
-        driver_create,
-        driver_cleanup,
-        driver_close,
-        driver_read,
-        driver_write,
-        device_control,
-    ) {
+    // SAFETY: The I/O manager invokes DriverEntry at PASSIVE_LEVEL and supplies
+    // both raw arguments for this call. The registered callbacks use the exact
+    // WDF ABI and remain in the loaded driver image until teardown completes.
+    let driver = match unsafe {
+        interface::init_driver_object(
+            driver_object,
+            registry_path,
+            "PortmasterKext",
+            driver_unload,
+            driver_create,
+            driver_cleanup,
+            driver_close,
+            driver_read,
+            driver_write,
+            device_control,
+        )
+    } {
         Ok(driver) => driver,
         Err(status) => {
             // No WFP callbacks should remain admitted if initialization aborts

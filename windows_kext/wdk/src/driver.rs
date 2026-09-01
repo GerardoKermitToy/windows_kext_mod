@@ -21,11 +21,19 @@ pub struct Driver {
 }
 
 impl Driver {
-    pub(crate) fn new(driver_handle: HANDLE, device_handle: HANDLE) -> Driver {
+    /// Wraps the handles created for this driver's KMDF control device.
+    ///
+    /// # Safety
+    ///
+    /// Both handles must be live KMDF objects of the expected types, and
+    /// `device_handle` must continue to identify its WDFDEVICE for every use of
+    /// the returned wrapper. The caller must follow KMDF's teardown ordering.
+    pub(crate) unsafe fn new(driver_handle: HANDLE, device_handle: HANDLE) -> Driver {
         Driver {
             _driver_handle: driver_handle,
             device_handle,
-            device_object: interface::wdf_device_wdm_get_device_object(device_handle),
+            // SAFETY: The caller guarantees that this is a live WDFDEVICE.
+            device_object: unsafe { interface::wdf_device_wdm_get_device_object(device_handle) },
         }
     }
 

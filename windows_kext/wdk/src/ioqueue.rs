@@ -180,9 +180,10 @@ impl<T> IOQueue<T> {
     }
 
     /// Returns an Element or a status.
-    fn pop_internal(&self, timeout: *const i64) -> Result<T, Status> {
+    fn pop_internal(&self, timeout: Option<&i64>) -> Result<T, Status> {
         unsafe {
             let kqueue = self.kernel_queue.get();
+            let timeout = timeout.map_or(core::ptr::null(), core::ptr::from_ref);
             // Check if initialized.
             if self.initialized.load(Ordering::Acquire) {
                 // Pop and check the return value.
@@ -231,7 +232,7 @@ impl<T> IOQueue<T> {
     /// Returns element or a status. Waits until element is pushed or the queue is interrupted.
     pub fn wait_and_pop(&self) -> Result<T, Status> {
         // No timeout.
-        self.pop_internal(core::ptr::null())
+        self.pop_internal(None)
     }
 
     /// Waits for an entry while remaining responsive to the owning handle's
@@ -271,13 +272,13 @@ impl<T> IOQueue<T> {
     /// Returns element or a status. Does not wait.
     pub fn pop(&self) -> Result<T, Status> {
         let timeout: i64 = 0;
-        self.pop_internal(&timeout)
+        self.pop_internal(Some(&timeout))
     }
 
     /// Returns element or a status. Waits the specified timeout.
     pub fn pop_timeout(&self, timeout: i64) -> Result<T, Status> {
         let timeout_ptr = timeout.saturating_mul(-10_000);
-        self.pop_internal(&timeout_ptr)
+        self.pop_internal(Some(&timeout_ptr))
     }
 
     /// Removes all elements and frees all the memory. The object can't be used after this function is called.

@@ -11,7 +11,7 @@ use alloc::{format, vec::Vec};
 use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
 
 use self::callout::{Callout, FilterType};
-use self::callout_data::CalloutData;
+use self::callout_data::{CalloutData, CalloutDataParts};
 use self::classify::ClassifyOut;
 use self::layer::IncomingValues;
 use self::metadata::FwpsIncomingMetadataValues;
@@ -129,7 +129,13 @@ impl FilterEngine {
                 .last_mut()
                 .ok_or_else(|| "newly inserted callout is missing".to_owned())?;
 
-            callout.register_runtime_callout(device_object, catch_all_callout)?;
+            // SAFETY: `FilterEngine::new` obtained this non-null WDM device
+            // object from the live KMDF control device. Driver teardown keeps the
+            // device and callback image alive until all runtime callouts have
+            // been unregistered.
+            unsafe {
+                callout.register_runtime_callout(device_object, catch_all_callout)?;
+            }
             callout.register_management_callout(filter_engine_handle)?;
             callout.register_filter(filter_engine_handle, sublayer_guid)?;
 
@@ -374,7 +380,7 @@ unsafe extern "system" fn catch_all_callout(
                 fixed_values.value_count as usize,
             )
         };
-        let data = CalloutData {
+        let data = CalloutData::from_parts(CalloutDataParts {
             layer: callout.layer,
             layer_id: fixed_values.layer_id,
             callout_id: callout.id,
@@ -383,7 +389,7 @@ unsafe extern "system" fn catch_all_callout(
             metadata: meta_values,
             classify_out,
             layer_data,
-        };
+        });
         // Call the defined function.
         (callout.callout_fn)(data);
     }
