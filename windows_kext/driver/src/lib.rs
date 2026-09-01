@@ -13,6 +13,8 @@ mod array_holder;
 #[cfg(not(test))]
 mod bandwidth;
 #[cfg(not(test))]
+mod bugcheck;
+#[cfg(not(test))]
 mod callouts;
 #[cfg(not(test))]
 mod common;
@@ -62,9 +64,6 @@ pub extern "system" fn _DllMainCRTStartup() {}
 
 #[cfg(not(test))]
 #[panic_handler]
-fn panic(info: &PanicInfo) -> ! {
-    use wdk::err;
-
-    err!("{}", info);
-    loop {}
+fn panic(info: &PanicInfo<'_>) -> ! {
+    bugcheck::panic_to_bugcheck(info)
 }

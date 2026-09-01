@@ -279,7 +279,7 @@ fn print_packet(packet: &[u8]) {
 /// identifier (2), sequence (2).
 pub fn get_icmp_echo(packet: &[u8], is_ipv6: bool) -> Option<IcmpEcho> {
     // The identifier ends at byte 6. Anything shorter is not an echo header, and
-    // indexing it would panic - which in this driver hangs the machine.
+    // indexing it would panic and trigger the driver's fatal diagnostic bug check.
     const ECHO_HEADER_LEN: usize = 6;
     if packet.len() < ECHO_HEADER_LEN {
         return None;
@@ -320,10 +320,10 @@ fn get_ports(packet: &[u8], protocol: smoltcp::wire::IpProtocol) -> (u16, u16) {
     // The port fields occupy the first four bytes of both the TCP and the UDP
     // header. smoltcp's src_port/dst_port index the buffer directly
     // (`data[0..2]`, `data[2..4]`) with no bounds check, so a shorter slice is an
-    // out-of-bounds index: a panic, which in this driver means a hung machine
-    // rather than a crash. Callers cannot all guarantee the length - the IPv6
-    // path derives the offset from an attacker-controlled extension header chain
-    // - so the check belongs here, at the single point every path goes through.
+    // out-of-bounds index and a fatal driver panic. Not all callers can guarantee
+    // the length: the IPv6 path derives the offset from an attacker-controlled
+    // extension header chain, so the check belongs here, at the single point every
+    // path goes through.
     const PORTS_LEN: usize = 4;
     if packet.len() < PORTS_LEN {
         return (0, 0);
@@ -463,8 +463,8 @@ const TCP_RST_FLAG: u8 = 0x04;
 /// options and IPv6 extension headers both move the TCP header.
 ///
 /// A short or malformed packet returns false. In particular, every indexed byte
-/// is obtained through `get`, because a panic in this callout would hang the
-/// machine rather than merely reject the packet.
+/// is obtained through `get`, because a panic in this callout is a fatal driver
+/// bug check.
 pub fn is_tcp_reset_from_nbl(nbl: &NetBufferList, ipv6: bool) -> bool {
     if ipv6 {
         let Some((packet, len)) = read_ipv6_headers(nbl) else {
