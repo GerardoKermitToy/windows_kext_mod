@@ -14,6 +14,7 @@ use wdk::filter_engine::layer::{
 use wdk::filter_engine::net_buffer::NetBufferList;
 use wdk::filter_engine::packet::{Injector, TransportPacketList, TransportProtocol};
 use wdk::filter_engine::{callout_data::CalloutData, PacketDirection as WfpPacketDirection};
+use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_DIRECTION_OUTBOUND;
 
 // ALE Layers
 
@@ -1154,6 +1155,53 @@ pub fn endpoint_closure_v6(data: CalloutData) {
     }
 }
 
+/// Returns the IP version when this is an outbound UDP flow-established indication.
+/// A missing or mistyped direction is not treated as outbound.
+fn outbound_udp_flow_ip_version(data: &CalloutData) -> Option<bool> {
+    let (protocol_index, direction_index, is_ipv6) = match data.get_layer() {
+        layer::Layer::AleFlowEstablishedV4 => (
+            layer::FieldsAleFlowEstablishedV4::IpProtocol as usize,
+            layer::FieldsAleFlowEstablishedV4::Direction as usize,
+            false,
+        ),
+        layer::Layer::AleFlowEstablishedV6 => (
+            layer::FieldsAleFlowEstablishedV6::IpProtocol as usize,
+            layer::FieldsAleFlowEstablishedV6::Direction as usize,
+            true,
+        ),
+        _ => return None,
+    };
+
+    if !matches!(
+        get_protocol_if_present(data, protocol_index),
+        Some(IpProtocol::Udp)
+    ) || !matches!(data.get_value_type(direction_index), ValueType::FwpUint32)
+        || data.get_value_u32(direction_index) != FWP_DIRECTION_OUTBOUND as u32
+    {
+        return None;
+    }
+
+    Some(is_ipv6)
+}
+
+fn is_self_injected_outbound_udp_flow(device: &Device, data: &CalloutData) -> bool {
+    let Some(is_ipv6) = outbound_udp_flow_ip_version(data) else {
+        return false;
+    };
+    let layer_data = data.get_layer_data();
+    if layer_data.is_null() {
+        return false;
+    }
+
+    // SAFETY: FLOW_ESTABLISHED supplies this NBL for the duration of the classify
+    // callback. The synchronous injection-state query does not retain it.
+    unsafe {
+        device
+            .injector
+            .was_network_packet_injected_by_self(layer_data as _, is_ipv6)
+    }
+}
+
 /// Refreshes the owning process when a TCP or UDP ALE flow becomes active.
 ///
 /// WFP indicates TCP here after the three-way handshake completes. UDP has no
@@ -1235,6 +1283,15 @@ pub fn ale_flow_established_monitor(data: CalloutData) {
     };
 
     if matches!(key.protocol, IpProtocol::Udp) {
+        // Network reinjection can create a short-lived System-owned raw flow with
+        // the application's tuple but a different endpoint. Skip it before both
+        // endpoint and tuple resolution so its deletion cannot end the application
+        // connection. Injection state proves ownership; a raw-socket flag alone
+        // would also match legitimate application traffic.
+        if is_self_injected_outbound_udp_flow(device, &data) {
+            return;
+        }
+
         let endpoint_handle = transport_endpoint_handle(&data);
         // Authorization records the exact cache instance under the endpoint
         // handle. Resolve and validate it while both endpoint and connection
