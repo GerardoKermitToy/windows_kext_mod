@@ -522,7 +522,9 @@ unsafe extern "system" fn driver_create(
     // IRP. WDF supplies a non-null IRP, but keeping the defensive null check
     // after admission also covers the entire rejection path during teardown.
     let dispatch_guard = DISPATCH_GATE.enter(false);
-    let Some(mut create_request) = CreateRequest::new(irp) else {
+    // SAFETY: KMDF invokes this preprocess callback with the live IRP_MJ_CREATE
+    // request whose ownership remains with this dispatch routine until completion.
+    let Some(mut create_request) = (unsafe { CreateRequest::new(irp) }) else {
         return STATUS_INVALID_PARAMETER;
     };
     let Some(dispatch_guard) = dispatch_guard else {
@@ -575,7 +577,9 @@ unsafe extern "system" fn driver_cleanup(
     irp: *mut IRP,
 ) -> NTSTATUS {
     let dispatch_guard = DISPATCH_GATE.enter(false);
-    let Some(mut cleanup_request) = CleanupRequest::new(irp) else {
+    // SAFETY: KMDF invokes this preprocess callback with the live IRP_MJ_CLEANUP
+    // request whose ownership remains with this dispatch routine until completion.
+    let Some(mut cleanup_request) = (unsafe { CleanupRequest::new(irp) }) else {
         return STATUS_INVALID_PARAMETER;
     };
     let Some(dispatch_guard) = dispatch_guard else {
@@ -636,7 +640,9 @@ unsafe extern "system" fn driver_close(
     irp: *mut IRP,
 ) -> NTSTATUS {
     let dispatch_guard = DISPATCH_GATE.enter(false);
-    let Some(mut close_request) = CloseRequest::new(irp) else {
+    // SAFETY: KMDF invokes this preprocess callback with the live IRP_MJ_CLOSE
+    // request whose ownership remains with this dispatch routine until completion.
+    let Some(mut close_request) = (unsafe { CloseRequest::new(irp) }) else {
         return STATUS_INVALID_PARAMETER;
     };
     if dispatch_guard
@@ -654,7 +660,9 @@ unsafe extern "system" fn driver_read(
     irp: *mut IRP,
 ) -> NTSTATUS {
     let dispatch_guard = DISPATCH_GATE.enter(true);
-    let Some(mut read_request) = ReadRequest::new(irp) else {
+    // SAFETY: KMDF invokes this preprocess callback with a live buffered
+    // IRP_MJ_READ request that remains owned here until completion.
+    let Some(mut read_request) = (unsafe { ReadRequest::new(irp) }) else {
         return STATUS_INVALID_PARAMETER;
     };
     let Some(dispatch_guard) = dispatch_guard else {
@@ -679,7 +687,9 @@ unsafe extern "system" fn driver_write(
     irp: *mut IRP,
 ) -> NTSTATUS {
     let dispatch_guard = DISPATCH_GATE.enter(false);
-    let Some(mut write_request) = WriteRequest::new(irp) else {
+    // SAFETY: KMDF invokes this preprocess callback with a live buffered
+    // IRP_MJ_WRITE request that remains owned here until completion.
+    let Some(mut write_request) = (unsafe { WriteRequest::new(irp) }) else {
         return STATUS_INVALID_PARAMETER;
     };
     let Some(dispatch_guard) = dispatch_guard else {
@@ -712,7 +722,9 @@ unsafe extern "system" fn device_control(
     irp: *mut IRP,
 ) -> NTSTATUS {
     let dispatch_guard = DISPATCH_GATE.enter(false);
-    let Some(mut control_request) = DeviceControlRequest::new(irp) else {
+    // SAFETY: KMDF invokes this preprocess callback with a live METHOD_BUFFERED
+    // IRP_MJ_DEVICE_CONTROL request that remains owned here until completion.
+    let Some(mut control_request) = (unsafe { DeviceControlRequest::new(irp) }) else {
         return STATUS_INVALID_PARAMETER;
     };
     let Some(dispatch_guard) = dispatch_guard else {

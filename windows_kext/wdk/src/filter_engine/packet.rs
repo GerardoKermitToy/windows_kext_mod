@@ -792,7 +792,9 @@ unsafe extern "system" fn free_packet(
     net_buffer_list: *mut NET_BUFFER_LIST,
     _dispatch_level: BOOLEAN,
 ) {
-    if let Some(nbl) = net_buffer_list.as_ref() {
+    // SAFETY: WFP supplies either null or the live NBL whose asynchronous
+    // injection is completing, and keeps it valid through this callback.
+    if let Some(nbl) = unsafe { net_buffer_list.as_ref() } {
         if let Err(err) = check_ntstatus(nbl.Status) {
             crate::err!("inject status: {}", err);
         } else {
@@ -800,7 +802,10 @@ unsafe extern "system" fn free_packet(
         }
     }
     if !context.is_null() {
-        _ = Box::from_raw(context as *mut NetBufferList);
+        // SAFETY: the accepted injection transferred exactly one
+        // `Box<NetBufferList>` to WFP as this context. WFP invokes its completion
+        // callback once, so this is the matching and only reconstruction.
+        unsafe { drop(Box::from_raw(context as *mut NetBufferList)) };
     }
 }
 
@@ -812,7 +817,9 @@ unsafe extern "system" fn free_transport_packet(
     net_buffer_list: *mut NET_BUFFER_LIST,
     _dispatch_level: BOOLEAN,
 ) {
-    if let Some(nbl) = net_buffer_list.as_ref() {
+    // SAFETY: WFP supplies either null or the live NBL whose asynchronous
+    // transport injection is completing, and keeps it valid through this callback.
+    if let Some(nbl) = unsafe { net_buffer_list.as_ref() } {
         if let Err(err) = check_ntstatus(nbl.Status) {
             crate::err!("inject status: {}", err);
         } else {
@@ -820,7 +827,10 @@ unsafe extern "system" fn free_transport_packet(
         }
     }
     if !context.is_null() {
-        _ = Box::from_raw(context as *mut TransportPacketList);
+        // SAFETY: the accepted transport injection transferred exactly one
+        // `Box<TransportPacketList>` to WFP as this context. The completion is the
+        // matching one-shot ownership return.
+        unsafe { drop(Box::from_raw(context as *mut TransportPacketList)) };
     }
 }
 

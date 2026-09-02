@@ -340,7 +340,9 @@ unsafe extern "system" fn catch_all_callout(
         // Runtime callouts exist briefly while their FWPM transaction is being
         // built and while unload removes filters. The lifetime guard remains held
         // through return, but Device/filter context is intentionally inaccessible.
-        if let Some(classify_out) = classify_out.as_mut() {
+        // SAFETY: WFP supplies either null or a live writable FWPS_CLASSIFY_OUT0
+        // for the duration of this classify callback.
+        if let Some(classify_out) = unsafe { classify_out.as_mut() } {
             if classify_out.can_set_action() {
                 classify_out.action_continue();
                 classify_out.clear_absorb_flag();
@@ -349,16 +351,23 @@ unsafe extern "system" fn catch_all_callout(
         return;
     }
 
-    let Some(fixed_values) = fixed_values.as_ref() else {
+    // SAFETY: WFP owns these callback arguments and guarantees that each non-null
+    // pointer names a properly aligned object that remains live through callback
+    // return. The null cases are rejected before any field is accessed.
+    let Some(fixed_values) = (unsafe { fixed_values.as_ref() }) else {
         return;
     };
-    let Some(meta_values) = meta_values.as_ref() else {
+    // SAFETY: justified by the WFP callback-argument contract above.
+    let Some(meta_values) = (unsafe { meta_values.as_ref() }) else {
         return;
     };
-    let Some(filter) = filter.as_ref() else {
+    // SAFETY: justified by the WFP callback-argument contract above.
+    let Some(filter) = (unsafe { filter.as_ref() }) else {
         return;
     };
-    let Some(classify_out) = classify_out.as_mut() else {
+    // SAFETY: justified by the WFP callback-argument contract above; this callback
+    // has exclusive access to the mutable classify output for its invocation.
+    let Some(classify_out) = (unsafe { classify_out.as_mut() }) else {
         return;
     };
     if fixed_values.value_count != 0 && fixed_values.incoming_value_array.is_null() {
@@ -368,17 +377,25 @@ unsafe extern "system" fn catch_all_callout(
     // Filter context is the address of the callout.
     let callout = filter.context as *mut Callout;
 
-    if let Some(callout) = callout.as_ref() {
+    // SAFETY: active callback admission guarantees that Device still owns every
+    // registered Callout box. WFP copied this box address into `filter.context`,
+    // and keeps the corresponding filter live for this invocation.
+    if let Some(callout) = unsafe { callout.as_ref() } {
         // A zero-length slice still requires a non-null aligned pointer in Rust.
-        // Use a dangling pointer only for that empty representation; WFP's pointer
-        // is used unchanged whenever it describes at least one value.
+        // Use an empty slice for that representation; WFP's pointer is used
+        // unchanged whenever it describes at least one value.
         let values = if fixed_values.value_count == 0 {
             &[]
         } else {
-            core::slice::from_raw_parts(
-                fixed_values.incoming_value_array,
-                fixed_values.value_count as usize,
-            )
+            // SAFETY: the nonzero case was checked for null above, and WFP
+            // guarantees an array containing `value_count` incoming values for
+            // the duration of this classify callback.
+            unsafe {
+                core::slice::from_raw_parts(
+                    fixed_values.incoming_value_array,
+                    fixed_values.value_count as usize,
+                )
+            }
         };
         let data = CalloutData::from_parts(CalloutDataParts {
             layer: callout.layer,

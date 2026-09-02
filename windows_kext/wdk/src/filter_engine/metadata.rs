@@ -109,12 +109,21 @@ impl FwpsIncomingMetadataValues {
         None
     }
 
+    /// Copies the WFP process-path blob into an owned UTF-8 string.
+    ///
+    /// # Safety
+    ///
+    /// When the process-path metadata bit is set, `self.process_path` and its
+    /// non-empty data buffer must be readable native WFP metadata that remains
+    /// live for this call.
     pub(crate) unsafe fn get_process_path(&self) -> Option<String> {
         if !self.has_field(FWPS_METADATA_FIELD_PROCESS_PATH) || self.process_path.is_null() {
             return None;
         }
 
-        let path = &*self.process_path;
+        // SAFETY: the caller guarantees that the advertised WFP blob is readable
+        // for this call; the null case was rejected above.
+        let path = unsafe { &*self.process_path };
         if path.size == 0 {
             return None;
         }
@@ -125,7 +134,12 @@ impl FwpsIncomingMetadataValues {
             return None;
         }
 
-        if let Ok(path16) = U16CString::from_ptr(path.data as *const u16, path.size as usize / 2) {
+        // SAFETY: the WFP blob contract supplied by the caller guarantees that
+        // `data` is readable for exactly `size` bytes. The checks above convert
+        // that even byte count to the corresponding number of UTF-16 code units.
+        if let Ok(path16) =
+            unsafe { U16CString::from_ptr(path.data as *const u16, path.size as usize / 2) }
+        {
             if let Ok(path) = path16.to_string() {
                 return Some(path);
             }
@@ -195,15 +209,23 @@ impl FwpsIncomingMetadataValues {
         false
     }
 
+    /// Borrows the WFP transport-control-data buffer for this metadata lifetime.
+    ///
+    /// # Safety
+    ///
+    /// When the transport-control-data metadata bit is set, every non-null,
+    /// non-empty `control_data` range must be readable for the lifetime of the
+    /// returned slice and must not be mutated while that slice is borrowed.
     pub(crate) unsafe fn get_control_data(&self) -> Option<&[u8]> {
         if self.has_field(FWPS_METADATA_FIELD_TRANSPORT_CONTROL_DATA) {
             if self.control_data.is_null() || self.control_data_length == 0 {
                 return None;
             }
-            return Some(core::slice::from_raw_parts(
-                self.control_data,
-                self.control_data_length as usize,
-            ));
+            // SAFETY: the caller supplies the validity and immutability contract;
+            // null and zero-length representations were rejected above.
+            return Some(unsafe {
+                core::slice::from_raw_parts(self.control_data, self.control_data_length as usize)
+            });
         }
 
         None

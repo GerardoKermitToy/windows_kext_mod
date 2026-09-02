@@ -37,7 +37,11 @@ unsafe impl GlobalAlloc for WindowsAllocator {
         }
 
         if layout.align() <= POOL_ALIGNMENT {
-            return ExAllocatePool2(PoolType::NonPaged as u64, layout.size(), POOL_TAG) as *mut u8;
+            // SAFETY: `layout` has a nonzero size, and nonpaged NX pool is valid
+            // for allocator calls made at any IRQL at which this driver allocates.
+            return unsafe {
+                ExAllocatePool2(PoolType::NonPaged as u64, layout.size(), POOL_TAG) as *mut u8
+            };
         }
 
         // Reserve one pointer-sized header plus enough slack to align the user
@@ -54,7 +58,11 @@ unsafe impl GlobalAlloc for WindowsAllocator {
             return core::ptr::null_mut();
         };
 
-        let base = ExAllocatePool2(PoolType::NonPaged as u64, allocation_size, POOL_TAG) as *mut u8;
+        // SAFETY: `allocation_size` is nonzero and was checked for overflow. The
+        // returned nonpaged allocation is released with the same pool tag below.
+        let base = unsafe {
+            ExAllocatePool2(PoolType::NonPaged as u64, allocation_size, POOL_TAG) as *mut u8
+        };
         if base.is_null() {
             return core::ptr::null_mut();
         }
@@ -62,22 +70,29 @@ unsafe impl GlobalAlloc for WindowsAllocator {
         let address = match (base as usize).checked_add(core::mem::size_of::<*mut u8>()) {
             Some(address) => address,
             None => {
-                ExFreePoolWithTag(base as _, POOL_TAG);
+                // SAFETY: `base` is the live pool allocation returned above.
+                unsafe { ExFreePoolWithTag(base as _, POOL_TAG) };
                 return core::ptr::null_mut();
             }
         };
         let aligned_address = match address.checked_add(layout.align() - 1) {
             Some(address) => address & !(layout.align() - 1),
             None => {
-                ExFreePoolWithTag(base as _, POOL_TAG);
+                // SAFETY: `base` is the live pool allocation returned above.
+                unsafe { ExFreePoolWithTag(base as _, POOL_TAG) };
                 return core::ptr::null_mut();
             }
         };
         let aligned = aligned_address as *mut u8;
-        aligned
-            .sub(core::mem::size_of::<*mut u8>())
-            .cast::<*mut u8>()
-            .write(base);
+        // SAFETY: `allocation_size` reserved a pointer-sized header plus the full
+        // alignment slack. Therefore the header address is aligned for a pointer
+        // and lies inside the live allocation immediately before `aligned`.
+        unsafe {
+            aligned
+                .sub(core::mem::size_of::<*mut u8>())
+                .cast::<*mut u8>()
+                .write(base);
+        }
         aligned
     }
 
@@ -89,27 +104,45 @@ unsafe impl GlobalAlloc for WindowsAllocator {
         let base = if layout.align() <= POOL_ALIGNMENT {
             ptr
         } else {
-            ptr.sub(core::mem::size_of::<*mut u8>())
-                .cast::<*mut u8>()
-                .read()
+            // SAFETY: for an over-aligned layout, `alloc` stored the original
+            // allocation pointer in the pointer-sized header immediately before
+            // this user pointer. The GlobalAlloc contract pairs both layouts.
+            unsafe {
+                ptr.sub(core::mem::size_of::<*mut u8>())
+                    .cast::<*mut u8>()
+                    .read()
+            }
         };
-        ExFreePoolWithTag(base as _, POOL_TAG);
+        // SAFETY: `base` is the exact still-live pool allocation associated with
+        // `ptr`, and this is its single GlobalAlloc deallocation.
+        unsafe { ExFreePoolWithTag(base as _, POOL_TAG) };
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         // ExAllocatePool2 zero-initializes unless POOL_FLAG_UNINITIALIZED is set.
-        self.alloc(layout)
+        // SAFETY: this method forwards the caller's GlobalAlloc contract unchanged.
+        unsafe { self.alloc(layout) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        // SAFETY: the caller must ensure that the `new_size` does not overflow.
-        // `layout.align()` comes from a `Layout` and is thus guaranteed to be valid.
-        let new_layout = Layout::from_size_align_unchecked(new_size, layout.align());
-        let new_ptr = self.alloc(new_layout);
+        let Ok(new_layout) = Layout::from_size_align(new_size, layout.align()) else {
+            return core::ptr::null_mut();
+        };
+        // SAFETY: `new_layout` was validated above and this method forwards the
+        // caller's GlobalAlloc allocation-context contract.
+        let new_ptr = unsafe { self.alloc(new_layout) };
         if !new_ptr.is_null() {
-            // The old and new pool allocations cannot overlap.
-            core::ptr::copy_nonoverlapping(ptr, new_ptr, core::cmp::min(layout.size(), new_size));
-            self.dealloc(ptr, layout);
+            // SAFETY: the caller guarantees `ptr` names a live allocation described
+            // by `layout`; `new_ptr` names a distinct allocation of `new_size`
+            // bytes. The copied range is bounded by both allocations.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    ptr,
+                    new_ptr,
+                    core::cmp::min(layout.size(), new_size),
+                );
+                self.dealloc(ptr, layout);
+            }
         }
         new_ptr
     }

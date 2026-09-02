@@ -34,17 +34,43 @@ impl IrpPtr {
         (!ptr.is_null()).then_some(Self { ptr })
     }
 
+    /// Returns the request's current I/O stack location.
+    ///
+    /// # Safety
+    ///
+    /// While `self.ptr` is non-null, the caller must uphold the live native IRP
+    /// contract established by [`IrpPtr::new`].
     unsafe fn current_stack_location(&self) -> *mut IO_STACK_LOCATION {
-        (*self.ptr)
-            .Tail
-            .Overlay
-            .Anonymous2
-            .Anonymous
-            .CurrentStackLocation
+        if self.ptr.is_null() {
+            return core::ptr::null_mut();
+        }
+
+        // SAFETY: the caller guarantees a live native IRP. The null state created
+        // immediately before completion was rejected above.
+        unsafe {
+            (*self.ptr)
+                .Tail
+                .Overlay
+                .Anonymous2
+                .Anonymous
+                .CurrentStackLocation
+        }
     }
 
+    /// Returns the IRP's buffered-I/O system buffer without dereferencing it.
+    ///
+    /// # Safety
+    ///
+    /// While `self.ptr` is non-null, the caller must uphold the live native IRP
+    /// contract established by [`IrpPtr::new`].
     unsafe fn system_buffer(&self) -> *mut u8 {
-        (*self.ptr).AssociatedIrp.SystemBuffer.cast()
+        if self.ptr.is_null() {
+            return core::ptr::null_mut();
+        }
+
+        // SAFETY: the caller guarantees a live native IRP. Reading this union field
+        // is valid for the buffered request types accepted by the public wrappers.
+        unsafe { (*self.ptr).AssociatedIrp.SystemBuffer.cast() }
     }
 
     /// Publishes status and transfers the IRP back to the I/O manager exactly
@@ -95,7 +121,11 @@ impl CreateRequest {
     /// `irp` must satisfy the WDM dispatch contract documented by [`IrpPtr::new`].
     pub unsafe fn new(irp: *mut IRP) -> Option<Self> {
         Some(Self {
-            irp: IrpPtr::new(irp)?,
+            irp: unsafe {
+                // SAFETY: this constructor forwards its documented WDM dispatch
+                // contract directly to the opaque IRP wrapper.
+                IrpPtr::new(irp)?
+            },
         })
     }
 
@@ -140,7 +170,11 @@ impl CleanupRequest {
     /// `irp` must satisfy the WDM dispatch contract documented by [`IrpPtr::new`].
     pub unsafe fn new(irp: *mut IRP) -> Option<Self> {
         Some(Self {
-            irp: IrpPtr::new(irp)?,
+            irp: unsafe {
+                // SAFETY: this constructor forwards its documented WDM dispatch
+                // contract directly to the opaque IRP wrapper.
+                IrpPtr::new(irp)?
+            },
         })
     }
 
@@ -179,7 +213,11 @@ impl CloseRequest {
     /// `irp` must satisfy the WDM dispatch contract documented by [`IrpPtr::new`].
     pub unsafe fn new(irp: *mut IRP) -> Option<Self> {
         Some(Self {
-            irp: IrpPtr::new(irp)?,
+            irp: unsafe {
+                // SAFETY: this constructor forwards its documented WDM dispatch
+                // contract directly to the opaque IRP wrapper.
+                IrpPtr::new(irp)?
+            },
         })
     }
 
@@ -202,12 +240,17 @@ impl ReadRequest {
     /// manager. Its stack location and system buffer must remain valid until the
     /// request is completed.
     pub unsafe fn new(irp: *mut IRP) -> Option<Self> {
-        let irp = IrpPtr::new(irp)?;
-        let irp_sp = irp.current_stack_location();
+        // SAFETY: this constructor forwards its documented buffered-read IRP
+        // contract directly to the opaque wrapper.
+        let irp = unsafe { IrpPtr::new(irp)? };
+        // SAFETY: the IRP is still owned by this uncompleted wrapper.
+        let irp_sp = unsafe { irp.current_stack_location() };
         let length = if irp_sp.is_null() {
             0
         } else {
-            (*irp_sp).Parameters.Read.Length
+            // SAFETY: the constructor contract identifies an IRP_MJ_READ stack
+            // entry, so the Read member of the Parameters union is initialized.
+            unsafe { (*irp_sp).Parameters.Read.Length }
         };
         let (buffer, buffer_len) = unsafe {
             // SAFETY: The constructor's IRP contract guarantees that its buffered
@@ -279,12 +322,17 @@ impl WriteRequest {
     /// manager. Its stack location and system buffer must remain valid until the
     /// request is completed.
     pub unsafe fn new(irp: *mut IRP) -> Option<Self> {
-        let irp = IrpPtr::new(irp)?;
-        let irp_sp = irp.current_stack_location();
+        // SAFETY: this constructor forwards its documented buffered-write IRP
+        // contract directly to the opaque wrapper.
+        let irp = unsafe { IrpPtr::new(irp)? };
+        // SAFETY: the IRP is still owned by this uncompleted wrapper.
+        let irp_sp = unsafe { irp.current_stack_location() };
         let length = if irp_sp.is_null() {
             0
         } else {
-            (*irp_sp).Parameters.Write.Length
+            // SAFETY: the constructor contract identifies an IRP_MJ_WRITE stack
+            // entry, so the Write member of the Parameters union is initialized.
+            unsafe { (*irp_sp).Parameters.Write.Length }
         };
         let (buffer, buffer_len) = unsafe {
             // SAFETY: The constructor's IRP contract guarantees that its buffered
@@ -391,13 +439,20 @@ impl DeviceControlRequest {
     /// supplied by the I/O manager. Its stack location and system buffer must
     /// remain valid until the request is completed.
     pub unsafe fn new(irp: *mut IRP) -> Option<Self> {
-        let irp = IrpPtr::new(irp)?;
-        let irp_sp = irp.current_stack_location();
+        // SAFETY: this constructor forwards its documented METHOD_BUFFERED IOCTL
+        // IRP contract directly to the opaque wrapper.
+        let irp = unsafe { IrpPtr::new(irp)? };
+        // SAFETY: the IRP is still owned by this uncompleted wrapper.
+        let irp_sp = unsafe { irp.current_stack_location() };
         let (output_buffer_length, control_code) = if irp_sp.is_null() {
             (0, 0)
         } else {
-            let device_io =
-                &*core::ptr::addr_of!((*irp_sp).Parameters).cast::<DeviceIOControlParams>();
+            // SAFETY: the constructor contract identifies an IRP_MJ_DEVICE_CONTROL
+            // stack entry. The native Parameters storage is live, aligned, and its
+            // DeviceIoControl member has the pinned layout asserted above.
+            let device_io = unsafe {
+                &*core::ptr::addr_of!((*irp_sp).Parameters).cast::<DeviceIOControlParams>()
+            };
             (device_io.output_buffer_length, device_io.io_control_code)
         };
         let (buffer, buffer_len) = unsafe {

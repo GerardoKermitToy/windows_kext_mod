@@ -1,5 +1,6 @@
 #![cfg_attr(not(test), no_std)]
 #![allow(clippy::needless_return)]
+#![deny(unsafe_op_in_unsafe_fn)]
 
 extern crate alloc;
 
