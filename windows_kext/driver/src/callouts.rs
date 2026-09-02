@@ -92,44 +92,6 @@ pub fn get_callout_vec() -> Vec<Callout> {
         )
         .with_flow_delete_fn(ale_callouts::udp_flow_delete),
         // -----------------------------------------
-        // ALE resource assignment and release.
-        // Callout::new(
-        //     "AleResourceAssignmentV4",
-        //     "Ipv4 Port assignment monitoring",
-        //     0x6b9d1985_6f75_4d05_b9b5_1607e187906f,
-        //     Layer::AleResourceAssignmentV4Discard,
-        //     consts::FWP_ACTION_CALLOUT_INSPECTION,
-        //     FilterType::NonResettable,
-        //     ale_callouts::ale_resource_monitor,
-        // ),
-        Callout::new(
-            "Portmaster resource release IPv4",
-            "Portmaster uses this layer to detect when a IPv4 port has been released",
-            0x7b513bb3_a0be_4f77_a4bc_03c052abe8d7,
-            Layer::AleResourceReleaseV4,
-            consts::FWP_ACTION_CALLOUT_INSPECTION,
-            FilterType::NonResettable,
-            ale_callouts::ale_resource_monitor,
-        ),
-        // Callout::new(
-        //     "AleResourceAssignmentV6",
-        //     "Ipv4 Port assignment monitor",
-        //     0xb0d02299_3d3e_437d_916a_f0e96a60cc18,
-        //     Layer::AleResourceAssignmentV6Discard,
-        //     consts::FWP_ACTION_CALLOUT_INSPECTION,
-        //     FilterType::NonResettable,
-        //     ale_callouts::ale_resource_monitor,
-        // ),
-        Callout::new(
-            "Portmaster resource release IPv6",
-            "Portmaster uses this layer to detect when a IPv6 port has been released",
-            0x6cf36e04_e656_42c3_8cac_a1ce05328bd1,
-            Layer::AleResourceReleaseV6,
-            consts::FWP_ACTION_CALLOUT_INSPECTION,
-            FilterType::NonResettable,
-            ale_callouts::ale_resource_monitor,
-        ),
-        // -----------------------------------------
         // Stream layer
         Callout::new(
             "Portmaster Stream IPv4",

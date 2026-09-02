@@ -4,12 +4,8 @@ use crate::device::{Device, Packet};
 use crate::udp_flow_cache::UdpFlowRegistration;
 use alloc::{boxed::Box, string::String, vec::Vec};
 
-use crate::info;
 use smoltcp::wire::{
     IpAddress, IpProtocol, Ipv4Address, Ipv6Address, IPV4_HEADER_LEN, IPV6_HEADER_LEN,
-};
-use wdk::filter_engine::{
-    callout_data::CalloutData, PacketDirection as WfpPacketDirection,
 };
 use wdk::filter_engine::layer::{
     self, FieldsAleAuthConnectV4, FieldsAleAuthConnectV6, FieldsAleAuthRecvAcceptV4,
@@ -17,6 +13,7 @@ use wdk::filter_engine::layer::{
 };
 use wdk::filter_engine::net_buffer::NetBufferList;
 use wdk::filter_engine::packet::{Injector, TransportPacketList, TransportProtocol};
+use wdk::filter_engine::{callout_data::CalloutData, PacketDirection as WfpPacketDirection};
 
 // ALE Layers
 
@@ -1155,127 +1152,5 @@ pub fn ale_flow_established_monitor(data: CalloutData) {
         // TCP has no endpoint-peer map; preserve its existing tuple attribution
         // path. The UDP path above is protected by the endpoint instance identity.
         device.connection_cache.update_process_id(&key, process_id);
-    }
-}
-
-pub fn ale_resource_monitor(data: CalloutData) {
-    let Some(device) = crate::entry::get_device() else {
-        return;
-    };
-
-    match data.get_layer() {
-        layer::Layer::AleResourceAssignmentV4Discard => {
-            type Fields = layer::FieldsAleResourceAssignmentV4;
-            if let Some(conns) = device.connection_cache.end_all_on_endpoint_v4(
-                (
-                    get_protocol(&data, Fields::IpProtocol as usize),
-                    data.get_value_u16(Fields::IpLocalPort as usize),
-                ),
-                get_ipv4_address_if_present(&data, Fields::IpLocalAddress as usize),
-                data.get_process_id().filter(|pid| *pid != 0),
-            ) {
-                let process_id = data.get_process_id().unwrap_or(0);
-                info!(
-                    "Port {}/{} Ipv4 assign request discarded pid={}",
-                    data.get_value_u16(Fields::IpLocalPort as usize),
-                    get_protocol(&data, Fields::IpProtocol as usize),
-                    process_id,
-                );
-                discard_pending_connections(device, &conns);
-                for conn in conns {
-                    emit_connection_end_v4(device, conn, process_id);
-                }
-            }
-        }
-        layer::Layer::AleResourceAssignmentV6Discard => {
-            type Fields = layer::FieldsAleResourceAssignmentV6;
-            if let Some(conns) = device.connection_cache.end_all_on_endpoint_v6(
-                (
-                    get_protocol(&data, Fields::IpProtocol as usize),
-                    data.get_value_u16(Fields::IpLocalPort as usize),
-                ),
-                get_ipv6_address_if_present(&data, Fields::IpLocalAddress as usize),
-                data.get_process_id().filter(|pid| *pid != 0),
-            ) {
-                let process_id = data.get_process_id().unwrap_or(0);
-                info!(
-                    "Port {}/{} Ipv6 assign request discarded pid={}",
-                    data.get_value_u16(Fields::IpLocalPort as usize),
-                    get_protocol(&data, Fields::IpProtocol as usize),
-                    process_id,
-                );
-                discard_pending_connections(device, &conns);
-                for conn in conns {
-                    emit_connection_end_v6(device, conn, process_id);
-                }
-            }
-        }
-        layer::Layer::AleResourceReleaseV4 => {
-            type Fields = layer::FieldsAleResourceReleaseV4;
-            let process_id = data.get_process_id().unwrap_or(0);
-            if matches!(
-                get_protocol(&data, Fields::IpProtocol as usize),
-                IpProtocol::Udp
-            ) {
-                if let Some(endpoint_handle) = udp_endpoint_handle(&data) {
-                    end_udp_endpoint(device, endpoint_handle, process_id);
-                    return;
-                }
-            }
-            if let Some(conns) = device.connection_cache.end_all_on_endpoint_v4(
-                (
-                    get_protocol(&data, Fields::IpProtocol as usize),
-                    data.get_value_u16(Fields::IpLocalPort as usize),
-                ),
-                get_ipv4_address_if_present(&data, Fields::IpLocalAddress as usize),
-                data.get_process_id().filter(|pid| *pid != 0),
-            ) {
-                let process_id = data.get_process_id().unwrap_or(0);
-                info!(
-                    "Port {}/{} released pid={}",
-                    data.get_value_u16(Fields::IpLocalPort as usize),
-                    get_protocol(&data, Fields::IpProtocol as usize),
-                    process_id,
-                );
-                discard_pending_connections(device, &conns);
-                for conn in conns {
-                    emit_connection_end_v4(device, conn, process_id);
-                }
-            }
-        }
-        layer::Layer::AleResourceReleaseV6 => {
-            type Fields = layer::FieldsAleResourceReleaseV6;
-            let process_id = data.get_process_id().unwrap_or(0);
-            if matches!(
-                get_protocol(&data, Fields::IpProtocol as usize),
-                IpProtocol::Udp
-            ) {
-                if let Some(endpoint_handle) = udp_endpoint_handle(&data) {
-                    end_udp_endpoint(device, endpoint_handle, process_id);
-                    return;
-                }
-            }
-            if let Some(conns) = device.connection_cache.end_all_on_endpoint_v6(
-                (
-                    get_protocol(&data, Fields::IpProtocol as usize),
-                    data.get_value_u16(Fields::IpLocalPort as usize),
-                ),
-                get_ipv6_address_if_present(&data, Fields::IpLocalAddress as usize),
-                data.get_process_id().filter(|pid| *pid != 0),
-            ) {
-                let process_id = data.get_process_id().unwrap_or(0);
-                info!(
-                    "Port {}/{} released pid={}",
-                    data.get_value_u16(Fields::IpLocalPort as usize),
-                    get_protocol(&data, Fields::IpProtocol as usize),
-                    process_id,
-                );
-                discard_pending_connections(device, &conns);
-                for conn in conns {
-                    emit_connection_end_v6(device, conn, process_id);
-                }
-            }
-        }
-        _ => {}
     }
 }

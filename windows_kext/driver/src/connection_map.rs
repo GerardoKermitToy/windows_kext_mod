@@ -373,12 +373,9 @@ impl<T: Connection + Clone> ConnectionMap<T> {
     /// Ends the connection matching `key` and returns a copy of it, or `None` if
     /// there is no live match.
     ///
-    /// Already-ended entries are skipped rather than ended again. Two layers can
-    /// report the same close: `endpoint_closure_*` (this path) and
-    /// `ale_resource_monitor` on the resource-release layer, which performs an
-    /// endpoint sweep. Without the check the second one to arrive emitted a
-    /// duplicate connection-end event for a connection that was already closed -
-    /// observed on IPv6, where Windows indicates both.
+    /// Already-ended entries are skipped rather than ended again. Repeated or
+    /// competing lifecycle indications must not emit duplicate connection-end
+    /// events.
     ///
     /// The search continues past ended entries instead of stopping at the first
     /// address match. `add` inserts without replacing, and ended entries are only
@@ -425,10 +422,10 @@ impl<T: Connection + Clone> ConnectionMap<T> {
     /// The map is grouped by protocol and local port, but that grouping is not a
     /// sufficient identity: two local addresses can listen on the same port, and
     /// multiple processes can share an endpoint with `SO_REUSEADDR`. The optional
-    /// address and PID filters are supplied by the ALE resource indication.
+    /// address and PID filters are supplied by the ALE endpoint-closure indication.
     ///
     /// A connection with PID 0 is treated as an unknown owner and is eligible when
-    /// a release carries a PID. Otherwise a PID-0 connection would remain stale
+    /// a closure carries a PID. Otherwise a PID-0 connection would remain stale
     /// forever when it was created before attribution became available. A missing
     /// local address (WFP `FWP_EMPTY` for a wildcard bind) deliberately means
     /// "all local addresses", leaving the PID as the disambiguating field.
