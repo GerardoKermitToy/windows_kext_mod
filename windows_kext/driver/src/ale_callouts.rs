@@ -1161,9 +1161,9 @@ pub fn endpoint_closure_v6(data: CalloutData) {
     }
 }
 
-/// Returns the IP version when this is an outbound UDP flow-established indication.
-/// A missing or mistyped direction is not treated as outbound.
-fn outbound_udp_flow_ip_version(data: &CalloutData) -> Option<bool> {
+/// Returns the IP version when this is an outbound TCP or UDP flow-established
+/// indication. A missing or mistyped direction is not treated as outbound.
+fn outbound_transport_flow_ip_version(data: &CalloutData) -> Option<bool> {
     let (protocol_index, direction_index, is_ipv6) = match data.get_layer() {
         layer::Layer::AleFlowEstablishedV4 => (
             layer::FieldsAleFlowEstablishedV4::IpProtocol as usize,
@@ -1180,7 +1180,7 @@ fn outbound_udp_flow_ip_version(data: &CalloutData) -> Option<bool> {
 
     if !matches!(
         get_protocol_if_present(data, protocol_index),
-        Some(IpProtocol::Udp)
+        Some(IpProtocol::Tcp | IpProtocol::Udp)
     ) || !matches!(data.get_value_type(direction_index), ValueType::FwpUint32)
         || data.get_value_u32(direction_index) != FWP_DIRECTION_OUTBOUND as u32
     {
@@ -1190,8 +1190,8 @@ fn outbound_udp_flow_ip_version(data: &CalloutData) -> Option<bool> {
     Some(is_ipv6)
 }
 
-fn is_self_injected_outbound_udp_flow(device: &Device, data: &CalloutData) -> bool {
-    let Some(is_ipv6) = outbound_udp_flow_ip_version(data) else {
+fn is_self_injected_outbound_transport_flow(device: &Device, data: &CalloutData) -> bool {
+    let Some(is_ipv6) = outbound_transport_flow_ip_version(data) else {
         return false;
     };
     let layer_data = data.get_layer_data();
@@ -1288,16 +1288,18 @@ pub fn ale_flow_established_monitor(data: CalloutData) {
         _ => return,
     };
 
-    if matches!(key.protocol, IpProtocol::Udp) {
-        // Network reinjection can create a short-lived System-owned raw flow with
-        // the application's tuple but a different endpoint. Skip it before both
-        // endpoint and tuple resolution so its deletion cannot end the application
-        // connection. Injection state proves ownership; a raw-socket flag alone
-        // would also match legitimate application traffic.
-        if is_self_injected_outbound_udp_flow(device, &data) {
-            return;
-        }
+    // Network-layer reinjection can create an additional short-lived,
+    // System-owned raw TCP or UDP flow with the application's tuple but a
+    // different endpoint. It is not the application connection authorized above.
+    // Skip it before endpoint or tuple resolution so it cannot produce a false
+    // correlation error, overwrite attribution, or own lifecycle state. Injection
+    // state proves ownership; a raw-socket flag alone would also match legitimate
+    // application traffic.
+    if is_self_injected_outbound_transport_flow(device, &data) {
+        return;
+    }
 
+    if matches!(key.protocol, IpProtocol::Udp) {
         let endpoint_handle = transport_endpoint_handle(&data);
         // Authorization records the exact cache instance under the endpoint
         // handle. Resolve and validate it while both endpoint and connection
