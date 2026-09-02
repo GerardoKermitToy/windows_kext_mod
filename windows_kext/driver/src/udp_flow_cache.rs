@@ -256,6 +256,13 @@ impl UdpFlowCache {
         }
     }
 
+    #[allow(dead_code)]
+    pub fn get_entries_counts(&self) -> (usize, usize) {
+        let _guard = self.lock.read_lock();
+        let state = unsafe { &*self.state.get() };
+        (state.registrations.len(), state.callbacks_in_progress)
+    }
+
     pub fn is_drained(&self) -> bool {
         let _guard = self.lock.read_lock();
         let state = unsafe { &*self.state.get() };

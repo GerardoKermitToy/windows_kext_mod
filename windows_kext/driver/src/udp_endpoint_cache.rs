@@ -185,6 +185,13 @@ impl UdpEndpointCache {
         self.endpoints.remove(&endpoint_handle)
     }
 
+    #[allow(dead_code)]
+    pub fn get_entries_counts(&self) -> (usize, usize) {
+        let _guard = self.lock.read_lock();
+        let peers = self.endpoints.values().map(Vec::len).sum();
+        (self.endpoints.len(), peers)
+    }
+
     pub fn clear(&mut self) {
         let _guard = self.lock.write_lock();
         self.endpoints.clear();

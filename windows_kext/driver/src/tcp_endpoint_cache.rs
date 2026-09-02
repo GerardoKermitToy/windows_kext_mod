@@ -109,6 +109,11 @@ impl TcpEndpointCache {
         Some(endpoint)
     }
 
+    #[allow(dead_code)]
+    pub fn get_entries_count(&self) -> usize {
+        self.endpoints.len()
+    }
+
     pub fn clear(&mut self) {
         self.endpoints.clear();
     }

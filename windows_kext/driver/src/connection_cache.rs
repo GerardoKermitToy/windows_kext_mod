@@ -434,19 +434,17 @@ impl ConnectionCache {
     }
 
     #[allow(dead_code)]
-    pub fn get_entries_count(&self) -> usize {
-        let mut size = 0;
-        {
+    pub fn get_entries_counts(&self) -> (usize, usize) {
+        let v4 = {
             let connections = self.connections_v4.read_lock();
-            size += connections.get_count();
-        }
-
-        {
+            connections.get_count()
+        };
+        let v6 = {
             let connections = self.connections_v6.read_lock();
-            size += connections.get_count();
-        }
+            connections.get_count()
+        };
 
-        size
+        (v4, v6)
     }
 }
 

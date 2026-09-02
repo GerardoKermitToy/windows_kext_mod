@@ -152,6 +152,12 @@ impl IcmpEchoCache {
         Some(entry.process_id)
     }
 
+    #[allow(dead_code)]
+    pub fn get_entries_count(&self) -> usize {
+        let _guard = self.lock.read_lock();
+        self.entries.len()
+    }
+
     /// Drops every entry past its TTL.
     ///
     /// Called from the periodic `CleanEndedConnections` command, which runs at

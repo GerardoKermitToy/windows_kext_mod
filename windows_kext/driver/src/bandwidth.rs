@@ -261,29 +261,24 @@ impl Bandwidth {
     }
 
     #[allow(dead_code)]
-    pub fn get_entries_count(&self) -> usize {
-        let mut size = 0;
-        {
-            let values = &self.stats_tcp_v4.values();
+    pub fn get_entries_counts(&self) -> (usize, usize, usize, usize) {
+        let tcp_v4 = {
             let _guard = self.stats_tcp_v4_lock.read_lock();
-            size += values.len();
-        }
-        {
-            let values = &self.stats_tcp_v6.values();
+            self.stats_tcp_v4.len()
+        };
+        let tcp_v6 = {
             let _guard = self.stats_tcp_v6_lock.read_lock();
-            size += values.len();
-        }
-        {
-            let values = &self.stats_udp_v4.values();
+            self.stats_tcp_v6.len()
+        };
+        let udp_v4 = {
             let _guard = self.stats_udp_v4_lock.read_lock();
-            size += values.len();
-        }
-        {
-            let values = &self.stats_udp_v6.values();
+            self.stats_udp_v4.len()
+        };
+        let udp_v6 = {
             let _guard = self.stats_udp_v6_lock.read_lock();
-            size += values.len();
-        }
+            self.stats_udp_v6.len()
+        };
 
-        return size;
+        (tcp_v4, tcp_v6, udp_v4, udp_v6)
     }
 }

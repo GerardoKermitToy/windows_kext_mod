@@ -537,21 +537,58 @@ impl Device {
                 }
             }
             CommandType::PrintMemoryStats => {
-                // Getting the information takes a long time and interferes with the callouts causing the device to crash.
-                // TODO(vladimir): Make more optimized version
-                // info!(
-                //     "Packet cache: {} entries",
-                //     self.packet_cache.get_entries_count()
-                // );
-                // info!(
-                //     "BandwidthStats cache: {} entries",
-                //     self.bandwidth_stats.get_entries_count()
-                // );
-                // info!(
-                //     "Connection cache: {} entries\n {}",
-                //     self.connection_cache.get_entries_count(),
-                //     self.connection_cache.get_full_cache_info()
-                // );
+                // Snapshot each cache independently. All spin-lock guards must be
+                // released before crate::err! allocates the userspace log records.
+                let packet_cache_entries = {
+                    let packet_cache = self.packet_cache.write_lock();
+                    packet_cache.get_entries_count()
+                };
+                let (connection_v4_entries, connection_v6_entries) =
+                    self.connection_cache.get_entries_counts();
+                let (bandwidth_tcp_v4, bandwidth_tcp_v6, bandwidth_udp_v4, bandwidth_udp_v6) = {
+                    let bandwidth_stats = self.bandwidth_stats.write_lock();
+                    bandwidth_stats.get_entries_counts()
+                };
+                let tcp_endpoint_entries = {
+                    let endpoint_cache = self.tcp_endpoint_cache.read_lock();
+                    endpoint_cache.get_entries_count()
+                };
+                let (udp_endpoint_entries, udp_endpoint_peers) = {
+                    let endpoint_cache = self.udp_endpoint_cache.write_lock();
+                    endpoint_cache.get_entries_counts()
+                };
+                let (udp_flow_entries, udp_flow_callbacks) =
+                    self.udp_flow_cache.get_entries_counts();
+                let icmp_echo_entries = {
+                    let icmp_echo_cache = self.icmp_echo_cache.write_lock();
+                    icmp_echo_cache.get_entries_count()
+                };
+
+                crate::err!("Packet cache: {} entries", packet_cache_entries);
+                crate::err!(
+                    "Connection cache: IPv4 {} entries, IPv6 {} entries",
+                    connection_v4_entries,
+                    connection_v6_entries
+                );
+                crate::err!(
+                    "BandwidthStats cache: TCPv4 {}, TCPv6 {}, UDPv4 {}, UDPv6 {} entries",
+                    bandwidth_tcp_v4,
+                    bandwidth_tcp_v6,
+                    bandwidth_udp_v4,
+                    bandwidth_udp_v6
+                );
+                crate::err!("TCP endpoint cache: {} entries", tcp_endpoint_entries);
+                crate::err!(
+                    "UDP endpoint cache: {} endpoints, {} peers",
+                    udp_endpoint_entries,
+                    udp_endpoint_peers
+                );
+                crate::err!(
+                    "UDP flow cache: {} entries, {} callbacks in progress",
+                    udp_flow_entries,
+                    udp_flow_callbacks
+                );
+                crate::err!("ICMP echo cache: {} entries", icmp_echo_entries);
             }
             CommandType::CleanEndedConnections => {
                 wdk::dbg!("CleanEndedConnections command");
