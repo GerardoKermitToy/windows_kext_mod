@@ -219,8 +219,6 @@ pub trait Connection {
     }
     /// Returns the timestamp when the connection ended.
     fn get_end_time(&self) -> u64;
-    /// Returns the timestamp when the connection was last accessed.
-    fn get_last_accessed_time(&self) -> u64;
     /// Sets the timestamp when the connection was last accessed.
     fn set_last_accessed_time(&self, timestamp: u64);
 }
@@ -399,10 +397,6 @@ impl Connection for ConnectionV4 {
         self.extra.end_timestamp
     }
 
-    fn get_last_accessed_time(&self) -> u64 {
-        self.last_accessed_timestamp.load(Ordering::Relaxed)
-    }
-
     fn set_last_accessed_time(&self, timestamp: u64) {
         self.last_accessed_timestamp
             .store(timestamp, Ordering::Relaxed);
@@ -562,10 +556,6 @@ impl Connection for ConnectionV6 {
 
     fn get_end_time(&self) -> u64 {
         self.extra.end_timestamp
-    }
-
-    fn get_last_accessed_time(&self) -> u64 {
-        self.last_accessed_timestamp.load(Ordering::Relaxed)
     }
 
     fn set_last_accessed_time(&self, timestamp: u64) {

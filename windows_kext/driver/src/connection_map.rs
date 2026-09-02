@@ -462,44 +462,20 @@ impl<T: Connection + Clone> ConnectionMap<T> {
         self.0.clear();
     }
 
-    /// Removes ended history and returns live UDP entries that have been idle for
-    /// ten minutes.
-    ///
-    /// Live TCP entries are not expired by inactivity. They remain cached until a
+    /// Removes ended history after its one-minute late-packet grace period.
+    /// Live TCP and UDP entries are retained regardless of inactivity until a
     /// native lifecycle indication ends them, the cache is cleared, or the driver
     /// unloads.
-    ///
-    /// WFP's documented UDP idle lifetime is not a reliable callback deadline on
-    /// current Windows versions. Native flow deletion can end a connection earlier,
-    /// but the cache watchdog still publishes and removes every stale UDP entry so
-    /// user space cannot retain it indefinitely. This is bookkeeping only: removing
-    /// a cache entry does not abort the WFP flow or close the application's socket.
-    pub fn clean_ended_connections(&mut self) -> Vec<T> {
+    pub fn clean_ended_connections(&mut self) {
         let now = get_monotonic_timestamp_ms();
-        const TEN_MINUTES: u64 = Duration::from_secs(60 * 10).as_millis() as u64;
         let before_one_minute = now.saturating_sub(Duration::from_secs(60).as_millis() as u64);
-        let mut inactive = Vec::new();
 
         for connections in self.0.values_mut() {
             // `retain` preserves the relative order of the entries it keeps, so
             // the sort order the lookups depend on survives the sweep.
-            connections.retain(|c| {
-                if c.has_ended() {
-                    return c.get_end_time() >= before_one_minute;
-                }
-
-                if c.get_protocol() == IpProtocol::Udp
-                    && now.saturating_sub(c.get_last_accessed_time()) >= TEN_MINUTES
-                {
-                    inactive.push(c.clone());
-                    return false;
-                }
-
-                true
-            });
+            connections.retain(|c| !c.has_ended() || c.get_end_time() >= before_one_minute);
         }
         self.0.retain(|_, v| !v.is_empty());
-        inactive
     }
 
     /// Appends the IDs of every live UDP cache instance without refreshing activity.
@@ -711,42 +687,17 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_reports_inactive_udp_as_watchdog() {
+    fn cleanup_keeps_inactive_live_udp_until_lifecycle_end() {
         let tuple = key([203, 0, 113, 1], 443);
-        let mut map = ConnectionMap::new();
-        map.add(live(&tuple, 10));
-
-        let inactive = map.clean_ended_connections();
-
-        assert_eq!(inactive.len(), 1);
-        assert_eq!(inactive[0].process_id, 10);
-        assert_eq!(map.get_count(), 0);
-    }
-
-    #[test]
-    fn cleanup_expires_udp_at_exact_ten_minute_boundary() {
-        let tuple = key([203, 0, 113, 5], 443);
         let conn = live(&tuple, 10);
         conn.set_last_accessed_time(Duration::from_secs(50 * 60).as_millis() as u64);
         let mut map = ConnectionMap::new();
         map.add(conn);
 
-        let inactive = map.clean_ended_connections();
+        map.clean_ended_connections();
 
-        assert_eq!(inactive.len(), 1);
-        assert_eq!(map.get_count(), 0);
-    }
-
-    #[test]
-    fn cleanup_keeps_udp_active_within_ten_minutes() {
-        let tuple = key([203, 0, 113, 6], 443);
-        let conn = live(&tuple, 10);
-        conn.set_last_accessed_time(Duration::from_secs(50 * 60).as_millis() as u64 + 1);
-        let mut map = ConnectionMap::new();
-        map.add(conn);
-
-        assert!(map.clean_ended_connections().is_empty());
         assert_eq!(map.get_count(), 1);
+        assert_eq!(map.read(&tuple, read_process_id), Some(10));
     }
 
     #[test]
@@ -758,7 +709,8 @@ mod tests {
         let mut map = ConnectionMap::new();
         map.add(conn);
 
-        assert!(map.clean_ended_connections().is_empty());
+        map.clean_ended_connections();
+
         assert_eq!(map.get_count(), 1);
         assert_eq!(map.read(&tuple, read_process_id), Some(10));
     }
@@ -769,7 +721,7 @@ mod tests {
         let mut map = ConnectionMap::new();
         map.add(ended(&tuple, 10));
 
-        assert!(map.clean_ended_connections().is_empty());
+        map.clean_ended_connections();
         assert_eq!(map.get_count(), 0);
     }
 
@@ -788,7 +740,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_instance_activity_postpones_udp_expiry() {
+    fn exact_live_instance_can_be_touched() {
         let tuple = key([198, 51, 100, 3], 443);
         let conn = live(&tuple, 10);
         let instance_id = conn.get_instance_id();
@@ -796,7 +748,6 @@ mod tests {
         map.add(conn);
 
         assert!(map.touch_instance(&tuple, instance_id));
-        assert!(map.clean_ended_connections().is_empty());
         assert_eq!(map.get_count(), 1);
     }
 

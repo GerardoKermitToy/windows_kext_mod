@@ -747,10 +747,8 @@ fn associate_udp_flow_context(
         .udp_flow_cache
         .mark_associated(flow_context, connection_instance_id)
     {
-        // Touch only the exact cache instance that received this context. Besides
-        // confirming that tuple reuse has not replaced it, this records the
-        // association time as activity so the ten-minute fallback starts after
-        // flow establishment rather than an earlier packet-layer observation.
+        // Touch only the exact cache instance that received this context, so a
+        // concurrently reused tuple cannot record activity on its replacement.
         let _ = device
             .connection_cache
             .touch_connection_instance(&key, connection_instance_id);

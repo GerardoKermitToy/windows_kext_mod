@@ -28,7 +28,6 @@ use crate::{
     array_holder::ArrayHolder,
     bandwidth::Bandwidth,
     callouts,
-    connection::Connection,
     connection_cache::ConnectionCache,
     connection_map::Key,
     dbg, err,
@@ -547,28 +546,11 @@ impl Device {
             }
             CommandType::CleanEndedConnections => {
                 wdk::dbg!("CleanEndedConnections command");
-                let (inactive_v4, inactive_v6) = self.connection_cache.clean_ended_connections();
-                let mut inactive_instance_ids =
-                    Vec::with_capacity(inactive_v4.len() + inactive_v6.len());
-                inactive_instance_ids.extend(inactive_v4.iter().map(Connection::get_instance_id));
-                inactive_instance_ids.extend(inactive_v6.iter().map(Connection::get_instance_id));
-                self.discard_pending_connection_instances(&inactive_instance_ids);
-                // Native flow deletion emits promptly when WFP actually reclaims
-                // the ALE flow. This ten-minute watchdog also covers associated UDP
-                // flows whose Windows cleanup callback is delayed until socket close.
-                // It expires only Portmaster's cache record; it does not abort the
-                // WFP flow or close the socket. Either path consumes the exact live
-                // cache instance, so the later one cannot duplicate END.
-                for conn in inactive_v4 {
-                    crate::ale_callouts::emit_connection_end_v4(self, conn, 0);
-                }
-                for conn in inactive_v6 {
-                    crate::ale_callouts::emit_connection_end_v6(self, conn, 0);
-                }
-                // Reconcile only after the watchdog has removed inactive connection
-                // instances. Removing a WFP callout context does not close the UDP
-                // socket or flow; it merely asks WFP to return our allocation through
-                // flowDeleteFn.
+                self.connection_cache.clean_ended_connections();
+                // Reconcile endpoint and flow bookkeeping for connection instances
+                // that native lifecycle callbacks have already ended. Removing a WFP
+                // callout context does not close the UDP socket or flow; it merely asks
+                // WFP to return our allocation through flowDeleteFn.
                 self.clean_udp_lifecycle_state();
                 // Same intent for the ICMP echo table: an unanswered request is
                 // state that is no longer needed. Expired entries only, so that

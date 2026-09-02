@@ -174,8 +174,8 @@ impl UdpEndpointCache {
     ///
     /// An unknown handle leaves no state behind. Callers with a concrete handle
     /// deliberately do not use a local-port fallback for an unknown or repeated
-    /// indication: ignoring it is safer than ending a replacement socket, and the
-    /// inactivity watchdog still retires any unmatched bookkeeping.
+    /// indication: ignoring it is safer than ending a replacement socket, and
+    /// native flow deletion can still retire the matching peer state.
     pub fn take(&mut self, endpoint_handle: u64) -> Option<Vec<UdpEndpointPeer>> {
         if endpoint_handle == 0 {
             return None;

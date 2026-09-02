@@ -383,18 +383,16 @@ impl ConnectionCache {
         connections.end_all_on_endpoint(key, local_address, process_id)
     }
 
-    /// Cleans retained history and returns UDP entries expired by the fallback
-    /// inactivity watchdog. The caller must publish END for each returned entry.
-    pub fn clean_ended_connections(&self) -> (Vec<ConnectionV4>, Vec<ConnectionV6>) {
-        let inactive_v4 = {
+    /// Removes retained ended history after its late-packet grace period.
+    pub fn clean_ended_connections(&self) {
+        {
             let mut connections = self.connections_v4.write_lock();
-            connections.clean_ended_connections()
-        };
-        let inactive_v6 = {
+            connections.clean_ended_connections();
+        }
+        {
             let mut connections = self.connections_v6.write_lock();
-            connections.clean_ended_connections()
-        };
-        (inactive_v4, inactive_v6)
+            connections.clean_ended_connections();
+        }
     }
 
     /// Returns a sorted snapshot of every live UDP connection-cache instance ID

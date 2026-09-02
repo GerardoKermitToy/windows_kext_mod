@@ -2,8 +2,9 @@
 //!
 //! WFP owns each context after `FwpsFlowAssociateContext0` succeeds and returns it
 //! through flowDeleteFn when the flow expires. The registration tuple is retained
-//! separately so periodic idle cleanup and driver unload can explicitly remove
-//! outstanding contexts without terminating their underlying network flows.
+//! separately so periodic lifecycle reconciliation and driver unload can
+//! explicitly remove outstanding contexts without terminating their underlying
+//! network flows.
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
