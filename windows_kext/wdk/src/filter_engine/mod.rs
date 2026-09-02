@@ -24,6 +24,7 @@ pub mod ffi;
 pub mod flow;
 pub mod layer;
 pub(crate) mod metadata;
+pub use metadata::PacketDirection;
 pub mod net_buffer;
 pub mod packet;
 pub mod stream_data;

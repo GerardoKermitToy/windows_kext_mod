@@ -9,15 +9,33 @@ use windows_sys::Win32::{
         WindowsFilteringPlatform::{
             FWPS_METADATA_FIELD_COMPARTMENT_ID, FWPS_METADATA_FIELD_COMPLETION_HANDLE,
             FWPS_METADATA_FIELD_FLOW_HANDLE, FWPS_METADATA_FIELD_FRAGMENT_DATA,
-            FWPS_METADATA_FIELD_IP_HEADER_SIZE, FWPS_METADATA_FIELD_PROCESS_ID,
-            FWPS_METADATA_FIELD_PROCESS_PATH, FWPS_METADATA_FIELD_REMOTE_SCOPE_ID,
-            FWPS_METADATA_FIELD_TRANSPORT_CONTROL_DATA,
+            FWPS_METADATA_FIELD_IP_HEADER_SIZE, FWPS_METADATA_FIELD_PACKET_DIRECTION,
+            FWPS_METADATA_FIELD_PROCESS_ID, FWPS_METADATA_FIELD_PROCESS_PATH,
+            FWPS_METADATA_FIELD_REMOTE_SCOPE_ID, FWPS_METADATA_FIELD_TRANSPORT_CONTROL_DATA,
             FWPS_METADATA_FIELD_TRANSPORT_ENDPOINT_HANDLE,
             FWPS_METADATA_FIELD_TRANSPORT_HEADER_SIZE, FWP_BYTE_BLOB, FWP_DIRECTION,
+            FWP_DIRECTION_INBOUND, FWP_DIRECTION_OUTBOUND,
         },
     },
     Networking::WinSock::SCOPE_ID,
 };
+
+/// Direction of the packet that triggered an ALE reauthorization.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PacketDirection {
+    Outbound,
+    Inbound,
+}
+
+impl PacketDirection {
+    fn from_raw(direction: FWP_DIRECTION) -> Option<Self> {
+        match direction {
+            FWP_DIRECTION_OUTBOUND => Some(Self::Outbound),
+            FWP_DIRECTION_INBOUND => Some(Self::Inbound),
+            _ => None,
+        }
+    }
+}
 
 #[repr(C)]
 pub(crate) struct FwpsIncomingMetadataValues {
@@ -201,6 +219,16 @@ impl FwpsIncomingMetadataValues {
         None
     }
 
+    /// Returns the direction of the packet that triggered ALE reauthorization.
+    /// The backing field is not valid for ordinary authorization indications.
+    pub(crate) fn get_packet_direction(&self) -> Option<PacketDirection> {
+        if self.has_field(FWPS_METADATA_FIELD_PACKET_DIRECTION) {
+            return PacketDirection::from_raw(self.packet_direction);
+        }
+
+        None
+    }
+
     pub(crate) fn is_fragment_data(&self) -> bool {
         if self.has_field(FWPS_METADATA_FIELD_FRAGMENT_DATA) {
             return self.fragment_metadata.fragment_offset != 0;
@@ -315,3 +343,25 @@ const _: () = {
     assert!(offset_of!(FwpsIncomingMetadataValues, sub_process_tag) == 264);
     assert!(offset_of!(FwpsIncomingMetadataValues, reserved1) == 272);
 };
+
+#[cfg(test)]
+mod tests {
+    use super::PacketDirection;
+    use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
+        FWP_DIRECTION_INBOUND, FWP_DIRECTION_MAX, FWP_DIRECTION_OUTBOUND,
+    };
+
+    #[test]
+    fn packet_direction_accepts_only_native_inbound_and_outbound_values() {
+        assert_eq!(
+            PacketDirection::from_raw(FWP_DIRECTION_OUTBOUND),
+            Some(PacketDirection::Outbound)
+        );
+        assert_eq!(
+            PacketDirection::from_raw(FWP_DIRECTION_INBOUND),
+            Some(PacketDirection::Inbound)
+        );
+        assert_eq!(PacketDirection::from_raw(FWP_DIRECTION_MAX), None);
+        assert_eq!(PacketDirection::from_raw(-1), None);
+    }
+}

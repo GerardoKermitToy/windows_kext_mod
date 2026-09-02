@@ -8,7 +8,9 @@ use crate::info;
 use smoltcp::wire::{
     IpAddress, IpProtocol, Ipv4Address, Ipv6Address, IPV4_HEADER_LEN, IPV6_HEADER_LEN,
 };
-use wdk::filter_engine::callout_data::CalloutData;
+use wdk::filter_engine::{
+    callout_data::CalloutData, PacketDirection as WfpPacketDirection,
+};
 use wdk::filter_engine::layer::{
     self, FieldsAleAuthConnectV4, FieldsAleAuthConnectV6, FieldsAleAuthRecvAcceptV4,
     FieldsAleAuthRecvAcceptV6, ValueType,
@@ -25,7 +27,11 @@ struct AleLayerData {
     reauthorize: bool,
     process_id: u64,
     protocol: IpProtocol,
-    direction: Direction,
+    /// Direction assigned to the ALE flow, derived from its authorization layer.
+    connection_direction: Direction,
+    /// Direction of the packet currently being classified. During reauthorization
+    /// this can be opposite to `connection_direction`.
+    packet_direction: Direction,
     local_ip: IpAddress,
     local_port: u16,
     remote_ip: IpAddress,
@@ -80,6 +86,17 @@ fn get_u32_or_zero(data: &CalloutData, index: usize) -> u32 {
     }
 }
 
+/// Resolves the current packet direction without changing the direction assigned
+/// to the ALE flow. WFP supplies packet-direction metadata only for
+/// reauthorization; its absence means the authorization layer direction applies.
+fn get_packet_direction(data: &CalloutData, connection_direction: Direction) -> Direction {
+    match data.get_packet_direction() {
+        Some(WfpPacketDirection::Outbound) => Direction::Outbound,
+        Some(WfpPacketDirection::Inbound) => Direction::Inbound,
+        None => connection_direction,
+    }
+}
+
 fn get_ipv4_address(data: &CalloutData, index: usize) -> IpAddress {
     IpAddress::Ipv4(Ipv4Address::from_bytes(
         &data.get_value_u32(index).to_be_bytes(),
@@ -107,7 +124,8 @@ pub fn ale_layer_connect_v4(data: CalloutData) {
         reauthorize: data.is_reauthorize(Fields::Flags as usize),
         process_id: data.get_process_id().unwrap_or(0),
         protocol: get_protocol(&data, Fields::IpProtocol as usize),
-        direction: Direction::Outbound,
+        connection_direction: Direction::Outbound,
+        packet_direction: get_packet_direction(&data, Direction::Outbound),
         local_ip: get_ipv4_address(&data, Fields::IpLocalAddress as usize),
         local_port: data.get_value_u16(Fields::IpLocalPort as usize),
         remote_ip: get_ipv4_address(&data, Fields::IpRemoteAddress as usize),
@@ -127,7 +145,8 @@ pub fn ale_layer_connect_v6(data: CalloutData) {
         reauthorize: data.is_reauthorize(Fields::Flags as usize),
         process_id: data.get_process_id().unwrap_or(0),
         protocol: get_protocol(&data, Fields::IpProtocol as usize),
-        direction: Direction::Outbound,
+        connection_direction: Direction::Outbound,
+        packet_direction: get_packet_direction(&data, Direction::Outbound),
         local_ip: get_ipv6_address(&data, Fields::IpLocalAddress as usize),
         local_port: data.get_value_u16(Fields::IpLocalPort as usize),
         remote_ip: get_ipv6_address(&data, Fields::IpRemoteAddress as usize),
@@ -152,7 +171,8 @@ pub fn ale_layer_recv_accept_v4(data: CalloutData) {
         reauthorize: data.is_reauthorize(Fields::Flags as usize),
         process_id: data.get_process_id().unwrap_or(0),
         protocol: get_protocol(&data, Fields::IpProtocol as usize),
-        direction: Direction::Inbound,
+        connection_direction: Direction::Inbound,
+        packet_direction: get_packet_direction(&data, Direction::Inbound),
         local_ip: get_ipv4_address(&data, Fields::IpLocalAddress as usize),
         local_port: data.get_value_u16(Fields::IpLocalPort as usize),
         remote_ip: get_ipv4_address(&data, Fields::IpRemoteAddress as usize),
@@ -172,7 +192,8 @@ pub fn ale_layer_recv_accept_v6(data: CalloutData) {
         reauthorize: data.is_reauthorize(Fields::Flags as usize),
         process_id: data.get_process_id().unwrap_or(0),
         protocol: get_protocol(&data, Fields::IpProtocol as usize),
-        direction: Direction::Inbound,
+        connection_direction: Direction::Inbound,
+        packet_direction: get_packet_direction(&data, Direction::Inbound),
         local_ip: get_ipv6_address(&data, Fields::IpLocalAddress as usize),
         local_port: data.get_value_u16(Fields::IpLocalPort as usize),
         remote_ip: get_ipv6_address(&data, Fields::IpRemoteAddress as usize),
@@ -275,15 +296,16 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
     //
     // Register the connection here so the process ID is recorded while it is
     // available - the packet layer has no access to it and would store 0 - then
-    // permit and let the packet layer classify. Inbound UDP does not take this
-    // branch; it is authorized at ALE_AUTH_RECV_ACCEPT.
+    // permit and let the packet layer classify. During ordinary authorization,
+    // inbound UDP does not take this branch. During cross-direction
+    // reauthorization, the current packet direction deliberately controls it.
     if matches!(ale_data.protocol, IpProtocol::Udp)
-        && matches!(ale_data.direction, Direction::Outbound)
+        && matches!(ale_data.packet_direction, Direction::Outbound)
     {
         match device.connection_cache.register_connection(
             &key,
             ale_data.process_id,
-            ale_data.direction,
+            ale_data.connection_direction,
         ) {
             Ok(registration) => {
                 if registration.inserted {
@@ -342,7 +364,7 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
                                 (key, packet),
                                 Some(connection_instance_id),
                                 ale_data.process_id,
-                                ale_data.direction,
+                                ale_data.packet_direction,
                                 true,
                             )
                         };
@@ -367,11 +389,11 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
                 data.action_permit();
 
                 if device.is_owner_pid(ale_data.process_id as u32)
-                    && matches!(ale_data.direction, Direction::Outbound)
+                    && matches!(ale_data.packet_direction, Direction::Outbound)
                 {
-                    // If this is Portmaster's own outbound connection, clear the write flag
+                    // If this is Portmaster's own outbound packet, clear the write flag
                     // to prevent subsequent filters in the chain from overriding the permit action.
-                    // This prevents other firewall applications from blocking Portmaster's own connections.
+                    // This prevents other firewall applications from blocking Portmaster's own traffic.
                     data.clear_write_flag();
                 }
             }
@@ -386,7 +408,7 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
                 data.block_and_absorb();
             }
             Verdict::Block => {
-                if let Direction::Outbound = ale_data.direction {
+                if let Direction::Outbound = ale_data.packet_direction {
                     // Handled by packet layer.
                     data.action_permit();
                 } else {
@@ -395,7 +417,7 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
                 }
             }
             Verdict::Drop => {
-                if let Direction::Outbound = ale_data.direction {
+                if let Direction::Outbound = ale_data.packet_direction {
                     // Handled by packet layer.
                     data.action_permit();
                 } else {
@@ -405,7 +427,7 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
             }
         }
     } else {
-        crate::dbg!("pending connection: {} {}", key, ale_data.direction);
+        crate::dbg!("pending connection: {} {}", key, ale_data.packet_direction);
         // Only first packet of a connection can be pended: reauthorize == false
         //
         // Outbound UDP never reaches this point - it returns above and is decided
@@ -427,7 +449,7 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
         let registration = match device.connection_cache.register_connection(
             &key,
             ale_data.process_id,
-            ale_data.direction,
+            ale_data.connection_direction,
         ) {
             Ok(registration) => {
                 if registration.inserted {
@@ -457,7 +479,7 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
                 (key, packet),
                 Some(registration.instance_id),
                 ale_data.process_id,
-                ale_data.direction,
+                ale_data.packet_direction,
                 true,
             )
         };
@@ -465,7 +487,8 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
             let _ = device.event_queue.push(info);
         }
 
-        // Drop packet. It will be re-injected after Portmaster returns a verdict.
+        // Absorb this indication. A reusable packet clone, when WFP supplied one,
+        // will be re-injected after Portmaster returns a verdict.
         data.block_and_absorb();
     }
 }
@@ -478,17 +501,18 @@ fn save_packet(
 ) -> Result<Packet, alloc::string::String> {
     let mut packet_list = None;
     let mut save_packet_list = true;
-    if ale_data.protocol == IpProtocol::Tcp {
-        if let Direction::Outbound = ale_data.direction {
-            // Only time a packet data is missing is during connect state of outbound TCP connection.
-            // Don't save packet list only if connection is outbound, reauthorize is false and the protocol is TCP.
-            save_packet_list = ale_data.reauthorize;
-        }
-    };
+    if ale_data.protocol == IpProtocol::Tcp
+        && matches!(ale_data.packet_direction, Direction::Outbound)
+    {
+        // Initial outbound TCP authorization has no packet data. A later
+        // reauthorization may carry a transport-header NBL, so preserve it when
+        // WFP makes one available.
+        save_packet_list = ale_data.reauthorize;
+    }
     if save_packet_list {
         packet_list = create_packet_list(device, callout_data, ale_data)?;
     }
-    if pend && matches!(ale_data.direction, Direction::Inbound) && packet_list.is_none() {
+    if pend && matches!(ale_data.packet_direction, Direction::Inbound) && packet_list.is_none() {
         return Err("ALE receive/accept indication has no packet data".into());
     }
     if pend && matches!(ale_data.protocol, IpProtocol::Tcp | IpProtocol::Udp) {
@@ -506,6 +530,18 @@ fn create_packet_list(
     callout_data: &mut CalloutData,
     ale_data: &AleLayerData,
 ) -> Result<Option<TransportPacketList>, String> {
+    // An inbound packet can reauthorize an outbound ALE flow at AUTH_CONNECT.
+    // WFP does not expose a valid IP header for packet inspection at that layer,
+    // so it cannot be converted into the IP-header NBL required by transport
+    // receive injection. Absorb this indication without a clone; after the verdict
+    // forces another reauthorization, the next packet is classified normally.
+    if ale_data.reauthorize
+        && matches!(ale_data.connection_direction, Direction::Outbound)
+        && matches!(ale_data.packet_direction, Direction::Inbound)
+    {
+        return Ok(None);
+    }
+
     if callout_data.get_layer_data().is_null() {
         return Ok(None);
     }
@@ -516,7 +552,7 @@ fn create_packet_list(
     let mut nbl = unsafe { NetBufferList::new(callout_data.get_layer_data() as _) };
     let mut inbound = false;
     let mut event_data_offset = 0;
-    if let Direction::Inbound = ale_data.direction {
+    if let Direction::Inbound = ale_data.packet_direction {
         // At ALE_AUTH_RECV_ACCEPT the inbound data offset is at the payload.
         // Retreat over both headers so the clone passed to
         // FwpsInjectTransportReceiveAsync starts at the IP header.

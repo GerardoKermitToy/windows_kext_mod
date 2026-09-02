@@ -6,7 +6,7 @@ use crate::{
 use super::{
     classify::ClassifyOut,
     layer::{Layer, Value, ValueType},
-    metadata::FwpsIncomingMetadataValues,
+    metadata::{FwpsIncomingMetadataValues, PacketDirection},
     packet::TransportPacketList,
     stream_data::StreamCalloutIoPacket,
 };
@@ -278,6 +278,14 @@ impl<'a> CalloutData<'a> {
     /// Routing compartment for this indication, if WFP provided it.
     pub fn get_compartment_id(&self) -> Option<u32> {
         self.metadata.get_compartment_id()
+    }
+
+    /// Direction of the packet that triggered ALE reauthorization.
+    ///
+    /// WFP omits this metadata for an ordinary ALE authorization; callers must
+    /// then infer direction from the connect or receive/accept layer.
+    pub fn get_packet_direction(&self) -> Option<PacketDirection> {
+        self.metadata.get_packet_direction()
     }
 
     pub fn pend_operation(
