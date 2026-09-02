@@ -14,7 +14,7 @@ use wdk::filter_engine::layer::{
     FieldsAleAuthRecvAcceptV6, ValueType,
 };
 use wdk::filter_engine::net_buffer::NetBufferList;
-use wdk::filter_engine::packet::{Injector, TransportPacketList};
+use wdk::filter_engine::packet::{Injector, TransportPacketList, TransportProtocol};
 
 // ALE Layers
 
@@ -566,8 +566,14 @@ fn create_packet_list(
     let clone = nbl
         .clone(&device.network_allocator)
         .map_err(|err| alloc::format!("failed to clone ALE packet: {}", err))?;
+    let transport_protocol = match ale_data.protocol {
+        IpProtocol::Tcp => TransportProtocol::Tcp,
+        IpProtocol::Udp => TransportProtocol::Udp,
+        _ => return Err(String::from("unsupported ALE transport protocol")),
+    };
 
     Ok(Some(Injector::from_ale_callout(
+        transport_protocol,
         ale_data.is_ipv6,
         callout_data,
         clone,

@@ -166,8 +166,8 @@ impl CallbackBarrier {
     }
 
     /// Admits a callback that needs only the driver's code lifetime, not Device
-    /// state. This covers FWPS notify callbacks, whose function pointer remains
-    /// registered while management filters are being removed.
+    /// state. This covers FWPS notify callbacks and transport-injection DPCs,
+    /// which may still return while teardown is draining their native owners.
     pub fn enter_callback(&self) -> Option<CallbackAdmission<'_>> {
         let initial_token = self.state.load(Ordering::Acquire);
         let initial_phase = state_phase(initial_token);

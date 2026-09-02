@@ -815,6 +815,9 @@ impl Device {
                 // Initial ALE pends can be completed at the callback's IRQL and
                 // do not need the FilterEngine. Reauthorization is performed by
                 // the PASSIVE_LEVEL verdict path before this packet reaches here.
+                // FwpsInjectTransportReceiveAsync requires the pended ALE
+                // operation to be completed first, with this same cloned NBL.
+                // Keep completion before Injector's TCP DPC handoff.
                 let packet_list = defer.complete(!blocked)?;
                 if !blocked {
                     if let Some(packet_list) = packet_list {

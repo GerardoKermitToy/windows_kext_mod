@@ -4,13 +4,27 @@ use alloc::{
     string::{String, ToString},
 };
 use core::{
+    cell::UnsafeCell,
     ffi::c_void,
-    sync::atomic::{AtomicPtr, Ordering},
+    marker::PhantomPinned,
+    mem::MaybeUninit,
+    pin::Pin,
+    sync::atomic::{AtomicBool, AtomicPtr, Ordering},
 };
-use windows_sys::Win32::{
-    Foundation::{BOOLEAN, INVALID_HANDLE_VALUE, STATUS_SUCCESS},
-    Networking::WinSock::{AF_INET, AF_INET6, AF_UNSPEC, SCOPE_ID, SCOPE_ID_0},
-    System::Kernel::{COMPARTMENT_ID, UNSPECIFIED_COMPARTMENT_ID},
+use windows_sys::{
+    Wdk::{
+        Foundation::KDPC,
+        System::SystemServices::{
+            ExAcquireRundownProtection, ExInitializeRundownProtection, ExReleaseRundownProtection,
+            ExRundownCompleted, ExWaitForRundownProtectionRelease, EX_RUNDOWN_REF,
+            EX_RUNDOWN_REF_0,
+        },
+    },
+    Win32::{
+        Foundation::{BOOLEAN, INVALID_HANDLE_VALUE, STATUS_SUCCESS},
+        Networking::WinSock::{AF_INET, AF_INET6, AF_UNSPEC, SCOPE_ID, SCOPE_ID_0},
+        System::Kernel::{COMPARTMENT_ID, UNSPECIFIED_COMPARTMENT_ID},
+    },
 };
 
 use crate::{
@@ -26,7 +40,50 @@ use crate::{
 
 use super::{callout_data::CalloutData, net_buffer::NetBufferList};
 
+type TransportInjectDeferredRoutine = unsafe extern "system" fn(
+    dpc: *mut KDPC,
+    deferred_context: *mut c_void,
+    system_argument_1: *mut c_void,
+    system_argument_2: *mut c_void,
+);
+
+extern "system" {
+    fn KeInitializeDpc(
+        dpc: *mut KDPC,
+        deferred_routine: TransportInjectDeferredRoutine,
+        deferred_context: *mut c_void,
+    );
+    fn KeInsertQueueDpc(
+        dpc: *mut KDPC,
+        system_argument_1: *mut c_void,
+        system_argument_2: *mut c_void,
+    ) -> BOOLEAN;
+}
+
+// The generated KDPC is allocated in nonpaged pool and initialized in place.
+// An accidental binding-layout change would otherwise let KeInitializeDpc
+// overwrite the neighboring work-item fields.
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    assert!(core::mem::size_of::<KDPC>() == 64);
+    assert!(core::mem::align_of::<KDPC>() == 8);
+};
+
+/// Upper-layer protocol carried by an ALE transport packet clone.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransportProtocol {
+    Tcp,
+    Udp,
+}
+
+impl TransportProtocol {
+    fn requires_dpc(self) -> bool {
+        matches!(self, Self::Tcp)
+    }
+}
+
 pub struct TransportPacketList {
+    protocol: TransportProtocol,
     ipv6: bool,
     pub net_buffer_list: NetBufferList,
     event_data_offset: usize,
@@ -53,6 +110,125 @@ pub struct TransportPacketList {
 // ownership moves with this value.
 unsafe impl Send for TransportPacketList {}
 
+/// One admission reference held from transport-injection submission until the
+/// native injection API has either accepted the NBL or rejected it synchronously.
+///
+/// The referenced rundown object is pinned in `TransportInjectionState` and
+/// cannot be released by `Injector::destroy` until every such guard is dropped.
+struct TransportSubmission {
+    rundown: *mut EX_RUNDOWN_REF,
+}
+
+// The guard is transferred through a nonpaged DPC allocation. The kernel rundown
+// API provides the cross-CPU synchronization; the raw pointer remains pinned and
+// live until teardown has waited for this reference.
+unsafe impl Send for TransportSubmission {}
+
+impl Drop for TransportSubmission {
+    fn drop(&mut self) {
+        unsafe {
+            ExReleaseRundownProtection(self.rundown);
+        }
+    }
+}
+
+/// A fresh DPC object and all ownership needed to submit one TCP injection.
+///
+/// `packet_list` remains `Some` while the DPC is queued. The DPC routine takes
+/// it immediately before calling WFP. If queuing fails, dropping this allocation
+/// reclaims both the packet clone and its transport-submission admission.
+struct TcpTransportInjection {
+    dpc: KDPC,
+    injection_handle: *mut c_void,
+    packet_list: Option<TransportPacketList>,
+    _submission: TransportSubmission,
+}
+
+// The allocation is published only to the kernel DPC queue and consumed exactly
+// once by `inject_tcp_transport_dpc`.
+unsafe impl Send for TcpTransportInjection {}
+
+struct TransportInjectionState {
+    handle: AtomicPtr<c_void>,
+    submissions: UnsafeCell<EX_RUNDOWN_REF>,
+    closing: AtomicBool,
+    drained: AtomicBool,
+    _pin: PhantomPinned,
+}
+
+// The handle is atomic, the rundown reference is accessed only through kernel
+// interlocked APIs, and the remaining fields are atomic lifecycle state.
+unsafe impl Send for TransportInjectionState {}
+unsafe impl Sync for TransportInjectionState {}
+
+impl TransportInjectionState {
+    fn new() -> Pin<Box<Self>> {
+        let state = Box::pin(Self {
+            handle: AtomicPtr::new(INVALID_HANDLE_VALUE),
+            submissions: UnsafeCell::new(EX_RUNDOWN_REF {
+                Anonymous: EX_RUNDOWN_REF_0 { Count: 0 },
+            }),
+            closing: AtomicBool::new(false),
+            drained: AtomicBool::new(false),
+            _pin: PhantomPinned,
+        });
+        unsafe {
+            ExInitializeRundownProtection(state.as_ref().get_ref().submissions.get());
+        }
+        state
+    }
+
+    fn acquire_submission(&self) -> Option<TransportSubmission> {
+        if self.closing.load(Ordering::Acquire) {
+            return None;
+        }
+
+        let rundown = self.submissions.get();
+        if unsafe { ExAcquireRundownProtection(rundown) } == 0 {
+            return None;
+        }
+        let submission = TransportSubmission { rundown };
+
+        // A closer can publish its state between the first check and the native
+        // acquisition. The reference is included in its wait either way; reject
+        // the new operation so teardown does not submit additional packet work.
+        if self.closing.load(Ordering::Acquire) {
+            return None;
+        }
+
+        Some(submission)
+    }
+
+    /// Closes submission admission and waits until every queued DPC has called
+    /// WFP (or reclaimed an immediately rejected packet). This must run at
+    /// PASSIVE_LEVEL before the transport injection handle is destroyed.
+    fn close_and_wait(&self) {
+        if self.drained.load(Ordering::Acquire) {
+            return;
+        }
+
+        if self
+            .closing
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            unsafe {
+                ExWaitForRundownProtectionRelease(self.submissions.get());
+                ExRundownCompleted(self.submissions.get());
+            }
+            self.drained.store(true, Ordering::Release);
+            return;
+        }
+
+        // Concurrent destroy callers are unusual, but `destroy` takes `&self`.
+        // Do not let one caller destroy the handle while the other is still
+        // waiting for the DPC submissions that use it.
+        while !self.drained.load(Ordering::Acquire) {
+            crate::utils::sleep_ms(1);
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct InjectInfo {
     pub ipv6: bool,
@@ -73,7 +249,7 @@ impl TransportPacketList {
 }
 
 pub struct Injector {
-    transport_inject_handle: AtomicPtr<c_void>,
+    transport_injection: Pin<Box<TransportInjectionState>>,
     packet_inject_handle_v4: AtomicPtr<c_void>,
     packet_inject_handle_v6: AtomicPtr<c_void>,
 }
@@ -90,33 +266,28 @@ impl Injector {
         // leaving that value in `self` would make Drop attempt to destroy an
         // uninitialized or otherwise invalid handle.
         let injector = Self {
-            transport_inject_handle: AtomicPtr::new(INVALID_HANDLE_VALUE),
+            transport_injection: TransportInjectionState::new(),
             packet_inject_handle_v4: AtomicPtr::new(INVALID_HANDLE_VALUE),
             packet_inject_handle_v6: AtomicPtr::new(INVALID_HANDLE_VALUE),
         };
 
         unsafe {
             let mut handle = INVALID_HANDLE_VALUE;
-            let status = FwpsInjectionHandleCreate0(
-                AF_UNSPEC,
-                FWPS_INJECTION_TYPE_TRANSPORT,
-                &mut handle,
-            );
+            let status =
+                FwpsInjectionHandleCreate0(AF_UNSPEC, FWPS_INJECTION_TYPE_TRANSPORT, &mut handle);
             check_ntstatus(status)
                 .map_err(|err| format!("failed to create transport injection handle: {}", err))?;
             if handle.is_null() || handle == INVALID_HANDLE_VALUE {
                 return Err("WFP returned an invalid transport injection handle".to_string());
             }
             injector
-                .transport_inject_handle
+                .transport_injection
+                .handle
                 .store(handle, Ordering::Release);
 
             handle = INVALID_HANDLE_VALUE;
-            let status = FwpsInjectionHandleCreate0(
-                AF_INET,
-                FWPS_INJECTION_TYPE_NETWORK,
-                &mut handle,
-            );
+            let status =
+                FwpsInjectionHandleCreate0(AF_INET, FWPS_INJECTION_TYPE_NETWORK, &mut handle);
             check_ntstatus(status)
                 .map_err(|err| format!("failed to create IPv4 injection handle: {}", err))?;
             if handle.is_null() || handle == INVALID_HANDLE_VALUE {
@@ -127,11 +298,8 @@ impl Injector {
                 .store(handle, Ordering::Release);
 
             handle = INVALID_HANDLE_VALUE;
-            let status = FwpsInjectionHandleCreate0(
-                AF_INET6,
-                FWPS_INJECTION_TYPE_NETWORK,
-                &mut handle,
-            );
+            let status =
+                FwpsInjectionHandleCreate0(AF_INET6, FWPS_INJECTION_TYPE_NETWORK, &mut handle);
             check_ntstatus(status)
                 .map_err(|err| format!("failed to create IPv6 injection handle: {}", err))?;
             if handle.is_null() || handle == INVALID_HANDLE_VALUE {
@@ -156,6 +324,13 @@ impl Injector {
             return Err("WFP injection handles must be destroyed at PASSIVE_LEVEL".to_string());
         }
 
+        // A queued TCP DPC is not yet visible to WFP, so handle destruction cannot
+        // wait for it. Close DPC admission and wait until every queued routine has
+        // either submitted its injection or reclaimed an immediate failure first.
+        // Once submitted, FwpsInjectionHandleDestroy0 supplies the second half of
+        // the lifetime protocol by waiting for WFP completion callbacks.
+        self.transport_injection.close_and_wait();
+
         fn destroy_one(handle: &AtomicPtr<c_void>, name: &str) -> Result<(), String> {
             let value = handle.load(Ordering::Acquire);
             if value == INVALID_HANDLE_VALUE || value.is_null() {
@@ -176,7 +351,7 @@ impl Injector {
 
         let mut first_error = None;
         for (handle, name) in [
-            (&self.transport_inject_handle, "transport"),
+            (&self.transport_injection.handle, "transport"),
             (&self.packet_inject_handle_v4, "IPv4 network"),
             (&self.packet_inject_handle_v6, "IPv6 network"),
         ] {
@@ -195,6 +370,7 @@ impl Injector {
 
     /// Creates the packet list used to replay an ALE indication.
     pub fn from_ale_callout(
+        protocol: TransportProtocol,
         ipv6: bool,
         callout_data: &CalloutData,
         net_buffer_list: NetBufferList,
@@ -215,11 +391,9 @@ impl Injector {
         let mut remote_ip = [0; 16];
         remote_ip[..address_length].copy_from_slice(remote_ip_slice);
 
-        let remote_scope_id = callout_data
-            .get_remote_scope_id()
-            .unwrap_or(SCOPE_ID {
-                Anonymous: SCOPE_ID_0 { Value: 0 },
-            });
+        let remote_scope_id = callout_data.get_remote_scope_id().unwrap_or(SCOPE_ID {
+            Anonymous: SCOPE_ID_0 { Value: 0 },
+        });
         let send_params = FWPS_TRANSPORT_SEND_PARAMS1 {
             remote_address: core::ptr::null(),
             remote_scope_id,
@@ -230,6 +404,7 @@ impl Injector {
         };
 
         Ok(TransportPacketList {
+            protocol,
             ipv6,
             net_buffer_list,
             event_data_offset,
@@ -249,20 +424,88 @@ impl Injector {
         })
     }
 
-    // TODO: pick a better name. This is not transport
+    /// Injects a saved ALE packet through the transport path.
+    ///
+    /// UDP has no TCP stack-lock dependency and is submitted in the caller's
+    /// current context. TCP is always transferred to a regular DPC before either
+    /// transport injection API is called.
     pub fn inject_packet_list_transport(
         &self,
         packet_list: TransportPacketList,
     ) -> Result<(), String> {
-        let transport_inject_handle = self
-            .transport_inject_handle
-            .load(Ordering::Acquire);
+        let Some(submission) = self.transport_injection.acquire_submission() else {
+            return Err("failed to inject packet: transport injector is closing".to_string());
+        };
+        let transport_inject_handle = self.transport_injection.handle.load(Ordering::Acquire);
         if transport_inject_handle == INVALID_HANDLE_VALUE || transport_inject_handle.is_null() {
             return Err("failed to inject packet: invalid handle value".to_string());
         }
-        // Box the entire packet_list so that remote_ip and send_params
-        // are heap-allocated. Their addresses remain stable until free_transport_packet
-        // drops the Box after WFP calls the completion callback.
+
+        if packet_list.protocol.requires_dpc() {
+            return Self::queue_tcp_transport_injection(
+                transport_inject_handle,
+                packet_list,
+                submission,
+            );
+        }
+
+        let result = Self::inject_transport_packet_now(transport_inject_handle, packet_list);
+        // Keep teardown from destroying the handle until the native call has
+        // either accepted ownership or returned an immediate error.
+        drop(submission);
+        result
+    }
+
+    fn queue_tcp_transport_injection(
+        transport_inject_handle: *mut c_void,
+        packet_list: TransportPacketList,
+        submission: TransportSubmission,
+    ) -> Result<(), String> {
+        // The global driver allocator uses nonpaged pool, as required for KDPC
+        // storage. Initialize the DPC only after the Box has its final address.
+        let work = Box::new(TcpTransportInjection {
+            dpc: unsafe { MaybeUninit::zeroed().assume_init() },
+            injection_handle: transport_inject_handle,
+            packet_list: Some(packet_list),
+            _submission: submission,
+        });
+        let work = Box::into_raw(work);
+
+        let queued = unsafe {
+            KeInitializeDpc(
+                core::ptr::addr_of_mut!((*work).dpc),
+                inject_tcp_transport_dpc,
+                work.cast(),
+            );
+            KeInsertQueueDpc(
+                core::ptr::addr_of_mut!((*work).dpc),
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+            )
+        };
+        if queued == 0 {
+            // This is a fresh KDPC, so it cannot legitimately already be queued.
+            // Ownership was not transferred; reclaim the packet and rundown guard.
+            unsafe {
+                drop(Box::from_raw(work));
+            }
+            return Err("failed to queue TCP transport injection DPC".to_string());
+        }
+
+        Ok(())
+    }
+
+    fn inject_transport_packet_now(
+        transport_inject_handle: *mut c_void,
+        packet_list: TransportPacketList,
+    ) -> Result<(), String> {
+        if transport_inject_handle == INVALID_HANDLE_VALUE || transport_inject_handle.is_null() {
+            return Err("failed to inject packet: invalid handle value".to_string());
+        }
+
+        // Box the entire packet_list so that remote_ip and send_params are
+        // heap-allocated. Their addresses remain stable until
+        // free_transport_packet drops the Box after WFP calls the completion.
         let mut boxed = Box::new(packet_list);
         let raw_nbl = boxed.net_buffer_list.nbl;
 
@@ -289,7 +532,9 @@ impl Injector {
             let address_family = if boxed.ipv6 { AF_INET6 } else { AF_INET };
             let raw_ptr = Box::into_raw(boxed);
 
-            // Inject. Context is *mut TransportPacketList; freed by free_transport_packet.
+            // On success WFP owns this Box until free_transport_packet. On an
+            // immediate failure the completion callback is not called, so reclaim
+            // the exact same allocation below.
             let status = if (*raw_ptr).inbound {
                 FwpsInjectTransportReceiveAsync0(
                     transport_inject_handle,
@@ -318,14 +563,10 @@ impl Injector {
                     raw_ptr as _,
                 )
             };
-            // Check for success
-            if let Err(err) = check_ntstatus(status) {
-                _ = Box::from_raw(raw_ptr);
-                return Err(err);
-            }
+            reclaim_immediate_injection_failure(raw_ptr, status)?;
         }
 
-        return Ok(());
+        Ok(())
     }
 
     pub fn inject_net_buffer_list(
@@ -437,9 +678,7 @@ impl Injector {
         &self,
         nbl: *const NET_BUFFER_LIST,
     ) -> bool {
-        let transport_inject_handle = self
-            .transport_inject_handle
-            .load(Ordering::Acquire);
+        let transport_inject_handle = self.transport_injection.handle.load(Ordering::Acquire);
         if transport_inject_handle == INVALID_HANDLE_VALUE
             || transport_inject_handle.is_null()
             || nbl.is_null()
@@ -448,11 +687,8 @@ impl Injector {
         }
 
         unsafe {
-            let state = FwpsQueryPacketInjectionState0(
-                transport_inject_handle,
-                nbl,
-                core::ptr::null_mut(),
-            );
+            let state =
+                FwpsQueryPacketInjectionState0(transport_inject_handle, nbl, core::ptr::null_mut());
 
             match state {
                 FWPS_PACKET_INJECTION_STATE::FWPS_PACKET_NOT_INJECTED => false,
@@ -463,6 +699,65 @@ impl Injector {
                 _ => false,
             }
         }
+    }
+}
+
+/// Finalizes the ownership transfer attempted by an asynchronous WFP injection.
+///
+/// # Safety
+///
+/// `packet` must be a non-null pointer returned by `Box::into_raw`. On native
+/// success the registered completion callback must own and eventually reconstruct
+/// that Box. On native failure WFP must not retain or complete the pointer.
+unsafe fn reclaim_immediate_injection_failure<T>(
+    packet: *mut T,
+    status: i32,
+) -> Result<(), String> {
+    match check_ntstatus(status) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            unsafe {
+                drop(Box::from_raw(packet));
+            }
+            Err(err)
+        }
+    }
+}
+
+/// Runs one TCP transport injection at DISPATCH_LEVEL.
+///
+/// The callback barrier keeps this driver code resident through return. The work
+/// allocation owns the queued packet and one transport-rundown reference; both are
+/// released on every exit path. A successful WFP call moves only the packet Box to
+/// `free_transport_packet`, while an immediate failure reclaims it in the call.
+unsafe extern "system" fn inject_tcp_transport_dpc(
+    _dpc: *mut KDPC,
+    deferred_context: *mut c_void,
+    _system_argument_1: *mut c_void,
+    _system_argument_2: *mut c_void,
+) {
+    // Acquire code-lifetime admission before interpreting driver-owned context.
+    // This remains available after classify admission closes and is drained only
+    // after Injector::destroy has waited for this work item.
+    let callback_admission = crate::callback_barrier::CALLBACK_BARRIER.enter_callback();
+
+    if deferred_context.is_null() {
+        crate::err!("TCP transport injection DPC received a null context");
+        return;
+    }
+    let mut work = unsafe { Box::from_raw(deferred_context as *mut TcpTransportInjection) };
+
+    if callback_admission.is_none() {
+        crate::err!("TCP transport injection DPC ran after callback admission closed");
+        return;
+    }
+
+    let Some(packet_list) = work.packet_list.take() else {
+        crate::err!("TCP transport injection DPC had no packet");
+        return;
+    };
+    if let Err(err) = Injector::inject_transport_packet_now(work.injection_handle, packet_list) {
+        crate::err!("failed to inject TCP packet from DPC: {}", err);
     }
 }
 
@@ -526,5 +821,52 @@ unsafe extern "system" fn free_transport_packet(
     }
     if !context.is_null() {
         _ = Box::from_raw(context as *mut TransportPacketList);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{reclaim_immediate_injection_failure, TransportProtocol};
+    use alloc::{boxed::Box, sync::Arc};
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    struct DropProbe(Arc<AtomicBool>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    #[test]
+    fn only_tcp_requires_dpc_transport_injection() {
+        assert!(TransportProtocol::Tcp.requires_dpc());
+        assert!(!TransportProtocol::Udp.requires_dpc());
+    }
+
+    #[test]
+    fn immediate_injection_failure_reclaims_context() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let packet = Box::into_raw(Box::new(DropProbe(dropped.clone())));
+
+        let result = unsafe { reclaim_immediate_injection_failure(packet, -1) };
+
+        assert!(result.is_err());
+        assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn successful_injection_leaves_context_for_completion() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let packet = Box::into_raw(Box::new(DropProbe(dropped.clone())));
+
+        let result = unsafe { reclaim_immediate_injection_failure(packet, 0) };
+
+        assert!(result.is_ok());
+        assert!(!dropped.load(Ordering::Acquire));
+        unsafe {
+            drop(Box::from_raw(packet));
+        }
+        assert!(dropped.load(Ordering::Acquire));
     }
 }
