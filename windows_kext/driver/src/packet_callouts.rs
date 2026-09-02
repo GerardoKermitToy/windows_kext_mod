@@ -200,6 +200,10 @@ fn ip_packet_layer(
     // Read once here: it is needed both by the fragment check below and by every
     // retreat in the loop.
     let wfp_ip_header_size = data.get_ip_header_size();
+    // Preserve the namespace/routing context for every clone that can outlive
+    // this classify callback. The injector falls back to WFP's unspecified
+    // compartment only when this metadata is absent.
+    let compartment_id = data.get_compartment_id();
 
     // A fragmented datagram is indicated twice at this layer: once per individual
     // fragment, and once more as the reassembled whole (verified on Windows 11:
@@ -447,6 +451,7 @@ fn ip_packet_layer(
                                 effective_direction,
                                 ipv6,
                                 key.is_loopback(),
+                                compartment_id,
                                 interface_index,
                                 sub_interface_index,
                             ) {
@@ -517,6 +522,7 @@ fn ip_packet_layer(
                 effective_direction,
                 ipv6,
                 key.is_loopback(),
+                compartment_id,
                 interface_index,
                 sub_interface_index,
             ) {
@@ -553,6 +559,7 @@ fn clone_packet(
     direction: Direction,
     ipv6: bool,
     loopback: bool,
+    compartment_id: Option<u32>,
     interface_index: u32,
     sub_interface_index: u32,
 ) -> Result<Packet, String> {
@@ -583,6 +590,7 @@ fn clone_packet(
             ipv6,
             inbound,
             loopback,
+            compartment_id,
             interface_index,
             sub_interface_index,
         },

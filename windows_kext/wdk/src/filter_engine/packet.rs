@@ -234,8 +234,18 @@ pub struct InjectInfo {
     pub ipv6: bool,
     pub inbound: bool,
     pub loopback: bool,
+    /// Routing compartment supplied with the original WFP indication. `None`
+    /// means WFP omitted the metadata and injection must use the unspecified
+    /// compartment rather than inventing a default compartment identity.
+    pub compartment_id: Option<u32>,
     pub interface_index: u32,
     pub sub_interface_index: u32,
+}
+
+fn resolve_compartment_id(compartment_id: Option<u32>) -> COMPARTMENT_ID {
+    compartment_id
+        .map(|id| id as COMPARTMENT_ID)
+        .unwrap_or(UNSPECIFIED_COMPARTMENT_ID)
 }
 
 impl TransportPacketList {
@@ -413,10 +423,7 @@ impl Injector {
             remote_scope_id,
             control_data,
             inbound,
-            compartment_id: callout_data
-                .get_compartment_id()
-                .map(|id| id as COMPARTMENT_ID)
-                .unwrap_or(UNSPECIFIED_COMPARTMENT_ID),
+            compartment_id: resolve_compartment_id(callout_data.get_compartment_id()),
             interface_index,
             sub_interface_index,
             // Pointers are populated after this object has a stable Box address.
@@ -588,6 +595,8 @@ impl Injector {
         let nbl = packet_boxed.nbl;
         let packet_pointer = Box::into_raw(packet_boxed);
 
+        let compartment_id = resolve_compartment_id(inject_info.compartment_id);
+
         let status = if inject_info.inbound && !inject_info.loopback {
             // Inject inbound.
             unsafe {
@@ -595,7 +604,7 @@ impl Injector {
                     inject_handle,
                     core::ptr::null_mut(),
                     0,
-                    UNSPECIFIED_COMPARTMENT_ID,
+                    compartment_id,
                     inject_info.interface_index,
                     inject_info.sub_interface_index,
                     nbl,
@@ -610,7 +619,7 @@ impl Injector {
                     inject_handle,
                     core::ptr::null_mut(),
                     0,
-                    UNSPECIFIED_COMPARTMENT_ID,
+                    compartment_id,
                     nbl,
                     free_packet,
                     (packet_pointer as *mut NetBufferList) as _,
@@ -836,7 +845,10 @@ unsafe extern "system" fn free_transport_packet(
 
 #[cfg(test)]
 mod tests {
-    use super::{reclaim_immediate_injection_failure, TransportProtocol};
+    use super::{
+        reclaim_immediate_injection_failure, resolve_compartment_id, TransportProtocol,
+        UNSPECIFIED_COMPARTMENT_ID,
+    };
     use alloc::{boxed::Box, sync::Arc};
     use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -852,6 +864,16 @@ mod tests {
     fn only_tcp_requires_dpc_transport_injection() {
         assert!(TransportProtocol::Tcp.requires_dpc());
         assert!(!TransportProtocol::Udp.requires_dpc());
+    }
+
+    #[test]
+    fn network_injection_preserves_explicit_compartment() {
+        assert_eq!(resolve_compartment_id(Some(42)), 42);
+    }
+
+    #[test]
+    fn network_injection_uses_unspecified_compartment_when_metadata_is_absent() {
+        assert_eq!(resolve_compartment_id(None), UNSPECIFIED_COMPARTMENT_ID);
     }
 
     #[test]
