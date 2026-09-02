@@ -88,9 +88,9 @@ pub struct ConnectionMap<T: Connection>(BTreeMap<(IpProtocol, u16), Vec<T>>);
 ///
 /// `partition_point` is used twice instead of `binary_search_by`, because the
 /// sort key is not unique: `binary_search_by` returns an arbitrary index inside
-/// a run of equal keys, and picking that one entry would reintroduce the bug
-/// documented on `end` - a stale ended entry shadowing the live connection
-/// behind it. The two bounds give the whole run, in insertion order.
+/// a run of equal keys, and selecting only that entry could let retained ended
+/// history shadow the live replacement behind it. The two bounds give the whole
+/// run, in insertion order.
 fn equal_range<T: Connection>(connections: &[T], target: (IpAddress, u16)) -> Range<usize> {
     let start = connections.partition_point(|conn| conn.remote_key() < target);
     let end = connections.partition_point(|conn| conn.remote_key() <= target);
@@ -148,8 +148,8 @@ impl<T: Connection + Clone> ConnectionMap<T> {
         if let Some(connections) = self.0.get_mut(&key) {
             // Insert *after* any entries with the same remote endpoint. That keeps
             // the vector in insertion order within a run of equal keys, which the
-            // lookups rely on: `end` expects to reach a live connection that was
-            // added behind an ended one, while `read_with_ended_fallback` keeps
+            // lookups and exact-instance operations can reach a live connection
+            // added behind ended history, while `read_with_ended_fallback` keeps
             // the oldest ended match for late packets.
             let index = connections.partition_point(|c| c.remote_key() <= conn.remote_key());
             connections.insert(index, conn);
@@ -368,32 +368,6 @@ impl<T: Connection + Clone> ConnectionMap<T> {
             }
         }
         false
-    }
-
-    /// Ends the connection matching `key` and returns a copy of it, or `None` if
-    /// there is no live match.
-    ///
-    /// Already-ended entries are skipped rather than ended again. Repeated or
-    /// competing lifecycle indications must not emit duplicate connection-end
-    /// events.
-    ///
-    /// The search continues past ended entries instead of stopping at the first
-    /// address match. `add` inserts without replacing, and ended entries are only
-    /// removed later by `clean_ended_connections`, so a stale closed entry can sit
-    /// in front of a live one with the same 5-tuple - returning `None` on the
-    /// first match would then leave the live connection open forever. This is why
-    /// the whole run of equal remote keys is examined and not just one entry of it.
-    pub fn end(&mut self, key: Key) -> Option<T> {
-        if let Some(connections) = self.0.get_mut(&key.small()) {
-            let range = equal_range(connections, (key.remote_address, key.remote_port));
-            for conn in &mut connections[range] {
-                if conn.remote_equals(&key) && !conn.has_ended() {
-                    conn.end(get_monotonic_timestamp_ms());
-                    return Some(conn.clone());
-                }
-            }
-        }
-        return None;
     }
 
     /// Ends the live connection matching both its tuple and cache-instance ID.
@@ -668,19 +642,6 @@ mod tests {
         map.add(live(&redirect_target, 10));
 
         assert_eq!(map.read(&redirect_target, read_process_id), Some(10));
-    }
-
-    #[test]
-    fn end_skips_ended_entry_and_ends_live_replacement() {
-        let tuple = key([1, 1, 1, 1], 443);
-        let mut map = ConnectionMap::new();
-        map.add(ended(&tuple, 10));
-        map.add(live(&tuple, 20));
-
-        let ended = map.end(tuple).expect("live entry");
-
-        assert_eq!(ended.process_id, 20);
-        assert!(map.get_mut(&tuple).is_none());
     }
 
     #[test]

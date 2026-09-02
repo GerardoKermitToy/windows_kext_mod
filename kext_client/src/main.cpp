@@ -513,7 +513,7 @@ BOOL WINAPI ConsoleHandler(DWORD signal) {
         signal == CTRL_CLOSE_EVENT) {
         g_shutdown_requested.store(true);
         Emit("\nCtrl+C: stopping...\n");
-        // Stop() sets the stop flag and sends the Shutdown command, which is
+        // Stop() sets the stop flag and issues IOCTL_SHUTDOWN_REQUEST, which is
         // what actually releases the blocked read.
         if (g_driver != nullptr) {
             g_driver->Stop();
@@ -935,9 +935,8 @@ int wmain(int argc, wchar_t** argv) {
                 "log lines: %llu, bandwidth records: %llu\n",
                 connections, verdicts, ends, logs, bandwidth_records);
 
-    // Stop() already sent the Shutdown command, which is what released the
-    // reader; the driver has resolved its pending packets by now
-    // (device.rs:312). No second shutdown is needed here.
+    // Stop() already issued IOCTL_SHUTDOWN_REQUEST, which released the reader
+    // and resolved pending packets. No second shutdown is needed here.
 
     // Cleanup() closes the handle, stops the service and deletes it. It also
     // runs from the destructor, but call it here so the result is visible

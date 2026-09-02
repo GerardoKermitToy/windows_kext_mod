@@ -186,9 +186,8 @@ public:
     // FO_SYNCHRONOUS_IO and the I/O manager holds its lock for the duration of
     // each request. Because a read on this device blocks in the driver for as
     // long as no event is queued, that lock is held indefinitely, and every
-    // WriteFile from another thread waits behind it. Commands would then only
-    // reach the driver after the next event arrived — including the Shutdown
-    // command needed to stop.
+    // WriteFile or DeviceIoControl request from another thread waits behind it.
+    // The shutdown IOCTL needed to stop would then also be delayed.
     //
     // With FILE_FLAG_OVERLAPPED there is no such serialisation, so commands
     // reach the driver while a read is still blocked. Every operation must then
@@ -208,10 +207,9 @@ public:
     // client instead.
     void Run(const Handlers& handlers, unsigned poll_interval_ms = 1000);
 
-    // Signals Run() to return, then asks the driver to release the blocked
-    // reader. A normal stop runs down the event queue and completes the read
-    // as EOF; a handle cleanup completes it as operation-aborted. Safe to call
-    // from a Ctrl+C handler.
+    // Signals Run() to return, then issues IOCTL_SHUTDOWN_REQUEST so the driver
+    // releases its blocked reader and pending packets. Safe to call repeatedly or
+    // from a Ctrl+C handler; the shutdown IOCTL is submitted at most once.
     void Stop();
 
     // IOCTL_VERSION: returns the 4-byte driver version.
@@ -221,7 +219,6 @@ public:
 
     // Commands written to the device (protocol/src/command.rs).
     bool SendVerdict(uint64_t id, Verdict verdict, std::string& error);
-    bool SendShutdown(std::string& error);
     bool RequestLogs(std::string& error);
     bool RequestBandwidthStats(std::string& error);
     bool RequestMemoryStats(std::string& error);
@@ -242,6 +239,7 @@ private:
     std::wstring         service_name_;
     std::unique_ptr<duplex_pipe::Server> server_;
     std::atomic<bool>    client_connected_{false};
+    std::atomic<bool>    shutdown_requested_{false};
     void*                device_ = nullptr;   // HANDLE
     void*                scm_ = nullptr;      // SC_HANDLE
     void*                stop_event_ = nullptr;  // HANDLE, signals Stop()

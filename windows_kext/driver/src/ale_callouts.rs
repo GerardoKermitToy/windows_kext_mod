@@ -202,9 +202,48 @@ pub fn ale_layer_recv_accept_v6(data: CalloutData) {
     ale_layer_auth(data, ale_data);
 }
 
-fn udp_endpoint_handle(data: &CalloutData) -> Option<u64> {
+fn transport_endpoint_handle(data: &CalloutData) -> Option<u64> {
     data.get_transport_endpoint_handle()
         .filter(|endpoint_handle| *endpoint_handle != 0)
+}
+
+fn parent_endpoint_handle(data: &CalloutData) -> Option<u64> {
+    data.get_parent_endpoint_handle()
+        .filter(|endpoint_handle| *endpoint_handle != 0)
+}
+
+/// Associates a TCP endpoint only while its exact connection-cache generation
+/// is still live. Endpoint closure takes the same lock before ending the stored
+/// generation, so a concurrent reauthorization cannot republish stale identity.
+fn track_tcp_endpoint_instance(
+    device: &Device,
+    endpoint_handle: Option<u64>,
+    parent_endpoint_handle: Option<u64>,
+    key: Key,
+    instance_id: u64,
+) {
+    let Some(endpoint_handle) = endpoint_handle else {
+        return;
+    };
+
+    let mut endpoint_cache = device.tcp_endpoint_cache.write_lock();
+    let associated = device
+        .connection_cache
+        .with_live_connection_instance(&key, instance_id, |_| {
+            Some(endpoint_cache.associate_instance(
+                endpoint_handle,
+                key,
+                parent_endpoint_handle,
+                instance_id,
+            ))
+        });
+    if matches!(associated, Some(false)) {
+        crate::err!(
+            "TCP endpoint handle {} is already associated with another connection: {}",
+            endpoint_handle,
+            key
+        );
+    }
 }
 
 /// Associates an endpoint only after a concrete live connection-cache instance
@@ -221,6 +260,28 @@ fn track_udp_endpoint_instance(
     };
     let mut endpoint_cache = device.udp_endpoint_cache.write_lock();
     let _ = endpoint_cache.associate_instance(endpoint_handle, key, instance_id);
+}
+
+fn track_endpoint_instance(
+    device: &Device,
+    endpoint_handle: Option<u64>,
+    parent_endpoint_handle: Option<u64>,
+    key: Key,
+    instance_id: u64,
+) {
+    match key.protocol {
+        IpProtocol::Tcp => track_tcp_endpoint_instance(
+            device,
+            endpoint_handle,
+            parent_endpoint_handle,
+            key,
+            instance_id,
+        ),
+        IpProtocol::Udp => {
+            track_udp_endpoint_instance(device, endpoint_handle, key, instance_id)
+        }
+        _ => {}
+    }
 }
 
 fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
@@ -267,14 +328,12 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
 
     let key = ale_data.as_key();
 
-    // Keep the handle now, but associate it only after this authorization has a
-    // concrete connection-cache instance. In particular, a blocked first packet
-    // must not leave an unbound peer for the lifetime of a listening socket.
-    let endpoint_handle = if matches!(ale_data.protocol, IpProtocol::Udp) {
-        udp_endpoint_handle(&data)
-    } else {
-        None
-    };
+    // Keep the WFP endpoint identity now, but associate it only after this
+    // authorization has selected a concrete live connection-cache generation.
+    // Reauthorization of an already cached TCP connection may omit this metadata;
+    // in that case the association saved by the initial indication remains valid.
+    let endpoint_handle = transport_endpoint_handle(&data);
+    let parent_endpoint_handle = parent_endpoint_handle(&data);
 
     // Outbound UDP is decided at the IP packet layer, not here.
     //
@@ -312,7 +371,13 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
                         ale_data.process_id
                     );
                 }
-                track_udp_endpoint_instance(device, endpoint_handle, key, registration.instance_id);
+                track_endpoint_instance(
+                    device,
+                    endpoint_handle,
+                    parent_endpoint_handle,
+                    key,
+                    registration.instance_id,
+                );
             }
             Err(err) => crate::err!("failed to build connection: {}", err),
         }
@@ -346,7 +411,13 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
 
     // Connection already in cache.
     if let Some((verdict, connection_instance_id)) = cached {
-        track_udp_endpoint_instance(device, endpoint_handle, key, connection_instance_id);
+        track_endpoint_instance(
+            device,
+            endpoint_handle,
+            parent_endpoint_handle,
+            key,
+            connection_instance_id,
+        );
         crate::dbg!("processing existing connection: {} {}", key, verdict);
         match verdict {
             // No verdict yet
@@ -424,6 +495,18 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
             }
         }
     } else {
+        // Creating TCP state without native endpoint identity would force closure
+        // back to a tuple lookup and reintroduce stale-generation teardown. An
+        // already cached connection was handled above and can safely reuse the
+        // association saved by its initial authorization.
+        if matches!(ale_data.protocol, IpProtocol::Tcp) && endpoint_handle.is_none() {
+            crate::err!(
+                "cannot register TCP authorization without an endpoint handle: {}",
+                key
+            );
+            return;
+        }
+
         crate::dbg!("pending connection: {} {}", key, ale_data.packet_direction);
         // Only first packet of a connection can be pended: reauthorize == false
         //
@@ -469,7 +552,13 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
             }
         };
 
-        track_udp_endpoint_instance(device, endpoint_handle, key, registration.instance_id);
+        track_endpoint_instance(
+            device,
+            endpoint_handle,
+            parent_endpoint_handle,
+            key,
+            registration.instance_id,
+        );
         let info = {
             let mut packet_cache = device.packet_cache.write_lock();
             packet_cache.push(
@@ -837,13 +926,47 @@ pub(crate) unsafe extern "system" fn udp_flow_delete(
     device.udp_flow_cache.finish_callback();
 }
 
-fn end_udp_endpoint(device: &Device, endpoint_handle: u64, process_id: u64) {
+fn end_tcp_endpoint(device: &Device, endpoint_handle: u64, process_id: u64) -> bool {
+    // Keep endpoint identity serialized with the exact-instance end operation.
+    // A concurrent reauthorization can either validate and publish before this
+    // block, or observe the ended instance afterwards, but cannot republish it
+    // between consuming the association and ending the connection.
+    let mut endpoint_cache = device.tcp_endpoint_cache.write_lock();
+    let Some(endpoint) = endpoint_cache.take(endpoint_handle) else {
+        return false;
+    };
+
+    let key = endpoint.key;
+    if key.is_ipv6() {
+        let conn = device
+            .connection_cache
+            .end_connection_instance_v6(key, endpoint.instance_id);
+        drop(endpoint_cache);
+        if let Some(conn) = conn {
+            discard_pending_connections(device, core::slice::from_ref(&conn));
+            emit_connection_end_v6(device, conn, process_id);
+        }
+        return true;
+    }
+
+    let conn = device
+        .connection_cache
+        .end_connection_instance_v4(key, endpoint.instance_id);
+    drop(endpoint_cache);
+    if let Some(conn) = conn {
+        discard_pending_connections(device, core::slice::from_ref(&conn));
+        emit_connection_end_v4(device, conn, process_id);
+    }
+    true
+}
+
+fn end_udp_endpoint(device: &Device, endpoint_handle: u64, process_id: u64) -> bool {
     let endpoint = {
         let mut endpoint_cache = device.udp_endpoint_cache.write_lock();
         endpoint_cache.take(endpoint_handle)
     };
     let Some(endpoint) = endpoint else {
-        return;
+        return false;
     };
 
     let mut ended_v4 = Vec::new();
@@ -873,6 +996,7 @@ fn end_udp_endpoint(device: &Device, endpoint_handle: u64, process_id: u64) {
     for conn in ended_v6 {
         emit_connection_end_v6(device, conn, process_id);
     }
+    true
 }
 
 fn end_local_endpoint_v4(
@@ -920,61 +1044,58 @@ pub fn endpoint_closure_v4(data: CalloutData) {
     };
     let process_id = data.get_process_id().unwrap_or(0);
     let protocol = get_protocol_if_present(&data, Fields::IpProtocol as usize);
+    let endpoint_handle = transport_endpoint_handle(&data);
 
-    // UDP closure is socket-level and may omit its remote tuple. A concrete
-    // endpoint handle is authoritative: consume its exact peers when tracked and
-    // otherwise ignore the indication. Falling back by local port for an unknown or
-    // repeated handle could end bookkeeping for a replacement socket, and avoiding
-    // that fallback removes the need to retain endpoint tombstones forever.
-    if matches!(protocol, Some(IpProtocol::Udp)) {
-        if let Some(endpoint_handle) = udp_endpoint_handle(&data) {
-            end_udp_endpoint(device, endpoint_handle, process_id);
-            return;
+    match protocol {
+        Some(IpProtocol::Tcp) => {
+            let connected_endpoint = get_ipv4_address_if_present(
+                &data,
+                Fields::IpRemoteAddress as usize,
+            )
+            .is_some()
+                && get_u16_if_present(&data, Fields::IpRemotePort as usize).is_some();
+            let Some(endpoint_handle) = endpoint_handle else {
+                if connected_endpoint {
+                    crate::err!("connected TCP closure has no endpoint handle");
+                }
+                return;
+            };
+            if !end_tcp_endpoint(device, endpoint_handle, process_id) && connected_endpoint {
+                crate::err!("TCP endpoint closure did not match a tracked connection");
+            }
         }
+        Some(IpProtocol::Udp) => {
+            // UDP closure is socket-level and may omit its remote tuple. A
+            // concrete endpoint handle is authoritative: consume its exact peers
+            // when tracked and otherwise ignore the indication. Falling back by
+            // local port for an unknown handle could end a replacement socket.
+            if let Some(endpoint_handle) = endpoint_handle {
+                let _ = end_udp_endpoint(device, endpoint_handle, process_id);
+                return;
+            }
 
-        let Some(local_port) = get_u16_if_present(&data, Fields::IpLocalPort as usize) else {
-            return;
-        };
-        end_local_endpoint_v4(
-            device,
-            IpProtocol::Udp,
-            local_port,
-            get_ipv4_address_if_present(&data, Fields::IpLocalAddress as usize),
-            process_id,
-        );
-        return;
-    }
-
-    let Some(protocol) = protocol else {
-        // A generic UDP closure can omit the protocol as well as the remote tuple.
-        // The endpoint map contains only UDP associations, so it remains safe to
-        // consume a known handle here. An unknown handle cannot be matched safely.
-        if let Some(endpoint_handle) = udp_endpoint_handle(&data) {
-            end_udp_endpoint(device, endpoint_handle, process_id);
+            let Some(local_port) = get_u16_if_present(&data, Fields::IpLocalPort as usize) else {
+                return;
+            };
+            end_local_endpoint_v4(
+                device,
+                IpProtocol::Udp,
+                local_port,
+                get_ipv4_address_if_present(&data, Fields::IpLocalAddress as usize),
+                process_id,
+            );
         }
-        return;
-    };
-
-    let (Some(local_address), Some(local_port), Some(remote_address), Some(remote_port)) = (
-        get_ipv4_address_if_present(&data, Fields::IpLocalAddress as usize),
-        get_u16_if_present(&data, Fields::IpLocalPort as usize),
-        get_ipv4_address_if_present(&data, Fields::IpRemoteAddress as usize),
-        get_u16_if_present(&data, Fields::IpRemotePort as usize),
-    ) else {
-        return;
-    };
-
-    let key = Key {
-        protocol,
-        local_address,
-        local_port,
-        remote_address,
-        remote_port,
-    };
-
-    if let Some(conn) = device.connection_cache.end_connection_v4(key) {
-        discard_pending_connections(device, core::slice::from_ref(&conn));
-        emit_connection_end_v4(device, conn, process_id);
+        None => {
+            // A generic closure may omit the protocol. Endpoint handles remain
+            // globally authoritative, so consult both protocol-specific maps
+            // without attempting a tuple or local-port fallback.
+            if let Some(endpoint_handle) = endpoint_handle {
+                if !end_tcp_endpoint(device, endpoint_handle, process_id) {
+                    let _ = end_udp_endpoint(device, endpoint_handle, process_id);
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -985,55 +1106,51 @@ pub fn endpoint_closure_v6(data: CalloutData) {
     };
     let process_id = data.get_process_id().unwrap_or(0);
     let protocol = get_protocol_if_present(&data, Fields::IpProtocol as usize);
+    let endpoint_handle = transport_endpoint_handle(&data);
 
-    // See endpoint_closure_v4 for why a present but unknown handle is ignored
-    // instead of retained as a tombstone or converted to a local-port sweep.
-    if matches!(protocol, Some(IpProtocol::Udp)) {
-        if let Some(endpoint_handle) = udp_endpoint_handle(&data) {
-            end_udp_endpoint(device, endpoint_handle, process_id);
-            return;
+    match protocol {
+        Some(IpProtocol::Tcp) => {
+            let connected_endpoint = get_ipv6_address_if_present(
+                &data,
+                Fields::IpRemoteAddress as usize,
+            )
+            .is_some()
+                && get_u16_if_present(&data, Fields::IpRemotePort as usize).is_some();
+            let Some(endpoint_handle) = endpoint_handle else {
+                if connected_endpoint {
+                    crate::err!("connected TCP closure has no endpoint handle");
+                }
+                return;
+            };
+            if !end_tcp_endpoint(device, endpoint_handle, process_id) && connected_endpoint {
+                crate::err!("TCP endpoint closure did not match a tracked connection");
+            }
         }
+        Some(IpProtocol::Udp) => {
+            if let Some(endpoint_handle) = endpoint_handle {
+                let _ = end_udp_endpoint(device, endpoint_handle, process_id);
+                return;
+            }
 
-        let Some(local_port) = get_u16_if_present(&data, Fields::IpLocalPort as usize) else {
-            return;
-        };
-        end_local_endpoint_v6(
-            device,
-            IpProtocol::Udp,
-            local_port,
-            get_ipv6_address_if_present(&data, Fields::IpLocalAddress as usize),
-            process_id,
-        );
-        return;
-    }
-
-    let Some(protocol) = protocol else {
-        if let Some(endpoint_handle) = udp_endpoint_handle(&data) {
-            end_udp_endpoint(device, endpoint_handle, process_id);
+            let Some(local_port) = get_u16_if_present(&data, Fields::IpLocalPort as usize) else {
+                return;
+            };
+            end_local_endpoint_v6(
+                device,
+                IpProtocol::Udp,
+                local_port,
+                get_ipv6_address_if_present(&data, Fields::IpLocalAddress as usize),
+                process_id,
+            );
         }
-        return;
-    };
-
-    let (Some(local_address), Some(local_port), Some(remote_address), Some(remote_port)) = (
-        get_ipv6_address_if_present(&data, Fields::IpLocalAddress as usize),
-        get_u16_if_present(&data, Fields::IpLocalPort as usize),
-        get_ipv6_address_if_present(&data, Fields::IpRemoteAddress as usize),
-        get_u16_if_present(&data, Fields::IpRemotePort as usize),
-    ) else {
-        return;
-    };
-
-    let key = Key {
-        protocol,
-        local_address,
-        local_port,
-        remote_address,
-        remote_port,
-    };
-
-    if let Some(conn) = device.connection_cache.end_connection_v6(key) {
-        discard_pending_connections(device, core::slice::from_ref(&conn));
-        emit_connection_end_v6(device, conn, process_id);
+        None => {
+            if let Some(endpoint_handle) = endpoint_handle {
+                if !end_tcp_endpoint(device, endpoint_handle, process_id) {
+                    let _ = end_udp_endpoint(device, endpoint_handle, process_id);
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1118,7 +1235,7 @@ pub fn ale_flow_established_monitor(data: CalloutData) {
     };
 
     if matches!(key.protocol, IpProtocol::Udp) {
-        let endpoint_handle = udp_endpoint_handle(&data);
+        let endpoint_handle = transport_endpoint_handle(&data);
         // Authorization records the exact cache instance under the endpoint
         // handle. Resolve and validate it while both endpoint and connection
         // guards are held, so endpoint closure cannot turn an old flow callback
@@ -1148,9 +1265,50 @@ pub fn ale_flow_established_monitor(data: CalloutData) {
             );
         }
         associate_udp_flow_context(device, &data, key, endpoint_handle, connection_instance_id);
-    } else if let Some(process_id) = process_id {
-        // TCP has no endpoint-peer map; preserve its existing tuple attribution
-        // path. The UDP path above is protected by the endpoint instance identity.
-        device.connection_cache.update_process_id(&key, process_id);
+    } else {
+        let Some(established_endpoint_handle) = transport_endpoint_handle(&data) else {
+            crate::err!("established TCP flow has no endpoint handle: {}", key);
+            return;
+        };
+        let parent_endpoint_handle = parent_endpoint_handle(&data);
+
+        // AUTH_RECV_ACCEPT can expose a provisional endpoint handle for the
+        // accepted connection. Resolve that authorization through its tuple,
+        // parent listener and still-live instance, then replace the provisional
+        // handle with the child endpoint used by FLOW_ESTABLISHED and CLOSURE.
+        let (endpoint, rebind_failed) = {
+            let mut endpoint_cache = device.tcp_endpoint_cache.write_lock();
+            let endpoint = endpoint_cache.resolve_live_instance(
+                &key,
+                parent_endpoint_handle,
+                |instance_id| {
+                    device
+                        .connection_cache
+                        .with_live_connection_instance(&key, instance_id, Some)
+                        .is_some()
+                },
+            );
+            let rebind_failed = endpoint.is_some_and(|endpoint| {
+                !endpoint_cache.rebind_established(established_endpoint_handle, endpoint)
+            });
+            (endpoint, rebind_failed)
+        };
+
+        if rebind_failed {
+            crate::err!("failed to rebind established TCP endpoint: {}", key);
+            return;
+        }
+        let Some(endpoint) = endpoint else {
+            crate::err!("failed to resolve TCP authorization for established flow: {}", key);
+            return;
+        };
+
+        if let Some(process_id) = process_id {
+            device.connection_cache.update_process_id_instance(
+                &endpoint.key,
+                endpoint.instance_id,
+                process_id,
+            );
+        }
     }
 }

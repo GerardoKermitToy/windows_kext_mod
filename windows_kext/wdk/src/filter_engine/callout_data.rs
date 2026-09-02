@@ -240,6 +240,10 @@ impl<'a> CalloutData<'a> {
         self.metadata.get_transport_endpoint_handle()
     }
 
+    pub fn get_parent_endpoint_handle(&self) -> Option<u64> {
+        self.metadata.get_parent_endpoint_handle()
+    }
+
     pub fn get_remote_scope_id(&self) -> Option<SCOPE_ID> {
         self.metadata.get_remote_scope_id()
     }

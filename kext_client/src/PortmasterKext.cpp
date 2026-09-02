@@ -256,6 +256,7 @@ bool Driver::Open(std::string& error) {
         return false;
     }
 
+    shutdown_requested_.store(false, std::memory_order_release);
     client_connected_.store(false, std::memory_order_release);
     const RPC_STATUS server_status = server_->Start();
     if (server_status != ERROR_SUCCESS) {
@@ -413,11 +414,6 @@ bool Driver::SendVerdict(uint64_t id, Verdict verdict, std::string& error) {
     return SendCommand(buf, sizeof(buf), error);
 }
 
-bool Driver::SendShutdown(std::string& error) {
-    const uint8_t buf[1] = {static_cast<uint8_t>(CommandType::Shutdown)};
-    return SendCommand(buf, sizeof(buf), error);
-}
-
 bool Driver::RequestLogs(std::string& error) {
     const uint8_t buf[1] = {static_cast<uint8_t>(CommandType::GetLogs)};
     return SendCommand(buf, sizeof(buf), error);
@@ -444,16 +440,25 @@ bool Driver::RequestClearCache(std::string& error) {
 }
 
 void Driver::Stop() {
-    // Order matters: raise the flag first so the reader exits once it wakes.
+    // Wake Run() and ReaderLoop first. The shutdown IOCTL below releases the
+    // driver's pending read; the event also bounds the reader with CancelIoEx if
+    // the IOCTL cannot be completed.
     if (stop_event_ != nullptr) {
         SetEvent(static_cast<HANDLE>(stop_event_));
     }
 
-    // Then ask the driver to release the read. A normal Stop sends Shutdown,
-    // which runs down the event queue and completes the read with EOF. If the
-    // handle is already being closed, IRP_MJ_CLEANUP completes it as canceled.
+    if (device_ == nullptr) {
+        return;
+    }
+
+    bool expected = false;
+    if (!shutdown_requested_.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return;
+    }
+
     std::string ignored;
-    SendShutdown(ignored);
+    RequestShutdown(ignored);
 }
 
 // -------------------------------------------------------------------- parsing
@@ -658,8 +663,8 @@ void Driver::ReaderLoop(const Handlers& handlers) {
 
         if (ok == 0) {
             const DWORD err = GetLastError();
-            // ERROR_HANDLE_EOF is the normal end of a run: the Shutdown
-            // command runs down the driver's event queue and completes the
+            // ERROR_HANDLE_EOF is the normal end of a run: the shutdown
+            // IOCTL runs down the driver's event queue and completes the
             // blocked read as EOF. A handle cleanup reports
             // ERROR_OPERATION_ABORTED and is handled below as another normal
             // stop path.
@@ -675,7 +680,7 @@ void Driver::ReaderLoop(const Handlers& handlers) {
             }
 
             // Pending: wait for completion or for Stop(). Stop() sends the
-            // Shutdown command, while handle cleanup can complete the read as
+            // shutdown IOCTL, while handle cleanup can complete the read as
             // ERROR_OPERATION_ABORTED. Both paths signal the OVERLAPPED event.
             HANDLE waits[2] = {ov.get()->hEvent, stop_event};
             const DWORD result = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
@@ -711,8 +716,8 @@ void Driver::ReaderLoop(const Handlers& handlers) {
         }
 
         if (read == 0) {
-            // EOF: the driver ran down the event queue (for example after
-            // Stop() sends Shutdown). Cleanup cancellation normally takes the
+            // EOF: the driver ran down the event queue (for example after Stop()
+            // issues the shutdown IOCTL). Cleanup cancellation normally takes the
             // error path above instead.
             break;
         }

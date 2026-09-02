@@ -40,6 +40,7 @@ mod packet_callouts;
 mod packet_util;
 #[cfg(not(test))]
 mod stream_callouts;
+mod tcp_endpoint_cache;
 mod udp_endpoint_cache;
 mod udp_flow_cache;
 

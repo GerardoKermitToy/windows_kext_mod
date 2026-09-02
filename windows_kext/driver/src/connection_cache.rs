@@ -140,40 +140,6 @@ impl ConnectionCache {
         registration
     }
 
-    /// Updates the owning process of a connection when the incoming PID is usable.
-    ///
-    /// Returns true if the entry was updated.
-    ///
-    /// PID 0 is ignored. PID 4 may replace an unknown PID (0), but must not
-    /// replace a concrete application PID. Any other PID takes precedence and
-    /// replaces the currently stored value, including 0 or 4.
-    ///
-    /// Flow-established attribution uses this when an inbound packet-layer fallback
-    /// starts with PID 0 because no socket is associated at that layer, or when ALE
-    /// later supplies a concrete application PID that takes precedence over earlier
-    /// attribution. Without the PID-0 repair, every later packet repeats the endpoint
-    /// lookup - roughly 200 times for a single loopback connection in the capture
-    /// that motivated it.
-    pub fn update_process_id(&self, key: &Key, process_id: u64) -> bool {
-        // PID 0 carries no attribution and must never replace a stored value.
-        if process_id == 0 {
-            return false;
-        }
-
-        if key.is_ipv6() {
-            let mut connections = self.connections_v6.write_lock();
-            if let Some(conn) = connections.get_mut(key) {
-                return merge_process_id(&mut conn.process_id, process_id);
-            }
-        } else {
-            let mut connections = self.connections_v4.write_lock();
-            if let Some(conn) = connections.get_mut(key) {
-                return merge_process_id(&mut conn.process_id, process_id);
-            }
-        }
-        false
-    }
-
     /// Runs `use_instance` only while the exact cache instance is still live.
     ///
     /// Endpoint tracking holds its own read guard around this call. The nested
@@ -351,16 +317,6 @@ impl ConnectionCache {
     pub fn end_connection_instance_v6(&self, key: Key, instance_id: u64) -> Option<ConnectionV6> {
         let mut connections = self.connections_v6.write_lock();
         connections.end_instance(key, instance_id)
-    }
-
-    pub fn end_connection_v4(&self, key: Key) -> Option<ConnectionV4> {
-        let mut connections = self.connections_v4.write_lock();
-        connections.end(key)
-    }
-
-    pub fn end_connection_v6(&self, key: Key) -> Option<ConnectionV6> {
-        let mut connections = self.connections_v6.write_lock();
-        connections.end(key)
     }
 
     pub fn end_all_on_endpoint_v4(

@@ -35,6 +35,7 @@ use crate::{
     id_cache::{IdCache, PendingPacket},
     logger,
     packet_util::Redirect,
+    tcp_endpoint_cache::TcpEndpointCache,
     udp_endpoint_cache::UdpEndpointCache,
     udp_flow_cache::{UdpFlowCache, UdpFlowRegistration},
 };
@@ -65,6 +66,9 @@ pub struct Device {
     pub(crate) event_queue: IOQueue<Info>, // Queue for events to user-space
     pub(crate) packet_cache: RwSpinLock<IdCache>, // Cache of pending packets waiting for verdict
     pub(crate) connection_cache: ConnectionCache, // Cache of connections and their verdicts
+    /// Exact TCP connection generations keyed by WFP transport endpoint handle.
+    /// Endpoint closure consumes this identity instead of resolving a reused tuple.
+    pub(crate) tcp_endpoint_cache: RwSpinLock<TcpEndpointCache>,
     /// UDP remote tuples grouped by WFP transport endpoint handle. A UDP socket
     /// receives one endpoint-closure indication regardless of its remote peers.
     pub(crate) udp_endpoint_cache: RwSpinLock<UdpEndpointCache>,
@@ -117,6 +121,7 @@ impl Device {
             event_queue: IOQueue::new(), // Queue for events to user-space
             packet_cache: RwSpinLock::new(IdCache::new()), // Cache of pending packets waiting for verdict
             connection_cache: ConnectionCache::new(),
+            tcp_endpoint_cache: RwSpinLock::new(TcpEndpointCache::new()),
             udp_endpoint_cache: RwSpinLock::new(UdpEndpointCache::new()),
             udp_flow_cache: UdpFlowCache::new(),
             icmp_echo_cache: RwSpinLock::new(IcmpEchoCache::new()),
@@ -478,6 +483,10 @@ impl Device {
                 wdk::dbg!("ClearCache command");
                 self.connection_cache.clear();
                 {
+                    let mut endpoint_cache = self.tcp_endpoint_cache.write_lock();
+                    endpoint_cache.clear();
+                }
+                {
                     let mut endpoint_cache = self.udp_endpoint_cache.write_lock();
                     endpoint_cache.clear();
                 }
@@ -748,6 +757,10 @@ impl Device {
             _ = self.inject_packet(pending.packet, true); // Complete ALE pends and discard all packet clones.
         }
 
+        {
+            let mut endpoint_cache = self.tcp_endpoint_cache.write_lock();
+            endpoint_cache.clear();
+        }
         let mut endpoint_cache = self.udp_endpoint_cache.write_lock();
         endpoint_cache.clear();
     }
