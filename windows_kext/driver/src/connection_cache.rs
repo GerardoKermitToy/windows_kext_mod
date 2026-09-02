@@ -5,7 +5,30 @@ use crate::{
 use alloc::{string::String, vec::Vec};
 
 use smoltcp::wire::{IpAddress, IpProtocol};
+#[cfg(not(test))]
 use wdk::rw_spin_lock::RwSpinLock;
+
+#[cfg(test)]
+struct RwSpinLock<T>(std::sync::RwLock<T>);
+
+#[cfg(test)]
+impl<T> RwSpinLock<T> {
+    fn new(value: T) -> Self {
+        Self(std::sync::RwLock::new(value))
+    }
+
+    fn read_lock(&self) -> std::sync::RwLockReadGuard<'_, T> {
+        self.0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn write_lock(&self) -> std::sync::RwLockWriteGuard<'_, T> {
+        self.0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
 
 /// Connection cache with a lock owning each map it protects.
 ///
@@ -168,6 +191,38 @@ impl ConnectionCache {
             }
         }
         None
+    }
+
+    /// Runs `use_instance` only while the exact cache generation matching a packet
+    /// key is still live.
+    ///
+    /// Unlike the endpoint-oriented method above, this accepts a reverse-redirect
+    /// key. The map's shared guard remains held while `use_instance` publishes both
+    /// the pending packet and its userspace event. A lifecycle end requires the
+    /// exclusive guard, so it cannot emit END between validation and publication.
+    pub fn with_live_connection_instance_matching<T, R>(
+        &self,
+        key: &Key,
+        instance_id: u64,
+        value: T,
+        use_instance: impl FnOnce(u64, T) -> R,
+    ) -> Result<R, T> {
+        if instance_id == 0 {
+            return Err(value);
+        }
+
+        if key.is_ipv6() {
+            let connections = self.connections_v6.read_lock();
+            if connections.has_live_instance_matching(key, instance_id) {
+                return Ok(use_instance(instance_id, value));
+            }
+        } else {
+            let connections = self.connections_v4.read_lock();
+            if connections.has_live_instance_matching(key, instance_id) {
+                return Ok(use_instance(instance_id, value));
+            }
+        }
+        Err(value)
     }
 
     /// Updates attribution on one exact live cache instance.
@@ -392,6 +447,119 @@ impl ConnectionCache {
         }
 
         size
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ConnectionCache;
+    use crate::{
+        connection::{Direction, Verdict, PM_DNS_PORT},
+        connection_map::Key,
+    };
+    use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Address};
+    use std::sync::TryLockError;
+
+    fn key(remote_address: [u8; 4], remote_port: u16) -> Key {
+        Key {
+            protocol: IpProtocol::Tcp,
+            local_address: IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 1)),
+            local_port: 50_000,
+            remote_address: IpAddress::Ipv4(Ipv4Address::from_bytes(&remote_address)),
+            remote_port,
+        }
+    }
+
+    #[test]
+    fn publication_callback_holds_liveness_guard_until_it_returns() {
+        let cache = ConnectionCache::new();
+        let tuple = key([192, 0, 2, 1], 443);
+        let registration = cache
+            .register_connection(&tuple, 100, Direction::Outbound)
+            .expect("connection registration");
+
+        let result = cache.with_live_connection_instance_matching(
+            &tuple,
+            registration.instance_id,
+            41,
+            |_, value| {
+                // A lifecycle end needs this map's exclusive guard. Verify that the
+                // publication callback still owns the shared guard, rather than
+                // merely running after an already-stale liveness check.
+                assert!(matches!(
+                    cache.connections_v4.0.try_write(),
+                    Err(TryLockError::WouldBlock)
+                ));
+                value + 1
+            },
+        );
+        assert_eq!(result, Ok(42));
+
+        assert!(cache
+            .end_connection_instance_v4(tuple, registration.instance_id)
+            .is_some());
+        let mut callback_ran = false;
+        let result = cache.with_live_connection_instance_matching(
+            &tuple,
+            registration.instance_id,
+            42,
+            |_, value| {
+                callback_ran = true;
+                value
+            },
+        );
+
+        assert_eq!(result, Err(42));
+        assert!(!callback_ran);
+    }
+
+    #[test]
+    fn publication_accepts_exact_redirect_generation_only_while_live() {
+        let cache = ConnectionCache::new();
+        let original = key([203, 0, 113, 1], 53);
+        let redirect = key([127, 0, 0, 1], PM_DNS_PORT);
+        let registration = cache
+            .register_connection(&original, 100, Direction::Outbound)
+            .expect("connection registration");
+        assert!(cache
+            .update_connection_instance(
+                original,
+                registration.instance_id,
+                Verdict::RedirectNameServer,
+            )
+            .is_some());
+
+        assert_eq!(
+            cache.with_live_connection_instance_matching(
+                &redirect,
+                registration.instance_id,
+                41,
+                |_, value| value + 1,
+            ),
+            Ok(42)
+        );
+        assert_eq!(
+            cache.with_live_connection_instance_matching(
+                &redirect,
+                registration.instance_id.wrapping_add(1),
+                41,
+                |_, value| value + 1,
+            ),
+            Err(41)
+        );
+
+        assert!(cache
+            .end_connection_instance_v4(original, registration.instance_id)
+            .is_some());
+        assert_eq!(
+            cache.with_live_connection_instance_matching(
+                &redirect,
+                registration.instance_id,
+                41,
+                |_, value| value + 1,
+            ),
+            Err(41)
+        );
     }
 }
 

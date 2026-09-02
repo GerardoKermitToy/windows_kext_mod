@@ -533,20 +533,20 @@ fn ip_packet_layer(
                 }
             };
 
-            let info = {
-                let mut packet_cache = device.packet_cache.write_lock();
-                packet_cache.push(
-                    (key, packet),
-                    connection_instance_id,
-                    process_id,
-                    effective_direction,
-                    false,
-                )
-            };
-
-            // Send to Portmaster
-            if let Some(info) = info {
-                let _ = device.event_queue.push(info);
+            if let Some(pending) = device.publish_pending_packet(
+                (key, packet),
+                connection_instance_id,
+                process_id,
+                effective_direction,
+                false,
+            ) {
+                crate::dbg!(
+                    "discarding packet queued after its connection ended: {}",
+                    key
+                );
+                if let Err(err) = device.inject_packet(pending.packet, true) {
+                    crate::err!("failed to discard stale pending packet: {}", err);
+                }
             }
             data.block_and_absorb();
         }

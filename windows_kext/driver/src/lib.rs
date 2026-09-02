@@ -20,7 +20,6 @@ mod callouts;
 #[cfg(not(test))]
 mod common;
 mod connection;
-#[cfg(not(test))]
 mod connection_cache;
 mod connection_map;
 #[cfg(not(test))]

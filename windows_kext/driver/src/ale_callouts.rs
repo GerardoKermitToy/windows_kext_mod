@@ -427,18 +427,21 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
                 // Connection is already pended. Save packet and wait for verdict.
                 match save_packet(device, &mut data, &ale_data, false) {
                     Ok(packet) => {
-                        let info = {
-                            let mut packet_cache = device.packet_cache.write_lock();
-                            packet_cache.push(
-                                (key, packet),
-                                Some(connection_instance_id),
-                                ale_data.process_id,
-                                ale_data.packet_direction,
-                                true,
-                            )
-                        };
-                        if let Some(info) = info {
-                            let _ = device.event_queue.push(info);
+                        if let Some(pending) = device.publish_pending_packet(
+                            (key, packet),
+                            Some(connection_instance_id),
+                            ale_data.process_id,
+                            ale_data.packet_direction,
+                            true,
+                        ) {
+                            crate::dbg!(
+                                "discarding packet queued after connection instance {} ended: {}",
+                                connection_instance_id,
+                                key
+                            );
+                            if let Err(err) = device.inject_packet(pending.packet, true) {
+                                crate::err!("failed to complete stale ALE operation: {}", err);
+                            }
                         }
                     }
                     Err(err) => {
@@ -560,18 +563,21 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
             key,
             registration.instance_id,
         );
-        let info = {
-            let mut packet_cache = device.packet_cache.write_lock();
-            packet_cache.push(
-                (key, packet),
-                Some(registration.instance_id),
-                ale_data.process_id,
-                ale_data.packet_direction,
-                true,
-            )
-        };
-        if let Some(info) = info {
-            let _ = device.event_queue.push(info);
+        if let Some(pending) = device.publish_pending_packet(
+            (key, packet),
+            Some(registration.instance_id),
+            ale_data.process_id,
+            ale_data.packet_direction,
+            true,
+        ) {
+            crate::dbg!(
+                "discarding packet queued after connection instance {} ended: {}",
+                registration.instance_id,
+                key
+            );
+            if let Err(err) = device.inject_packet(pending.packet, true) {
+                crate::err!("failed to complete stale ALE operation: {}", err);
+            }
         }
 
         // Absorb this indication. A reusable packet clone, when WFP supplied one,

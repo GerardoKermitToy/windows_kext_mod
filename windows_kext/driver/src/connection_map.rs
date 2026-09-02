@@ -222,6 +222,30 @@ impl<T: Connection + Clone> ConnectionMap<T> {
         false
     }
 
+    /// Returns whether one exact live instance matches either its original tuple or
+    /// its current reverse-redirect tuple.
+    ///
+    /// Pending packet publication uses the packet's observed key. A response from a
+    /// local redirect target no longer carries the original remote endpoint, but its
+    /// instance ID still identifies exactly one cached generation. The instance
+    /// check makes the otherwise ambiguous redirect scan safe for this operation.
+    pub fn has_live_instance_matching(&self, key: &Key, instance_id: u64) -> bool {
+        if self.has_live_instance(key, instance_id) {
+            return true;
+        }
+        if instance_id == 0 || !is_redirect_port(key.remote_port) {
+            return false;
+        }
+
+        self.0.get(&key.small()).is_some_and(|connections| {
+            connections.iter().any(|conn| {
+                conn.redirect_equals(key)
+                    && conn.get_instance_id() == instance_id
+                    && !conn.has_ended()
+            })
+        })
+    }
+
     /// Returns the exact live cache instance for mutation.
     ///
     /// Pending verdicts carry the instance that existed when their packet was

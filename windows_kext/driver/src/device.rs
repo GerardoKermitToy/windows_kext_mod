@@ -765,6 +765,74 @@ impl Device {
         endpoint_cache.clear();
     }
 
+    /// Publishes a packet decision request only while its exact connection
+    /// generation remains live.
+    ///
+    /// `with_live_connection_instance_matching` holds the connection-map read guard
+    /// through both pending-cache insertion and event-queue insertion. Every native
+    /// lifecycle end needs the corresponding map write guard, so publication is
+    /// ordered wholly before END or rejected wholly after the connection was ended.
+    /// The rejected packet is returned for fail-closed completion outside all locks.
+    pub(crate) fn publish_pending_packet(
+        &self,
+        value: (Key, Packet),
+        connection_instance_id: Option<u64>,
+        process_id: u64,
+        direction: crate::connection::Direction,
+        ale_layer: bool,
+    ) -> Option<PendingPacket> {
+        let pending = PendingPacket {
+            key: value.0,
+            packet: value.1,
+            connection_instance_id,
+        };
+
+        if let Some(instance_id) = connection_instance_id {
+            let key = pending.key;
+            return self
+                .connection_cache
+                .with_live_connection_instance_matching(
+                    &key,
+                    instance_id,
+                    pending,
+                    |_, pending| {
+                        self.enqueue_pending_packet(
+                            pending,
+                            process_id,
+                            direction,
+                            ale_layer,
+                        );
+                    },
+                )
+                .err();
+        }
+
+        self.enqueue_pending_packet(pending, process_id, direction, ale_layer);
+        None
+    }
+
+    fn enqueue_pending_packet(
+        &self,
+        pending: PendingPacket,
+        process_id: u64,
+        direction: crate::connection::Direction,
+        ale_layer: bool,
+    ) {
+        let info = {
+            let mut packet_cache = self.packet_cache.write_lock();
+            packet_cache.push(
+                (pending.key, pending.packet),
+                pending.connection_instance_id,
+                process_id,
+                direction,
+                ale_layer,
+            )
+        };
+        if let Some(info) = info {
+            let _ = self.event_queue.push(info);
+        }
+    }
+
     /// Cancels queued decisions for connection instances whose native lifetime has
     /// ended. Packet ownership is removed under the cache lock, then every ALE pend
     /// is completed as blocked after the lock has been released.
