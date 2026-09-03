@@ -29,11 +29,14 @@ impl TcpEndpointCache {
 
     /// Associates one exact live connection-cache instance with its WFP endpoint.
     ///
-    /// Reauthorization can repeat the same association. Returns `true` when the
-    /// mapping was inserted or already matched. A different association for an
-    /// already tracked handle is rejected: WFP defines the handle as unique for
-    /// the endpoint lifetime, so replacing it could let an old closure consume a
-    /// newer connection generation.
+    /// Reauthorization can repeat the same association while omitting optional
+    /// parent-endpoint metadata. Returns `true` when the mapping was inserted or
+    /// still identifies the same connection instance. A newly supplied parent is
+    /// retained, but two different concrete parents remain a conflict.
+    ///
+    /// A different connection for an already tracked handle is rejected: WFP
+    /// defines the handle as unique for the endpoint lifetime, so replacing it
+    /// could let an old closure consume a newer connection generation.
     pub fn associate_instance(
         &mut self,
         endpoint_handle: u64,
@@ -45,16 +48,27 @@ impl TcpEndpointCache {
             return false;
         }
 
-        let endpoint = TcpEndpointConnection {
-            key,
-            parent_endpoint_handle,
-            instance_id,
-        };
-        if let Some(existing) = self.endpoints.get(&endpoint_handle) {
-            return *existing == endpoint;
+        if let Some(existing) = self.endpoints.get_mut(&endpoint_handle) {
+            if existing.key != key || existing.instance_id != instance_id {
+                return false;
+            }
+
+            match (existing.parent_endpoint_handle, parent_endpoint_handle) {
+                (Some(existing_parent), Some(parent)) => return existing_parent == parent,
+                (None, Some(parent)) => existing.parent_endpoint_handle = Some(parent),
+                _ => {}
+            }
+            return true;
         }
 
-        self.endpoints.insert(endpoint_handle, endpoint);
+        self.endpoints.insert(
+            endpoint_handle,
+            TcpEndpointConnection {
+                key,
+                parent_endpoint_handle,
+                instance_id,
+            },
+        );
         true
     }
 
@@ -156,6 +170,43 @@ mod tests {
 
         assert!(cache.take(10).is_none());
         assert_eq!(cache.take(30).expect("established endpoint").instance_id, 100);
+    }
+
+    #[test]
+    fn reauthorization_may_omit_parent_endpoint() {
+        let mut cache = TcpEndpointCache::new();
+        let tuple = key();
+
+        assert!(cache.associate_instance(10, tuple, Some(20), 100));
+        assert!(cache.associate_instance(10, tuple, None, 100));
+        assert_eq!(
+            cache
+                .resolve_live_instance(&tuple, Some(20), |_| true)
+                .expect("preserved parent endpoint")
+                .instance_id,
+            100
+        );
+    }
+
+    #[test]
+    fn repeated_association_fills_but_does_not_replace_parent() {
+        let mut cache = TcpEndpointCache::new();
+        let tuple = key();
+
+        assert!(cache.associate_instance(10, tuple, None, 100));
+        assert!(cache.associate_instance(10, tuple, Some(20), 100));
+        assert!(!cache.associate_instance(10, tuple, Some(21), 100));
+        assert!(!cache.associate_instance(10, tuple, None, 101));
+        let mut other_tuple = tuple;
+        other_tuple.remote_port = 8443;
+        assert!(!cache.associate_instance(10, other_tuple, None, 100));
+        assert_eq!(
+            cache
+                .resolve_live_instance(&tuple, Some(20), |_| true)
+                .expect("filled parent endpoint")
+                .instance_id,
+            100
+        );
     }
 
     #[test]
