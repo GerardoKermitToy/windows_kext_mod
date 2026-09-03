@@ -80,7 +80,9 @@ pub struct Device {
     pub(crate) icmp_echo_cache: RwSpinLock<IcmpEchoCache>,
     pub(crate) injector: Injector,
     pub(crate) network_allocator: NetworkAllocator,
-    pub(crate) bandwidth_stats: RwSpinLock<Bandwidth>,
+    /// Each protocol/address-family map owns its own spin lock, so unrelated
+    /// packet callbacks do not serialize on one global bandwidth lock.
+    pub(crate) bandwidth_stats: Bandwidth,
     /// File object for the one accepted user-mode device open. The pointer is an
     /// opaque identity token; it is never dereferenced. A rejected CREATE gets a
     /// different file object, so its CLEANUP cannot release the active owner.
@@ -127,7 +129,7 @@ impl Device {
             icmp_echo_cache: RwSpinLock::new(IcmpEchoCache::new()),
             injector,
             network_allocator,
-            bandwidth_stats: RwSpinLock::new(Bandwidth::new()),
+            bandwidth_stats: Bandwidth::new(),
             owner_file_object: AtomicPtr::new(core::ptr::null_mut()),
             owner_pid: AtomicU32::new(0),
         })
@@ -504,34 +506,22 @@ impl Device {
             }
             CommandType::GetBandwidthStats => {
                 wdk::dbg!("GetBandwidthStats command");
-                let stats = {
-                    let mut bandwidth_stats = self.bandwidth_stats.write_lock();
-                    bandwidth_stats.get_all_updates_tcp_v4()
-                };
+                let stats = self.bandwidth_stats.get_all_updates_tcp_v4();
                 if let Some(stats) = stats {
                     _ = self.event_queue.push(stats);
                 }
 
-                let stats = {
-                    let mut bandwidth_stats = self.bandwidth_stats.write_lock();
-                    bandwidth_stats.get_all_updates_tcp_v6()
-                };
+                let stats = self.bandwidth_stats.get_all_updates_tcp_v6();
                 if let Some(stats) = stats {
                     _ = self.event_queue.push(stats);
                 }
 
-                let stats = {
-                    let mut bandwidth_stats = self.bandwidth_stats.write_lock();
-                    bandwidth_stats.get_all_updates_udp_v4()
-                };
+                let stats = self.bandwidth_stats.get_all_updates_udp_v4();
                 if let Some(stats) = stats {
                     _ = self.event_queue.push(stats);
                 }
 
-                let stats = {
-                    let mut bandwidth_stats = self.bandwidth_stats.write_lock();
-                    bandwidth_stats.get_all_updates_udp_v6()
-                };
+                let stats = self.bandwidth_stats.get_all_updates_udp_v6();
                 if let Some(stats) = stats {
                     _ = self.event_queue.push(stats);
                 }
@@ -545,10 +535,8 @@ impl Device {
                 };
                 let (connection_v4_entries, connection_v6_entries) =
                     self.connection_cache.get_entries_counts();
-                let (bandwidth_tcp_v4, bandwidth_tcp_v6, bandwidth_udp_v4, bandwidth_udp_v6) = {
-                    let bandwidth_stats = self.bandwidth_stats.write_lock();
-                    bandwidth_stats.get_entries_counts()
-                };
+                let (bandwidth_tcp_v4, bandwidth_tcp_v6, bandwidth_udp_v4, bandwidth_udp_v6) =
+                    self.bandwidth_stats.get_entries_counts();
                 let tcp_endpoint_entries = {
                     let endpoint_cache = self.tcp_endpoint_cache.read_lock();
                     endpoint_cache.get_entries_count()
