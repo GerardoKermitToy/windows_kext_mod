@@ -7,6 +7,7 @@ use wdk::filter_engine::net_buffer::NetBufferList;
 
 use crate::connection_map::Key;
 use crate::device::Packet;
+use crate::icmp_packet::is_icmp_port_unreachable;
 use crate::ipv6_packet::{
     recalculate_ipv6_transport_checksum, rewrite_ipv6_tcp_udp, walk_ipv6_headers, PortRewrite,
 };
@@ -605,6 +606,25 @@ pub fn get_icmp_echo_from_nbl(nbl: &NetBufferList, is_ipv6: bool) -> Option<Icmp
 
         get_icmp_echo(packet.get(transport_offset..)?, false)
     }
+}
+
+/// Returns true when an NBL contains an ICMP Destination Unreachable / Port
+/// Unreachable packet. The NBL must be positioned at the IP header.
+pub fn is_icmp_port_unreachable_from_nbl(nbl: &NetBufferList, ipv6: bool) -> bool {
+    if ipv6 {
+        let mut packet = [0u8; IPV6_INSPECT_LEN];
+        let Some(len) = read_leading_bytes(nbl, &mut packet, IPV6_HEADER_LEN + 8) else {
+            return false;
+        };
+        return is_icmp_port_unreachable(&packet[..len], true);
+    }
+
+    let mut packet = [0u8; IPV4_MAX_HEADER_LEN + 8];
+    let Some(len) = read_leading_bytes(nbl, &mut packet, IPV4_HEADER_LEN + 8) else {
+        return false;
+    };
+
+    is_icmp_port_unreachable(&packet[..len], false)
 }
 
 pub fn get_key_from_nbl_v6(nbl: &NetBufferList, direction: Direction) -> Result<Key, String> {

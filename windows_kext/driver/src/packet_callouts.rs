@@ -14,7 +14,8 @@ use crate::connection_map::Key;
 use crate::device::{Device, Packet};
 use crate::packet_util::{
     get_icmp_echo_from_nbl, get_key_from_nbl_v4, get_key_from_nbl_v6, is_fragment_v4,
-    is_fragment_v6, is_tcp_reset_from_nbl, recalc_header_checksums, Redirect,
+    is_fragment_v6, is_icmp_port_unreachable_from_nbl, is_tcp_reset_from_nbl,
+    recalc_header_checksums, Redirect,
 };
 
 // IP packet layers
@@ -272,6 +273,22 @@ fn ip_packet_layer(
         };
 
         if fast_track_pm_packets(&key, direction) {
+            data.action_permit();
+            return;
+        }
+
+        // The local IP stack emits this response when a UDP datagram reaches a
+        // port with no listener. It has no user-space owner or meaningful verdict
+        // target, so permit it without publishing a PID-0 request to Portmaster.
+        // Match the semantic equivalent in both families: ICMPv4 type 3/code 3
+        // and ICMPv6 type 1/code 4.
+        if matches!(direction, Direction::Outbound)
+            && matches!(
+                key.protocol,
+                smoltcp::wire::IpProtocol::Icmp | smoltcp::wire::IpProtocol::Icmpv6
+            )
+            && is_icmp_port_unreachable_from_nbl(&nbl, ipv6)
+        {
             data.action_permit();
             return;
         }

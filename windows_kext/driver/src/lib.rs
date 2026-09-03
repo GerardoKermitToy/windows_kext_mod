@@ -17,7 +17,6 @@ mod bandwidth;
 mod bugcheck;
 #[cfg(not(test))]
 mod callouts;
-#[cfg(not(test))]
 mod common;
 mod connection;
 mod connection_cache;
@@ -28,6 +27,7 @@ mod device;
 mod entry;
 #[cfg(not(test))]
 mod icmp_echo_cache;
+mod icmp_packet;
 #[cfg(not(test))]
 mod id_cache;
 mod ipv6_packet;
