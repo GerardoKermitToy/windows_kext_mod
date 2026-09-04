@@ -237,14 +237,29 @@ fn ip_packet_layer(
     // SAFETY: `ip_packet_layer` is called only by IP-packet classify handlers.
     // Their layer data is a WFP-owned NBL chain that stays live throughout this
     // callback, and the injection-state query is synchronous.
-    if unsafe {
+    let injection_origin = unsafe {
         device
             .injector
-            .was_network_packet_injected_by_self(data.get_layer_data() as _, ipv6)
-    } {
+            .network_packet_injection_origin(data.get_layer_data() as _, ipv6)
+    };
+    if injection_origin.is_self_injected() {
         data.action_permit();
         return;
     }
+
+    // WinDivert-style tools submit outbound packets synchronously from their
+    // user-space service. WFP identifies the NBL as injected by another handle,
+    // while the current process identifies the service that initiated that send.
+    // Read it only on the outbound path; inbound processing can run in an
+    // unrelated thread context.
+    let injected_by_other = injection_origin.is_injected_by_other();
+    let other_injector_process_id = if injected_by_other
+        && matches!(direction, Direction::Outbound)
+    {
+        wdk::utils::current_process_id()
+    } else {
+        0
+    };
 
     // SAFETY: The same WFP callback contract keeps the complete NBL chain stable;
     // all yielded wrappers are consumed by this loop before the callback returns.
@@ -302,7 +317,14 @@ fn ip_packet_layer(
         if matches!(direction, Direction::Outbound)
             && key.protocol == smoltcp::wire::IpProtocol::Tcp
             && is_tcp_reset_from_nbl(&nbl, ipv6)
-            && get_connection_info(&device.connection_cache, &key, ipv6, direction).is_none()
+            && get_connection_info(
+                &device.connection_cache,
+                &key,
+                ipv6,
+                direction,
+                !injected_by_other,
+            )
+            .is_none()
         {
             data.action_permit();
             return;
@@ -421,9 +443,13 @@ fn ip_packet_layer(
             key.protocol,
             smoltcp::wire::IpProtocol::Tcp | smoltcp::wire::IpProtocol::Udp
         ) {
-            if let Some(mut conn_info) =
-                get_connection_info(&device.connection_cache, &key, ipv6, direction)
-            {
+            if let Some(mut conn_info) = get_connection_info(
+                &device.connection_cache,
+                &key,
+                ipv6,
+                direction,
+                !injected_by_other,
+            ) {
                 // A new inbound connection must reach ALE_AUTH_RECV_ACCEPT so it
                 // can be attributed and authorized there. Keep permitting it while
                 // that authorization is still pending and the owning process is
@@ -500,6 +526,24 @@ fn ip_packet_layer(
                 // TCP/UDP connection will be pended and sent to Portmaster.
                 data.action_permit();
                 return;
+            } else if injected_by_other {
+                // A foreign network injector can emit a packet after the native
+                // application endpoint has already closed. It has no trustworthy
+                // socket endpoint that this driver can use for connection lifetime
+                // tracking: WinDivert, for example, shares one raw endpoint across
+                // many unrelated tuples.
+                //
+                // Treat this as a stateless packet decision. The pending record has
+                // no connection instance, so a permanent verdict cannot pollute a
+                // later application connection that reuses the tuple. The current
+                // process is the user-space injector that synchronously submitted
+                // this outbound packet.
+                process_id = other_injector_process_id;
+                crate::dbg!(
+                    "packet layer handling externally injected packet: {} PID: {}",
+                    key,
+                    process_id
+                );
             } else {
                 // An outbound TCP/UDP packet should normally have been registered at
                 // ALE_AUTH_CONNECT. Preserve the defensive fallback for packets that
@@ -619,32 +663,34 @@ fn get_connection_info(
     key: &Key,
     ipv6: bool,
     packet_direction: Direction,
+    use_ended_fallback: bool,
 ) -> Option<ConnectionInfo> {
     // A packet already in flight can arrive after endpoint closure. Preserve the
-    // ended-entry fallback only on the outbound packet path, which TCP/UDP reaches
-    // after ALE has registered any newly reused tuple. On the inbound path an
-    // ended entry is indistinguishable from the first packet of a new inbound flow;
-    // treating it as a miss lets that flow reach ALE_AUTH_RECV_ACCEPT for fresh
-    // attribution and authorization.
+    // ended-entry fallback only on the ordinary outbound packet path, which
+    // TCP/UDP reaches after ALE has registered any newly reused tuple. A packet
+    // injected by another driver has its own user-space originator and must not be
+    // mistaken for retained history belonging to the application whose tuple it
+    // copied. Inbound lookups likewise use live state only because the tuple can
+    // identify a new flow awaiting ALE authorization.
     if ipv6 {
-        let conn_info = connection_cache.read_connection_v6_for_packet(
-            key,
-            packet_direction,
-            |conn: &ConnectionV6| -> Option<ConnectionInfo> {
-                // Function is is behind spin lock. Just copy and return.
-                Some(ConnectionInfo::from_connection(conn))
-            },
-        );
-        return conn_info;
+        let process = |conn: &ConnectionV6| -> Option<ConnectionInfo> {
+            // The callback runs behind the cache's spin lock. Just copy and return.
+            Some(ConnectionInfo::from_connection(conn))
+        };
+        if use_ended_fallback {
+            connection_cache.read_connection_v6_for_packet(key, packet_direction, process)
+        } else {
+            connection_cache.read_connection_v6(key, process)
+        }
     } else {
-        let conn_info = connection_cache.read_connection_v4_for_packet(
-            key,
-            packet_direction,
-            |conn: &ConnectionV4| -> Option<ConnectionInfo> {
-                // Function is is behind spin lock. Just copy and return.
-                Some(ConnectionInfo::from_connection(conn))
-            },
-        );
-        return conn_info;
+        let process = |conn: &ConnectionV4| -> Option<ConnectionInfo> {
+            // The callback runs behind the cache's spin lock. Just copy and return.
+            Some(ConnectionInfo::from_connection(conn))
+        };
+        if use_ended_fallback {
+            connection_cache.read_connection_v4_for_packet(key, packet_direction, process)
+        } else {
+            connection_cache.read_connection_v4(key, process)
+        }
     }
 }

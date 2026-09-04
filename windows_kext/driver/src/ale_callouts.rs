@@ -12,7 +12,9 @@ use wdk::filter_engine::layer::{
     FieldsAleAuthRecvAcceptV6, ValueType,
 };
 use wdk::filter_engine::net_buffer::NetBufferList;
-use wdk::filter_engine::packet::{Injector, TransportPacketList, TransportProtocol};
+use wdk::filter_engine::packet::{
+    Injector, PacketInjectionOrigin, TransportPacketList, TransportProtocol,
+};
 use wdk::filter_engine::{callout_data::CalloutData, PacketDirection as WfpPacketDirection};
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_DIRECTION_OUTBOUND;
 
@@ -296,23 +298,34 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
     // Network-layer reinjection is used by the packet path, while packets held at
     // ALE receive/accept are returned with the transport injector. Either kind can
     // be indicated here again and must be permitted without creating another pend.
+    // Keep foreign injection distinct: it is handled below at the packet layer
+    // without binding the injector's shared raw endpoint to an application flow.
     let layer_data = data.get_layer_data();
     // SAFETY: A non-null ALE layer-data value is a WFP-owned NBL that remains
     // live for this classify callback. Both injection-state queries are
     // synchronous and do not retain it.
-    let injected_by_self = !layer_data.is_null()
-        && unsafe {
-            device
-                .injector
-                .was_network_packet_injected_by_self(layer_data as _, ale_data.is_ipv6)
-                || device
+    let (network_injection_origin, transport_injection_origin) = if layer_data.is_null() {
+        (PacketInjectionOrigin::Unknown, PacketInjectionOrigin::Unknown)
+    } else {
+        unsafe {
+            (
+                device
                     .injector
-                    .was_transport_packet_injected_by_self(layer_data as _)
-        };
-    if injected_by_self {
+                    .network_packet_injection_origin(layer_data as _, ale_data.is_ipv6),
+                device
+                    .injector
+                    .transport_packet_injection_origin(layer_data as _),
+            )
+        }
+    };
+    if network_injection_origin.is_self_injected()
+        || transport_injection_origin.is_self_injected()
+    {
         data.action_permit();
         return;
     }
+    let injected_by_other = network_injection_origin.is_injected_by_other()
+        || transport_injection_origin.is_injected_by_other();
 
     match ale_data.protocol {
         IpProtocol::Tcp | IpProtocol::Udp => {
@@ -325,6 +338,17 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
             data.action_permit();
             return;
         }
+    }
+
+    // A foreign network injector can create a synthetic System-owned ALE flow and
+    // expose one shared raw endpoint handle for many unrelated TCP/UDP tuples. It
+    // is not a socket connection that can be correlated through our endpoint
+    // caches. Let the outbound IP-packet callout apply policy instead; there it can
+    // retain a live application's connection or, once that endpoint has closed,
+    // report a stateless packet with the user-space injector's current PID.
+    if injected_by_other && matches!(ale_data.packet_direction, Direction::Outbound) {
+        data.action_permit();
+        return;
     }
 
     let key = ale_data.as_key();
@@ -1190,7 +1214,7 @@ fn outbound_transport_flow_ip_version(data: &CalloutData) -> Option<bool> {
     Some(is_ipv6)
 }
 
-fn is_self_injected_outbound_transport_flow(device: &Device, data: &CalloutData) -> bool {
+fn is_injected_outbound_transport_flow(device: &Device, data: &CalloutData) -> bool {
     let Some(is_ipv6) = outbound_transport_flow_ip_version(data) else {
         return false;
     };
@@ -1200,12 +1224,18 @@ fn is_self_injected_outbound_transport_flow(device: &Device, data: &CalloutData)
     }
 
     // SAFETY: FLOW_ESTABLISHED supplies this NBL for the duration of the classify
-    // callback. The synchronous injection-state query does not retain it.
-    unsafe {
-        device
-            .injector
-            .was_network_packet_injected_by_self(layer_data as _, is_ipv6)
-    }
+    // callback. The synchronous injection-state queries do not retain it.
+    let (network_origin, transport_origin) = unsafe {
+        (
+            device
+                .injector
+                .network_packet_injection_origin(layer_data as _, is_ipv6),
+            device
+                .injector
+                .transport_packet_injection_origin(layer_data as _),
+        )
+    };
+    network_origin.is_injected() || transport_origin.is_injected()
 }
 
 /// Refreshes the owning process when a TCP or UDP ALE flow becomes active.
@@ -1288,14 +1318,14 @@ pub fn ale_flow_established_monitor(data: CalloutData) {
         _ => return,
     };
 
-    // Network-layer reinjection can create an additional short-lived,
-    // System-owned raw TCP or UDP flow with the application's tuple but a
-    // different endpoint. It is not the application connection authorized above.
-    // Skip it before endpoint or tuple resolution so it cannot produce a false
-    // correlation error, overwrite attribution, or own lifecycle state. Injection
-    // state proves ownership; a raw-socket flag alone would also match legitimate
-    // application traffic.
-    if is_self_injected_outbound_transport_flow(device, &data) {
+    // Network- or transport-layer injection can create an additional raw TCP or
+    // UDP flow with the copied application tuple and a different, sometimes shared,
+    // endpoint. It is not the application's native connection. Skip both our own
+    // reinjection and another driver's synthetic flow before endpoint or tuple
+    // resolution so neither can produce false correlation errors, overwrite
+    // attribution, or own application lifecycle state. Injection state is the
+    // discriminator; a raw-socket flag alone would also match legitimate traffic.
+    if is_injected_outbound_transport_flow(device, &data) {
         return;
     }
 

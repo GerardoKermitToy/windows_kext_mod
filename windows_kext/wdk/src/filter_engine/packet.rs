@@ -69,6 +69,54 @@ const _: () = {
     assert!(core::mem::align_of::<KDPC>() == 8);
 };
 
+/// Origin reported by WFP for a packet queried with one of this driver's
+/// injection handles.
+///
+/// `InjectedBySelf` also covers packets previously injected by the same handle:
+/// both must bypass the owning callout to prevent a reinjection loop. `Unknown`
+/// keeps future native enum values distinct from packets that WFP explicitly says
+/// were not injected.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PacketInjectionOrigin {
+    NotInjected,
+    InjectedBySelf,
+    InjectedByOther,
+    Unknown,
+}
+
+impl PacketInjectionOrigin {
+    pub fn is_self_injected(self) -> bool {
+        matches!(self, Self::InjectedBySelf)
+    }
+
+    pub fn is_injected_by_other(self) -> bool {
+        matches!(self, Self::InjectedByOther)
+    }
+
+    pub fn is_injected(self) -> bool {
+        matches!(self, Self::InjectedBySelf | Self::InjectedByOther)
+    }
+}
+
+fn packet_injection_origin(state: FWPS_PACKET_INJECTION_STATE) -> PacketInjectionOrigin {
+    match state {
+        FWPS_PACKET_INJECTION_STATE::FWPS_PACKET_NOT_INJECTED => {
+            PacketInjectionOrigin::NotInjected
+        }
+        FWPS_PACKET_INJECTION_STATE::FWPS_PACKET_INJECTED_BY_SELF
+        | FWPS_PACKET_INJECTION_STATE::FWPS_PACKET_PREVIOUSLY_INJECTED_BY_SELF => {
+            PacketInjectionOrigin::InjectedBySelf
+        }
+        FWPS_PACKET_INJECTION_STATE::FWPS_PACKET_INJECTED_BY_OTHER => {
+            PacketInjectionOrigin::InjectedByOther
+        }
+        FWPS_PACKET_INJECTION_STATE::FWPS_PACKET_INJECTION_STATE_MAX => {
+            PacketInjectionOrigin::Unknown
+        }
+        _ => PacketInjectionOrigin::Unknown,
+    }
+}
+
 /// Upper-layer protocol carried by an ALE transport packet clone.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransportProtocol {
@@ -639,7 +687,7 @@ impl Injector {
         return Ok(());
     }
 
-    /// Returns whether WFP identifies this network-layer NBL as self-injected.
+    /// Returns the origin WFP reports for a network-layer NBL.
     ///
     /// # Safety
     ///
@@ -647,35 +695,41 @@ impl Injector {
     /// supplied by WFP and remain valid and readable for the duration of the
     /// synchronous query. The caller must obey WFP's IRQL and synchronization
     /// requirements for `FwpsQueryPacketInjectionState0`.
-    pub unsafe fn was_network_packet_injected_by_self(
+    pub unsafe fn network_packet_injection_origin(
         &self,
         nbl: *const NET_BUFFER_LIST,
         ipv6: bool,
-    ) -> bool {
+    ) -> PacketInjectionOrigin {
         let inject_handle = if ipv6 {
             self.packet_inject_handle_v6.load(Ordering::Acquire)
         } else {
             self.packet_inject_handle_v4.load(Ordering::Acquire)
         };
         if inject_handle == INVALID_HANDLE_VALUE || inject_handle.is_null() || nbl.is_null() {
-            return false;
+            return PacketInjectionOrigin::Unknown;
         }
 
-        unsafe {
-            let state = FwpsQueryPacketInjectionState0(inject_handle, nbl, core::ptr::null_mut());
-
-            match state {
-                FWPS_PACKET_INJECTION_STATE::FWPS_PACKET_NOT_INJECTED => false,
-                FWPS_PACKET_INJECTION_STATE::FWPS_PACKET_INJECTED_BY_SELF => true,
-                FWPS_PACKET_INJECTION_STATE::FWPS_PACKET_INJECTED_BY_OTHER => false,
-                FWPS_PACKET_INJECTION_STATE::FWPS_PACKET_PREVIOUSLY_INJECTED_BY_SELF => true,
-                FWPS_PACKET_INJECTION_STATE::FWPS_PACKET_INJECTION_STATE_MAX => false,
-                _ => false,
-            }
-        }
+        let state = unsafe {
+            FwpsQueryPacketInjectionState0(inject_handle, nbl, core::ptr::null_mut())
+        };
+        packet_injection_origin(state)
     }
 
-    /// Returns whether WFP identifies this transport-layer NBL as self-injected.
+    /// Returns whether WFP identifies this network-layer NBL as self-injected.
+    ///
+    /// # Safety
+    ///
+    /// The safety requirements are the same as for
+    /// [`Self::network_packet_injection_origin`].
+    pub unsafe fn was_network_packet_injected_by_self(
+        &self,
+        nbl: *const NET_BUFFER_LIST,
+        ipv6: bool,
+    ) -> bool {
+        unsafe { self.network_packet_injection_origin(nbl, ipv6) }.is_self_injected()
+    }
+
+    /// Returns the origin WFP reports for a transport-layer NBL.
     ///
     /// # Safety
     ///
@@ -683,31 +737,39 @@ impl Injector {
     /// supplied by WFP and remain valid and readable for the duration of the
     /// synchronous query. The caller must obey WFP's IRQL and synchronization
     /// requirements for `FwpsQueryPacketInjectionState0`.
-    pub unsafe fn was_transport_packet_injected_by_self(
+    pub unsafe fn transport_packet_injection_origin(
         &self,
         nbl: *const NET_BUFFER_LIST,
-    ) -> bool {
+    ) -> PacketInjectionOrigin {
         let transport_inject_handle = self.transport_injection.handle.load(Ordering::Acquire);
         if transport_inject_handle == INVALID_HANDLE_VALUE
             || transport_inject_handle.is_null()
             || nbl.is_null()
         {
-            return false;
+            return PacketInjectionOrigin::Unknown;
         }
 
-        unsafe {
-            let state =
-                FwpsQueryPacketInjectionState0(transport_inject_handle, nbl, core::ptr::null_mut());
+        let state = unsafe {
+            FwpsQueryPacketInjectionState0(
+                transport_inject_handle,
+                nbl,
+                core::ptr::null_mut(),
+            )
+        };
+        packet_injection_origin(state)
+    }
 
-            match state {
-                FWPS_PACKET_INJECTION_STATE::FWPS_PACKET_NOT_INJECTED => false,
-                FWPS_PACKET_INJECTION_STATE::FWPS_PACKET_INJECTED_BY_SELF => true,
-                FWPS_PACKET_INJECTION_STATE::FWPS_PACKET_INJECTED_BY_OTHER => false,
-                FWPS_PACKET_INJECTION_STATE::FWPS_PACKET_PREVIOUSLY_INJECTED_BY_SELF => true,
-                FWPS_PACKET_INJECTION_STATE::FWPS_PACKET_INJECTION_STATE_MAX => false,
-                _ => false,
-            }
-        }
+    /// Returns whether WFP identifies this transport-layer NBL as self-injected.
+    ///
+    /// # Safety
+    ///
+    /// The safety requirements are the same as for
+    /// [`Self::transport_packet_injection_origin`].
+    pub unsafe fn was_transport_packet_injected_by_self(
+        &self,
+        nbl: *const NET_BUFFER_LIST,
+    ) -> bool {
+        unsafe { self.transport_packet_injection_origin(nbl) }.is_self_injected()
     }
 }
 
@@ -846,9 +908,10 @@ unsafe extern "system" fn free_transport_packet(
 #[cfg(test)]
 mod tests {
     use super::{
-        reclaim_immediate_injection_failure, resolve_compartment_id, TransportProtocol,
-        UNSPECIFIED_COMPARTMENT_ID,
+        packet_injection_origin, reclaim_immediate_injection_failure, resolve_compartment_id,
+        PacketInjectionOrigin, TransportProtocol, UNSPECIFIED_COMPARTMENT_ID,
     };
+    use crate::ffi::FWPS_PACKET_INJECTION_STATE;
     use alloc::{boxed::Box, sync::Arc};
     use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -858,6 +921,40 @@ mod tests {
         fn drop(&mut self) {
             self.0.store(true, Ordering::Release);
         }
+    }
+
+    #[test]
+    fn native_injection_states_preserve_packet_origin() {
+        assert_eq!(
+            packet_injection_origin(
+                FWPS_PACKET_INJECTION_STATE::FWPS_PACKET_NOT_INJECTED
+            ),
+            PacketInjectionOrigin::NotInjected
+        );
+        assert_eq!(
+            packet_injection_origin(
+                FWPS_PACKET_INJECTION_STATE::FWPS_PACKET_INJECTED_BY_SELF
+            ),
+            PacketInjectionOrigin::InjectedBySelf
+        );
+        assert_eq!(
+            packet_injection_origin(
+                FWPS_PACKET_INJECTION_STATE::FWPS_PACKET_PREVIOUSLY_INJECTED_BY_SELF
+            ),
+            PacketInjectionOrigin::InjectedBySelf
+        );
+        assert_eq!(
+            packet_injection_origin(
+                FWPS_PACKET_INJECTION_STATE::FWPS_PACKET_INJECTED_BY_OTHER
+            ),
+            PacketInjectionOrigin::InjectedByOther
+        );
+        assert_eq!(
+            packet_injection_origin(
+                FWPS_PACKET_INJECTION_STATE::FWPS_PACKET_INJECTION_STATE_MAX
+            ),
+            PacketInjectionOrigin::Unknown
+        );
     }
 
     #[test]

@@ -54,9 +54,10 @@ pub fn sleep_ms(milliseconds: u64) {
 /// This is the *current thread's* process, not a property of any packet or
 /// connection, so it only identifies an originator where the caller knows the
 /// work is being done synchronously on the originating thread. Sending from an
-/// application is such a path; receiving is not - inbound processing runs in an
-/// arbitrary or DPC context, where the answer is whichever thread happened to be
-/// interrupted.
+/// application is such a path. The same is true when a user-space packet tool
+/// synchronously asks its driver to inject an outbound packet. Receiving is not -
+/// inbound processing runs in an arbitrary or DPC context, where the answer is
+/// whichever thread happened to be interrupted.
 ///
 /// Safe at IRQL <= DISPATCH_LEVEL.
 pub fn current_process_id() -> u64 {

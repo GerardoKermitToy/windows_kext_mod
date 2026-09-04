@@ -8,6 +8,7 @@ The first callout depends on packet direction and protocol:
 
 - Outbound TCP enters `ALE_AUTH_CONNECT` before it reaches the outbound IP packet layer.
 - Outbound UDP is registered at `ALE_AUTH_CONNECT` to capture its PID, but is authorized at the outbound IP packet layer so an ALE pend cannot corrupt the application's send result.
+- An outbound TCP or UDP NBL injected by another WFP driver is also authorized at the IP packet layer. Its synthetic ALE flow can expose a System PID and one raw endpoint shared by many tuples, neither of which is valid application identity.
 - Inbound traffic first reaches the inbound IP packet layer.
   - A new TCP or UDP tuple is permitted upward to `ALE_AUTH_RECV_ACCEPT`.
   - A cached live inbound tuple is also permitted while its verdict is still `Undecided` and its PID is unknown (`0`) or System (`4`).
@@ -53,7 +54,7 @@ The inspection callouts at `ALE_FLOW_ESTABLISHED_V4/V6` refresh the process ID o
 
 For TCP, authorization records each new cache generation with the transport and parent endpoint handles supplied by WFP. For an accepted inbound connection, `ALE_AUTH_RECV_ACCEPT` can expose a provisional transport endpoint while `ALE_FLOW_ESTABLISHED` exposes the child endpoint later used by `ALE_ENDPOINT_CLOSURE`; the driver resolves that transition through `(tuple, parent endpoint, live instance_id)` and replaces the provisional handle. Endpoint closure therefore consumes the established handle and calls only the exact-instance end operation, so a delayed closure cannot end a replacement connection that reused the tuple. An authorization cannot create a new TCP cache generation without an endpoint handle because its later lifetime could not be correlated safely. Reauthorization of an already cached connection may omit endpoint metadata and reuses the saved identity.
 
-For both TCP and UDP, outbound network reinjection can produce an additional System-owned raw flow with the application's tuple and a different endpoint. The driver verifies the NBL's network-injection state and skips that flow's `ALE_FLOW_ESTABLISHED` indication before endpoint or tuple resolution, so it cannot interfere with attribution or lifecycle tracking. For UDP, the driver associates a context containing the remote tuple with the real WFP flow via `FwpsFlowAssociateContext`. WFP invokes `flowDeleteFn` when that peer flow is actually reclaimed, and the callback emits the connection-end event. Windows documents a 60-second default idle lifetime, but current Windows versions can defer idle reclamation substantially; the driver waits for the native lifecycle signal instead of treating observed inactivity as an ended connection. When WFP supplies a transport endpoint handle at authorization, the driver associates the exact cache instance with that handle. Flow establishment reuses and validates this identity instead of resolving the five-tuple a second time. Windows emits `ALE_ENDPOINT_CLOSURE` once for the UDP socket, not once per remote peer, so socket closure ends any associated tuples that still have a live cache entry.
+For both TCP and UDP, outbound packet reinjection can produce an additional raw flow with the application's tuple and a different endpoint. The driver checks the NBL's injection state and skips any such `ALE_FLOW_ESTABLISHED` indication before endpoint or tuple resolution. Its own reinjection is a loop-prevention case; another driver's synthetic flow is skipped because a WinDivert-style injector can expose one raw endpoint for many unrelated tuples. Neither flow can therefore interfere with application attribution or lifecycle tracking. For UDP, the driver associates a context containing the remote tuple with the real WFP flow via `FwpsFlowAssociateContext`. WFP invokes `flowDeleteFn` when that peer flow is actually reclaimed, and the callback emits the connection-end event. Windows documents a 60-second default idle lifetime, but current Windows versions can defer idle reclamation substantially; the driver waits for the native lifecycle signal instead of treating observed inactivity as an ended connection. When WFP supplies a transport endpoint handle at authorization, the driver associates the exact cache instance with that handle. Flow establishment reuses and validates this identity instead of resolving the five-tuple a second time. Windows emits `ALE_ENDPOINT_CLOSURE` once for the UDP socket, not once per remote peer, so socket closure ends any associated tuples that still have a live cache entry.
 
 The cache's PID precedence rules ignore PID 0, prevent System (PID 4) from replacing a concrete application, and allow a concrete application PID to replace less reliable attribution. This repairs packet-layer fallback entries and refreshes the UDP owner without changing the cached verdict.
 
@@ -73,6 +74,7 @@ The packet callouts still see every network-layer indication. They defer missing
   - permanent accept/block/drop is applied immediately;
   - temporary verdicts create a Portmaster request;
   - redirect verdicts clone, rewrite, recalculate checksums, inject the replacement, and absorb the original.
+- An outbound NBL injected by another driver uses only live cache state. While the application connection exists, its PID and verdict remain authoritative. After that endpoint closes, retained history is deliberately ignored and the packet is sent as a stateless request attributed to the user-space injector through `PsGetCurrentProcessId`; no permanent verdict or endpoint identity is cached for a later tuple reuse.
 - An outbound tuple unexpectedly missing from the cache uses the defensive packet-level fallback.
 
 ### Other protocols
@@ -81,7 +83,7 @@ ICMP, IGMP, and protocols without TCP/UDP connection state are normally treated 
 
 ### Fragments and injected packets
 
-Individual IP fragments are permitted until WFP presents the reassembled datagram, which has a complete transport header and can be keyed safely. Network- and transport-injected packets are detected with the corresponding injection handle and permitted to prevent reinjection loops.
+Individual IP fragments are permitted until WFP presents the reassembled datagram, which has a complete transport header and can be keyed safely. Packets injected with this driver's own network or transport handle are detected and permitted to prevent reinjection loops; packets injected by another driver remain subject to policy as described above.
 
 ## Connection cache
 
