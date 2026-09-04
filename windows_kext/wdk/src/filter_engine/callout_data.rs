@@ -1,5 +1,9 @@
 use crate::{
-    ffi::{FwpsCompleteOperation0, FwpsFlowAssociateContext0, FwpsPendOperation0},
+    ffi::{
+        FwpsAcquireClassifyHandle0, FwpsCompleteClassify0, FwpsCompleteOperation0,
+        FwpsFlowAssociateContext0, FwpsPendClassify0, FwpsPendOperation0,
+        FwpsReleaseClassifyHandle0,
+    },
     utils::check_ntstatus,
 };
 
@@ -33,6 +37,46 @@ enum ClassifyDeferKind {
 pub struct ClassifyDefer {
     kind: ClassifyDeferKind,
     packet_list: Option<TransportPacketList>,
+}
+
+/// An asynchronous WFP classification whose native handle and output copy are
+/// owned until completion.
+///
+/// Endpoint-closure callouts use this form rather than `FwpsPendOperation0` so
+/// queued packet processing can finish before WFP shuts the endpoint down.
+#[must_use = "dropping this value completes the pended classification"]
+pub struct ClassifyPend {
+    handle: u64,
+    classify_out: ClassifyOut,
+}
+
+impl ClassifyPend {
+    fn finish(&mut self) {
+        if self.handle == 0 {
+            return;
+        }
+
+        // SAFETY: `handle` was acquired and successfully pended by
+        // `CalloutData::pend_classify`. This value owns the local handle reference
+        // and the required deep copy of classifyOut, and `handle = 0` below makes
+        // completion and release one-shot on every explicit or Drop path.
+        unsafe {
+            FwpsCompleteClassify0(self.handle, 0, &self.classify_out);
+            FwpsReleaseClassifyHandle0(self.handle);
+        }
+        self.handle = 0;
+    }
+
+    /// Completes the pended classification and releases its acquired handle.
+    pub fn complete(mut self) {
+        self.finish();
+    }
+}
+
+impl Drop for ClassifyPend {
+    fn drop(&mut self) {
+        self.finish();
+    }
 }
 
 impl ClassifyDefer {
@@ -98,10 +142,12 @@ pub(super) struct CalloutDataParts<'a> {
     pub layer: Layer,
     pub layer_id: u16,
     pub callout_id: u32,
+    pub filter_id: u64,
     pub flow_context: u64,
     pub values: &'a [Value],
     pub metadata: &'a FwpsIncomingMetadataValues,
     pub classify_out: &'a mut ClassifyOut,
+    pub classify_context: *const c_void,
     pub layer_data: *mut c_void,
 }
 
@@ -114,10 +160,12 @@ pub struct CalloutData<'a> {
     layer: Layer,
     layer_id: u16,
     callout_id: u32,
+    filter_id: u64,
     flow_context: u64,
     values: &'a [Value],
     metadata: &'a FwpsIncomingMetadataValues,
     classify_out: &'a mut ClassifyOut,
+    classify_context: *const c_void,
     layer_data: *mut c_void,
 }
 
@@ -127,10 +175,12 @@ impl<'a> CalloutData<'a> {
             layer: parts.layer,
             layer_id: parts.layer_id,
             callout_id: parts.callout_id,
+            filter_id: parts.filter_id,
             flow_context: parts.flow_context,
             values: parts.values,
             metadata: parts.metadata,
             classify_out: parts.classify_out,
+            classify_context: parts.classify_context,
             layer_data: parts.layer_data,
         }
     }
@@ -290,6 +340,52 @@ impl<'a> CalloutData<'a> {
     /// then infer direction from the connect or receive/accept layer.
     pub fn get_packet_direction(&self) -> Option<PacketDirection> {
         self.metadata.get_packet_direction()
+    }
+
+    /// Pends this complete WFP classification and owns the acquired handle until
+    /// [`ClassifyPend`] is completed or dropped.
+    ///
+    /// Unlike [`Self::pend_operation`], this preserves the lifetime of the classify
+    /// itself. WFP documents this mechanism for ALE endpoint closure so packet work
+    /// already queued by a callout can finish before endpoint shutdown.
+    pub fn pend_classify(&mut self) -> Result<ClassifyPend, String> {
+        if self.classify_context.is_null() {
+            return Err("classification context is missing".to_string());
+        }
+        if self.filter_id == 0 {
+            return Err("classification filter ID is missing".to_string());
+        }
+
+        let mut handle = 0;
+        // SAFETY: the validated callout trampoline supplied both pointers for this
+        // callback. These native calls consume them synchronously; after a
+        // successful pend, only the returned numeric handle and classifyOut copy
+        // escape the callback lifetime.
+        let status =
+            unsafe { FwpsAcquireClassifyHandle0(self.classify_context.cast_mut(), 0, &mut handle) };
+        check_ntstatus(status)
+            .map_err(|err| alloc::format!("failed to acquire classify handle: {}", err))?;
+        if handle == 0 {
+            // SAFETY: acquire reported success, so its output owns one local
+            // reference even though the returned identifier violates the contract.
+            unsafe { FwpsReleaseClassifyHandle0(handle) };
+            return Err("WFP returned a zero classify handle".to_string());
+        }
+
+        // SAFETY: the acquired handle belongs to this current classification;
+        // filter_id and classify_out came from the same validated callback.
+        let status = unsafe { FwpsPendClassify0(handle, self.filter_id, 0, self.classify_out) };
+        if let Err(err) = check_ntstatus(status) {
+            // SAFETY: pending failed, so this remains the sole acquired handle
+            // reference and must be released without a completion call.
+            unsafe { FwpsReleaseClassifyHandle0(handle) };
+            return Err(alloc::format!("failed to pend classification: {}", err));
+        }
+
+        Ok(ClassifyPend {
+            handle,
+            classify_out: *self.classify_out,
+        })
     }
 
     pub fn pend_operation(

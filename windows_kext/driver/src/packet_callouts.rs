@@ -635,13 +635,12 @@ fn clone_packet(
             return Err("failed to access cloned packet data".to_string());
         };
         // Outbound packets intercepted at the IP layer may carry only a partial
-        // pseudo-header checksum because the TCP/IP stack relies on NIC hardware
-        // checksum offload to fill in the real value before transmission.
-        // When this clone is later re-injected via FwpsInjectNetwork*Async (on
-        // Accept/PermanentAccept verdict), it bypasses the NIC entirely, so offload
-        // never runs. We must compute the full software checksum here. An IPv6
-        // packet whose extension chain cannot be resolved must not enter the
-        // pending cache with a checksum that can never be made valid.
+        // pseudo-header checksum because the TCP/IP stack asked the NIC to finish
+        // checksum offload. `clone_all` copies the packet bytes into a fresh NBL;
+        // it does not copy the original NBL's checksum-offload metadata. The fresh
+        // NBL must therefore carry complete software checksums before network-send
+        // reinjection. An IPv6 packet whose extension chain cannot be resolved must
+        // not enter the pending cache with a checksum that can never be made valid.
         recalc_header_checksums(data, ipv6)?;
     }
 

@@ -10,6 +10,7 @@ extern crate alloc;
 // in that graph and compile the full driver graph for every non-test build.
 #[cfg(not(test))]
 mod ale_callouts;
+mod ale_policy;
 mod array_holder;
 #[cfg(not(test))]
 mod bandwidth;
@@ -39,6 +40,7 @@ mod packet_callouts;
 mod packet_util;
 #[cfg(not(test))]
 mod stream_callouts;
+mod tcp_closure_cache;
 mod tcp_endpoint_cache;
 mod udp_endpoint_cache;
 mod udp_flow_cache;

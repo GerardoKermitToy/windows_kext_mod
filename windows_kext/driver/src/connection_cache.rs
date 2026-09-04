@@ -374,6 +374,71 @@ impl ConnectionCache {
         connections.end_instance(key, instance_id)
     }
 
+    /// Ends one IPv4 generation unless `defer_end` installed asynchronous
+    /// lifecycle state. The decision and end share the map's write guard, which
+    /// excludes packet publication for this address family.
+    pub fn end_connection_instance_v4_unless(
+        &self,
+        key: Key,
+        instance_id: u64,
+        defer_end: impl FnOnce() -> Result<bool, String>,
+    ) -> Result<Option<ConnectionV4>, String> {
+        let mut connections = self.connections_v4.write_lock();
+        if !connections.has_live_instance(&key, instance_id) {
+            return Ok(None);
+        }
+        if defer_end()? {
+            return Ok(None);
+        }
+        Ok(connections.end_instance(key, instance_id))
+    }
+
+    /// IPv6 counterpart of [`Self::end_connection_instance_v4_unless`].
+    pub fn end_connection_instance_v6_unless(
+        &self,
+        key: Key,
+        instance_id: u64,
+        defer_end: impl FnOnce() -> Result<bool, String>,
+    ) -> Result<Option<ConnectionV6>, String> {
+        let mut connections = self.connections_v6.write_lock();
+        if !connections.has_live_instance(&key, instance_id) {
+            return Ok(None);
+        }
+        if defer_end()? {
+            return Ok(None);
+        }
+        Ok(connections.end_instance(key, instance_id))
+    }
+
+    /// Runs `prepare_end` and marks the exact IPv4 generation ended under one
+    /// connection-map write guard. Pending-request publication holds the matching
+    /// read guard, so the prepared closure state cannot be removed before a newly
+    /// published packet has either joined it or observed the ended generation.
+    pub fn end_connection_instance_v4_after<T>(
+        &self,
+        key: Key,
+        instance_id: u64,
+        prepare_end: impl FnOnce() -> Option<T>,
+    ) -> Option<(Option<ConnectionV4>, T)> {
+        let mut connections = self.connections_v4.write_lock();
+        let prepared = prepare_end()?;
+        let connection = connections.end_instance(key, instance_id);
+        Some((connection, prepared))
+    }
+
+    /// IPv6 counterpart of [`Self::end_connection_instance_v4_after`].
+    pub fn end_connection_instance_v6_after<T>(
+        &self,
+        key: Key,
+        instance_id: u64,
+        prepare_end: impl FnOnce() -> Option<T>,
+    ) -> Option<(Option<ConnectionV6>, T)> {
+        let mut connections = self.connections_v6.write_lock();
+        let prepared = prepare_end()?;
+        let connection = connections.end_instance(key, instance_id);
+        Some((connection, prepared))
+    }
+
     pub fn end_all_on_endpoint_v4(
         &self,
         key: (IpProtocol, u16),
@@ -559,6 +624,53 @@ mod tests {
             Err(41)
         );
     }
-}
 
-// End of connection cache.
+    #[test]
+    fn endpoint_closure_decision_is_atomic_with_publication_guard() {
+        let cache = ConnectionCache::new();
+        let tuple = key([192, 0, 2, 2], 443);
+        let registration = cache
+            .register_connection(&tuple, 100, Direction::Outbound)
+            .expect("connection registration");
+
+        let ended = cache
+            .end_connection_instance_v4_unless(tuple, registration.instance_id, || {
+                assert!(matches!(
+                    cache.connections_v4.0.try_read(),
+                    Err(TryLockError::WouldBlock)
+                ));
+                Ok(true)
+            })
+            .expect("defer decision");
+        assert!(ended.is_none());
+        assert!(cache
+            .with_live_connection_instance(&tuple, registration.instance_id, Some)
+            .is_some());
+
+        let ended = cache
+            .end_connection_instance_v4_unless(tuple, registration.instance_id, || Ok(false))
+            .expect("inline end");
+        assert!(ended.is_some());
+    }
+
+    #[test]
+    fn stale_endpoint_does_not_install_deferred_state() {
+        let cache = ConnectionCache::new();
+        let tuple = key([192, 0, 2, 3], 443);
+        let registration = cache
+            .register_connection(&tuple, 100, Direction::Outbound)
+            .expect("connection registration");
+        assert!(cache
+            .end_connection_instance_v4(tuple, registration.instance_id)
+            .is_some());
+
+        let result = cache.end_connection_instance_v4_unless(
+            tuple,
+            registration.instance_id,
+            || -> Result<bool, alloc::string::String> {
+                panic!("stale endpoint attempted to install closure state")
+            },
+        );
+        assert!(matches!(result, Ok(None)));
+    }
+}

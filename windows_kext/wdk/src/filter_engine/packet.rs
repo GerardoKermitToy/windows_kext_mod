@@ -21,7 +21,7 @@ use windows_sys::{
         },
     },
     Win32::{
-        Foundation::{BOOLEAN, INVALID_HANDLE_VALUE, STATUS_SUCCESS},
+        Foundation::{BOOLEAN, INVALID_HANDLE_VALUE, NTSTATUS, STATUS_SUCCESS},
         Networking::WinSock::{AF_INET, AF_INET6, AF_UNSPEC, SCOPE_ID, SCOPE_ID_0},
         System::Kernel::{COMPARTMENT_ID, UNSPECIFIED_COMPARTMENT_ID},
     },
@@ -128,6 +128,75 @@ impl TransportProtocol {
     fn requires_dpc(self) -> bool {
         matches!(self, Self::Tcp)
     }
+
+    fn uses_network_send_for_ale(self, inbound: bool, loopback: bool) -> bool {
+        matches!(self, Self::Tcp | Self::Udp) && inbound && loopback
+    }
+}
+
+/// Asynchronous WFP injection API whose final completion failed.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InjectionPath {
+    NetworkReceive,
+    NetworkSend,
+    TransportReceive,
+    TransportSend,
+}
+
+impl InjectionPath {
+    fn for_network(inbound: bool, loopback: bool) -> Self {
+        if inbound && !loopback {
+            Self::NetworkReceive
+        } else {
+            Self::NetworkSend
+        }
+    }
+
+    fn for_transport(inbound: bool) -> Self {
+        if inbound {
+            Self::TransportReceive
+        } else {
+            Self::TransportSend
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NetworkReceive => "network-receive",
+            Self::NetworkSend => "network-send",
+            Self::TransportReceive => "transport-receive",
+            Self::TransportSend => "transport-send",
+        }
+    }
+}
+
+/// Reports a negative final `NET_BUFFER_LIST::Status` from WFP.
+///
+/// WFP may invoke this function at any IRQL up to `DISPATCH_LEVEL`. The callback
+/// must use only nonpaged code/data, must not block, and must remain callable until
+/// [`Injector::destroy`] has returned after draining all injection completions.
+pub type InjectionFailureCallback = unsafe fn(InjectionPath, NTSTATUS);
+
+#[derive(Clone, Copy)]
+struct InjectionCompletion {
+    path: InjectionPath,
+    failure_callback: Option<InjectionFailureCallback>,
+}
+
+impl InjectionCompletion {
+    fn report_if_failed(self, status: NTSTATUS) {
+        // Match NT_SUCCESS: zero and positive informational statuses are not
+        // failures. Immediate negative statuses never reach this completion path.
+        if status >= 0 {
+            return;
+        }
+        if let Some(callback) = self.failure_callback {
+            // SAFETY: InjectionFailureCallback's contract requires the function to
+            // remain callable through handle destruction and support DISPATCH_LEVEL.
+            unsafe { callback(self.path, status) };
+        }
+    }
 }
 
 pub struct TransportPacketList {
@@ -142,10 +211,12 @@ pub struct TransportPacketList {
     // valid during the ALE classify callback; the bytes are copied here so they outlive it.
     control_data: Option<Box<[u8]>>,
     inbound: bool,
-    compartment_id: COMPARTMENT_ID,
+    loopback: bool,
+    completion: InjectionCompletion,
+    compartment_id: Option<u32>,
     interface_index: u32,
     sub_interface_index: u32,
-    // send_params and remote_ip must outlive inject_packet_list_transport
+    // send_params and remote_ip must outlive inject_ale_packet
     // because FwpsInjectTransportSendAsync1 may read them after the function returns.
     // Storing send_params here ensures it lives on the heap inside Box<TransportPacketList>
     // until the WFP completion callback (free_transport_packet) drops it.
@@ -157,6 +228,12 @@ pub struct TransportPacketList {
 // pointers either target fields in the same pinned Box or native NBL state whose
 // ownership moves with this value.
 unsafe impl Send for TransportPacketList {}
+
+/// Ownership passed to a network-injection completion callback.
+struct NetworkInjectionContext {
+    net_buffer_list: NetBufferList,
+    completion: InjectionCompletion,
+}
 
 /// One admission reference held from transport-injection submission until the
 /// native injection API has either accepted the NBL or rejected it synchronously.
@@ -310,6 +387,7 @@ pub struct Injector {
     transport_injection: Pin<Box<TransportInjectionState>>,
     packet_inject_handle_v4: AtomicPtr<c_void>,
     packet_inject_handle_v6: AtomicPtr<c_void>,
+    injection_failure_callback: Option<InjectionFailureCallback>,
 }
 
 // Injection handles are atomically published and are destroyed only after both
@@ -318,7 +396,17 @@ pub struct Injector {
 
 // TODO: Implement custom allocator for the packet buffers for reusing memory and reducing allocations. This should improve latency.
 impl Injector {
+    /// Creates WFP injection handles without a final-status reporter.
     pub fn new() -> Result<Self, String> {
+        Self::new_with_failure_callback(None)
+    }
+
+    /// Creates WFP injection handles and registers an optional final-status
+    /// reporter. The reporter is copied into each accepted injection's owned
+    /// completion context, so it never dereferences this `Injector` asynchronously.
+    pub fn new_with_failure_callback(
+        injection_failure_callback: Option<InjectionFailureCallback>,
+    ) -> Result<Self, String> {
         // Commit each output only after WFP reports success and returns a usable
         // handle. A failed native call owns the contents of its output parameter;
         // leaving that value in `self` would make Drop attempt to destroy an
@@ -327,6 +415,7 @@ impl Injector {
             transport_injection: TransportInjectionState::new(),
             packet_inject_handle_v4: AtomicPtr::new(INVALID_HANDLE_VALUE),
             packet_inject_handle_v6: AtomicPtr::new(INVALID_HANDLE_VALUE),
+            injection_failure_callback,
         };
 
         unsafe {
@@ -428,6 +517,7 @@ impl Injector {
 
     /// Creates the packet list used to replay an ALE indication.
     pub fn from_ale_callout(
+        &self,
         protocol: TransportProtocol,
         ipv6: bool,
         callout_data: &CalloutData,
@@ -435,6 +525,7 @@ impl Injector {
         event_data_offset: usize,
         remote_ip_slice: &[u8],
         inbound: bool,
+        loopback: bool,
         interface_index: u32,
         sub_interface_index: u32,
     ) -> Result<TransportPacketList, String> {
@@ -471,7 +562,12 @@ impl Injector {
             remote_scope_id,
             control_data,
             inbound,
-            compartment_id: resolve_compartment_id(callout_data.get_compartment_id()),
+            loopback,
+            completion: InjectionCompletion {
+                path: InjectionPath::for_transport(inbound),
+                failure_callback: self.injection_failure_callback,
+            },
+            compartment_id: callout_data.get_compartment_id(),
             interface_index,
             sub_interface_index,
             // Pointers are populated after this object has a stable Box address.
@@ -479,15 +575,32 @@ impl Injector {
         })
     }
 
-    /// Injects a saved ALE packet through the transport path.
+    /// Injects a saved ALE packet after its pended operation is complete.
     ///
-    /// UDP has no TCP stack-lock dependency and is submitted in the caller's
-    /// current context. TCP is always transferred to a regular DPC before either
-    /// transport injection API is called.
-    pub fn inject_packet_list_transport(
-        &self,
-        packet_list: TransportPacketList,
-    ) -> Result<(), String> {
+    /// Inbound TCP and UDP loopback packets are returned through network-send
+    /// injection. Windows completes transport-receive injection of either protocol
+    /// with `STATUS_DATA_NOT_ACCEPTED`; a TCP network-receive comparison fails with
+    /// the same status. UDP loses the datagram, while TCP waits for the sender's
+    /// one-second SYN retransmission. Routing the complete IP packet back through
+    /// loopback send preserves immediate delivery. Non-loopback UDP uses transport
+    /// injection in the caller's current context. Non-loopback TCP is always
+    /// transferred to a regular DPC before either transport injection API is called.
+    pub fn inject_ale_packet(&self, packet_list: TransportPacketList) -> Result<(), String> {
+        if packet_list
+            .protocol
+            .uses_network_send_for_ale(packet_list.inbound, packet_list.loopback)
+        {
+            let inject_info = InjectInfo {
+                ipv6: packet_list.ipv6,
+                inbound: true,
+                loopback: true,
+                compartment_id: packet_list.compartment_id,
+                interface_index: packet_list.interface_index,
+                sub_interface_index: packet_list.sub_interface_index,
+            };
+            return self.inject_net_buffer_list(packet_list.net_buffer_list, inject_info);
+        }
+
         let Some(submission) = self.transport_injection.acquire_submission() else {
             return Err("failed to inject packet: transport injector is closing".to_string());
         };
@@ -585,6 +698,7 @@ impl Injector {
             };
 
             let address_family = if boxed.ipv6 { AF_INET6 } else { AF_INET };
+            let compartment_id = resolve_compartment_id(boxed.compartment_id);
             let raw_ptr = Box::into_raw(boxed);
 
             // On success WFP owns this Box until free_transport_packet. On an
@@ -597,7 +711,7 @@ impl Injector {
                     core::ptr::null_mut(),
                     0,
                     address_family,
-                    (*raw_ptr).compartment_id,
+                    compartment_id,
                     (*raw_ptr).interface_index,
                     (*raw_ptr).sub_interface_index,
                     raw_nbl,
@@ -612,7 +726,7 @@ impl Injector {
                     0,
                     &mut (*raw_ptr).send_params,
                     address_family,
-                    (*raw_ptr).compartment_id,
+                    compartment_id,
                     raw_nbl,
                     free_transport_packet,
                     raw_ptr as _,
@@ -638,14 +752,22 @@ impl Injector {
             return Err("failed to inject packet: invalid handle value".to_string());
         }
 
-        // Escape the stack, so the data can be freed after inject is complete.
-        let packet_boxed = Box::new(net_buffer_list);
-        let nbl = packet_boxed.nbl;
+        let path = InjectionPath::for_network(inject_info.inbound, inject_info.loopback);
+        // Escape the stack, so both packet ownership and completion-reporting
+        // metadata remain valid until WFP invokes free_packet.
+        let packet_boxed = Box::new(NetworkInjectionContext {
+            net_buffer_list,
+            completion: InjectionCompletion {
+                path,
+                failure_callback: self.injection_failure_callback,
+            },
+        });
+        let nbl = packet_boxed.net_buffer_list.nbl;
         let packet_pointer = Box::into_raw(packet_boxed);
 
         let compartment_id = resolve_compartment_id(inject_info.compartment_id);
 
-        let status = if inject_info.inbound && !inject_info.loopback {
+        let status = if path == InjectionPath::NetworkReceive {
             // Inject inbound.
             unsafe {
                 FwpsInjectNetworkReceiveAsync0(
@@ -657,7 +779,7 @@ impl Injector {
                     inject_info.sub_interface_index,
                     nbl,
                     free_packet,
-                    (packet_pointer as *mut NetBufferList) as _,
+                    packet_pointer.cast(),
                 )
             }
         } else {
@@ -670,7 +792,7 @@ impl Injector {
                     compartment_id,
                     nbl,
                     free_packet,
-                    (packet_pointer as *mut NetBufferList) as _,
+                    packet_pointer.cast(),
                 )
             }
         };
@@ -863,20 +985,24 @@ unsafe extern "system" fn free_packet(
     net_buffer_list: *mut NET_BUFFER_LIST,
     _dispatch_level: BOOLEAN,
 ) {
-    // SAFETY: WFP supplies either null or the live NBL whose asynchronous
-    // injection is completing, and keeps it valid through this callback.
-    if let Some(nbl) = unsafe { net_buffer_list.as_ref() } {
-        if let Err(err) = check_ntstatus(nbl.Status) {
-            crate::err!("inject status: {}", err);
-        } else {
-            crate::dbg!("inject status: Ok");
-        }
+    // Copy the final status and reporter while WFP and the completion context keep
+    // both objects live. Reporting never takes ownership of either packet object.
+    let status = unsafe { net_buffer_list.as_ref() }.map(|nbl| nbl.Status);
+    let completion = if context.is_null() {
+        None
+    } else {
+        // SAFETY: an accepted network injection supplied exactly one live
+        // `NetworkInjectionContext` as this callback context.
+        Some(unsafe { (*(context as *mut NetworkInjectionContext)).completion })
+    };
+    if let (Some(completion), Some(status)) = (completion, status) {
+        completion.report_if_failed(status);
     }
+
     if !context.is_null() {
-        // SAFETY: the accepted injection transferred exactly one
-        // `Box<NetBufferList>` to WFP as this context. WFP invokes its completion
-        // callback once, so this is the matching and only reconstruction.
-        unsafe { drop(Box::from_raw(context as *mut NetBufferList)) };
+        // SAFETY: WFP invokes this callback once for the accepted injection, so
+        // this is the matching and only reconstruction of the owned context.
+        unsafe { drop(Box::from_raw(context as *mut NetworkInjectionContext)) };
     }
 }
 
@@ -888,15 +1014,20 @@ unsafe extern "system" fn free_transport_packet(
     net_buffer_list: *mut NET_BUFFER_LIST,
     _dispatch_level: BOOLEAN,
 ) {
-    // SAFETY: WFP supplies either null or the live NBL whose asynchronous
-    // transport injection is completing, and keeps it valid through this callback.
-    if let Some(nbl) = unsafe { net_buffer_list.as_ref() } {
-        if let Err(err) = check_ntstatus(nbl.Status) {
-            crate::err!("inject status: {}", err);
-        } else {
-            crate::dbg!("inject status: Ok");
-        }
+    // WFP keeps the NBL and context live through this callback. Copy only the
+    // status and small reporter value before returning packet ownership.
+    let status = unsafe { net_buffer_list.as_ref() }.map(|nbl| nbl.Status);
+    let completion = if context.is_null() {
+        None
+    } else {
+        // SAFETY: an accepted transport injection supplied exactly one live
+        // `TransportPacketList` as this callback context.
+        Some(unsafe { (*(context as *mut TransportPacketList)).completion })
+    };
+    if let (Some(completion), Some(status)) = (completion, status) {
+        completion.report_if_failed(status);
     }
+
     if !context.is_null() {
         // SAFETY: the accepted transport injection transferred exactly one
         // `Box<TransportPacketList>` to WFP as this context. The completion is the
@@ -909,11 +1040,12 @@ unsafe extern "system" fn free_transport_packet(
 mod tests {
     use super::{
         packet_injection_origin, reclaim_immediate_injection_failure, resolve_compartment_id,
-        PacketInjectionOrigin, TransportProtocol, UNSPECIFIED_COMPARTMENT_ID,
+        InjectionCompletion, InjectionPath, PacketInjectionOrigin, TransportProtocol,
+        UNSPECIFIED_COMPARTMENT_ID,
     };
     use crate::ffi::FWPS_PACKET_INJECTION_STATE;
     use alloc::{boxed::Box, sync::Arc};
-    use core::sync::atomic::{AtomicBool, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicUsize, Ordering};
 
     struct DropProbe(Arc<AtomicBool>);
 
@@ -921,6 +1053,68 @@ mod tests {
         fn drop(&mut self) {
             self.0.store(true, Ordering::Release);
         }
+    }
+
+    static FAILURE_CALLBACK_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static FAILURE_CALLBACK_PATH: AtomicU8 = AtomicU8::new(0);
+    static FAILURE_CALLBACK_STATUS: AtomicI32 = AtomicI32::new(0);
+
+    unsafe fn capture_injection_failure(path: InjectionPath, status: i32) {
+        FAILURE_CALLBACK_PATH.store(path as u8, Ordering::Release);
+        FAILURE_CALLBACK_STATUS.store(status, Ordering::Release);
+        FAILURE_CALLBACK_COUNT.fetch_add(1, Ordering::AcqRel);
+    }
+
+    #[test]
+    fn completion_reports_only_negative_status_with_original_context() {
+        const STATUS_DATA_NOT_ACCEPTED: i32 = 0xc000_021bu32 as i32;
+
+        FAILURE_CALLBACK_COUNT.store(0, Ordering::Release);
+        FAILURE_CALLBACK_PATH.store(0, Ordering::Release);
+        FAILURE_CALLBACK_STATUS.store(0, Ordering::Release);
+        let completion = InjectionCompletion {
+            path: InjectionPath::TransportReceive,
+            failure_callback: Some(capture_injection_failure),
+        };
+
+        completion.report_if_failed(0);
+        completion.report_if_failed(1);
+        assert_eq!(FAILURE_CALLBACK_COUNT.load(Ordering::Acquire), 0);
+
+        completion.report_if_failed(STATUS_DATA_NOT_ACCEPTED);
+        assert_eq!(FAILURE_CALLBACK_COUNT.load(Ordering::Acquire), 1);
+        assert_eq!(
+            FAILURE_CALLBACK_PATH.load(Ordering::Acquire),
+            InjectionPath::TransportReceive as u8
+        );
+        assert_eq!(
+            FAILURE_CALLBACK_STATUS.load(Ordering::Acquire),
+            STATUS_DATA_NOT_ACCEPTED
+        );
+    }
+
+    #[test]
+    fn completion_paths_match_native_injection_apis() {
+        assert_eq!(
+            InjectionPath::for_network(true, false),
+            InjectionPath::NetworkReceive
+        );
+        assert_eq!(
+            InjectionPath::for_network(true, true),
+            InjectionPath::NetworkSend
+        );
+        assert_eq!(
+            InjectionPath::for_network(false, false),
+            InjectionPath::NetworkSend
+        );
+        assert_eq!(
+            InjectionPath::for_transport(true),
+            InjectionPath::TransportReceive
+        );
+        assert_eq!(
+            InjectionPath::for_transport(false),
+            InjectionPath::TransportSend
+        );
     }
 
     #[test]
@@ -961,6 +1155,15 @@ mod tests {
     fn only_tcp_requires_dpc_transport_injection() {
         assert!(TransportProtocol::Tcp.requires_dpc());
         assert!(!TransportProtocol::Udp.requires_dpc());
+    }
+
+    #[test]
+    fn only_inbound_loopback_uses_ale_network_send() {
+        for protocol in [TransportProtocol::Tcp, TransportProtocol::Udp] {
+            assert!(protocol.uses_network_send_for_ale(true, true));
+            assert!(!protocol.uses_network_send_for_ale(false, true));
+            assert!(!protocol.uses_network_send_for_ale(true, false));
+        }
     }
 
     #[test]

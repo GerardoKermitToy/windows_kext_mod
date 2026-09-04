@@ -9,9 +9,9 @@ use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Address, Ipv6Address};
 use wdk::{
     driver::Driver,
     filter_engine::{
-        callout_data::ClassifyDefer,
+        callout_data::{CalloutData, ClassifyDefer},
         net_buffer::{NetBufferList, NetworkAllocator},
-        packet::{InjectInfo, Injector},
+        packet::{InjectInfo, InjectionPath, Injector},
         FilterEngine, UnregisterCalloutsResult,
     },
     ioqueue::{self, IOQueue},
@@ -35,7 +35,8 @@ use crate::{
     id_cache::{IdCache, PendingPacket},
     logger,
     packet_util::Redirect,
-    tcp_endpoint_cache::TcpEndpointCache,
+    tcp_closure_cache::{PendingTcpClosure, TcpClosureCache},
+    tcp_endpoint_cache::{TcpEndpointCache, TcpEndpointConnection},
     udp_endpoint_cache::UdpEndpointCache,
     udp_flow_cache::{UdpFlowCache, UdpFlowRegistration},
 };
@@ -54,6 +55,32 @@ impl Packet {
             Self::AleLayer(defer) if defer.is_reauthorization()
         )
     }
+
+    /// Returns whether this packet remains independently deliverable after its
+    /// socket connection has ended.
+    ///
+    /// Outbound UDP is absorbed only after the socket send has completed. Its
+    /// network-layer clone already contains the complete datagram and can be
+    /// injected without the endpoint that originated it. ALE packets and inbound
+    /// network packets still depend on their live connection lifecycle.
+    pub(crate) fn survives_connection_end(&self, key: &Key) -> bool {
+        key.protocol == IpProtocol::Udp
+            && matches!(self, Self::PacketLayer(_, inject_info) if !inject_info.inbound)
+    }
+}
+
+/// Keeps an ID visible as in-progress until its userspace verdict has been fully
+/// applied. Endpoint closure snapshots include these claimed requests as well as
+/// IDs still waiting in the packet cache.
+struct PendingRequestGuard<'a> {
+    device: &'a Device,
+    id: u64,
+}
+
+impl Drop for PendingRequestGuard<'_> {
+    fn drop(&mut self) {
+        self.device.finish_pending_request(self.id);
+    }
 }
 
 // Device Context
@@ -69,6 +96,9 @@ pub struct Device {
     /// Exact TCP connection generations keyed by WFP transport endpoint handle.
     /// Endpoint closure consumes this identity instead of resolving a reused tuple.
     pub(crate) tcp_endpoint_cache: RwSpinLock<TcpEndpointCache>,
+    /// TCP endpoint-closure classifications delayed until the packet requests
+    /// already queued for that flow have finished.
+    tcp_closure_cache: RwSpinLock<TcpClosureCache>,
     /// UDP remote tuples grouped by WFP transport endpoint handle. A UDP socket
     /// receives one endpoint-closure indication regardless of its remote peers.
     pub(crate) udp_endpoint_cache: RwSpinLock<UdpEndpointCache>,
@@ -96,6 +126,24 @@ pub struct Device {
 // wrappers in wdk expose their cross-thread contracts individually, so Device's
 // auto-traits are checked field by field rather than bypassed with a blanket impl.
 
+/// Sends a final asynchronous WFP injection failure through the driver's existing
+/// log ring. WFP can invoke this callback at `DISPATCH_LEVEL`; `err!` allocates its
+/// bounded record from nonpaged pool and publishes it under `RwSpinLock`, without
+/// a pageable or waitable operation or any reference to `Device` state. The
+/// injection-handle destroy path drains every completion before the image unloads.
+///
+/// # Safety
+///
+/// `Injector` calls this only while the driver image and its static log ring remain
+/// live, at an IRQL no higher than `DISPATCH_LEVEL`.
+unsafe fn report_injection_failure(path: InjectionPath, status: NTSTATUS) {
+    err!(
+        "asynchronous WFP {} injection failed: NTSTATUS({:#010x})",
+        path.as_str(),
+        status as u32
+    );
+}
+
 impl Device {
     /// Initialize all members of the device. Memory is handled by windows.
     /// Make sure everything is initialized here.
@@ -103,7 +151,8 @@ impl Device {
         // Complete every fallible standalone allocation before registering WFP
         // callbacks. If either resource is unavailable, DriverEntry fails without
         // ever exposing a callback that depends on a partially built Device.
-        let injector = Injector::new().map_err(|err| format!("injector error: {}", err))?;
+        let injector = Injector::new_with_failure_callback(Some(report_injection_failure))
+            .map_err(|err| format!("injector error: {}", err))?;
         let network_allocator =
             NetworkAllocator::new().map_err(|err| format!("network allocator error: {}", err))?;
         let read_stream = PassiveMutex::new(ArrayHolder::default())
@@ -124,6 +173,7 @@ impl Device {
             packet_cache: RwSpinLock::new(IdCache::new()), // Cache of pending packets waiting for verdict
             connection_cache: ConnectionCache::new(),
             tcp_endpoint_cache: RwSpinLock::new(TcpEndpointCache::new()),
+            tcp_closure_cache: RwSpinLock::new(TcpClosureCache::new()),
             udp_endpoint_cache: RwSpinLock::new(UdpEndpointCache::new()),
             udp_flow_cache: UdpFlowCache::new(),
             icmp_echo_cache: RwSpinLock::new(IcmpEchoCache::new()),
@@ -339,30 +389,50 @@ impl Device {
                     connection_instance_id,
                 }) = packet
                 {
+                    let _request_guard = PendingRequestGuard {
+                        device: self,
+                        id: verdict.id,
+                    };
                     dbg!("Verdict received {}: {}", key, action);
                     // A connection verdict belongs to the exact cache instance that
                     // queued this packet. If endpoint/flow cleanup already ended it,
-                    // complete the saved operation as blocked instead of applying a
-                    // stale decision to a tuple replacement or reinjecting into a
-                    // closed endpoint. Protocols without connection state have no
-                    // instance and continue to use packet-only verdict handling.
+                    // never apply the decision to a tuple replacement. Packets that
+                    // depend on the endpoint are completed as blocked; an outbound
+                    // UDP network clone remains independently deliverable and is
+                    // handled below as a packet-only decision.
+                    let packet_survives_connection_end = packet.survives_connection_end(&key);
                     let redirect_info = if let Some(instance_id) = connection_instance_id {
-                        let Some(update) = self.connection_cache.update_connection_instance(
+                        match self.connection_cache.update_connection_instance(
                             key,
                             instance_id,
                             action,
-                        ) else {
-                            dbg!(
-                                "discarding stale verdict for ended connection instance {}: {}",
-                                instance_id,
-                                key
-                            );
-                            if let Err(err) = self.inject_packet(packet, true) {
-                                err!("failed to complete stale packet: {}", err);
+                        ) {
+                            Some(update) => update.redirect_info,
+                            None if packet_survives_connection_end => {
+                                // Endpoint closure does not revoke an outbound UDP
+                                // datagram whose send already completed before this
+                                // packet-layer decision. Apply the verdict to this
+                                // clone only, without caching it against a tuple that
+                                // may already belong to a replacement socket.
+                                dbg!(
+                                    "completing outbound UDP packet after connection instance {} ended: {}",
+                                    instance_id,
+                                    key
+                                );
+                                None
                             }
-                            return Ok(());
-                        };
-                        update.redirect_info
+                            None => {
+                                dbg!(
+                                    "discarding stale verdict for ended connection instance {}: {}",
+                                    instance_id,
+                                    key
+                                );
+                                if let Err(err) = self.inject_packet(packet, true) {
+                                    err!("failed to complete stale packet: {}", err);
+                                }
+                                return Ok(());
+                            }
+                        }
                     } else {
                         None
                     };
@@ -541,6 +611,10 @@ impl Device {
                     let endpoint_cache = self.tcp_endpoint_cache.read_lock();
                     endpoint_cache.get_entries_count()
                 };
+                let tcp_pending_closures = {
+                    let closure_cache = self.tcp_closure_cache.read_lock();
+                    closure_cache.get_entries_count()
+                };
                 let (udp_endpoint_entries, udp_endpoint_peers) = {
                     let endpoint_cache = self.udp_endpoint_cache.write_lock();
                     endpoint_cache.get_entries_counts()
@@ -565,7 +639,11 @@ impl Device {
                     bandwidth_udp_v4,
                     bandwidth_udp_v6
                 );
-                crate::err!("TCP endpoint cache: {} entries", tcp_endpoint_entries);
+                crate::err!(
+                    "TCP endpoint cache: {} entries, {} pending closures",
+                    tcp_endpoint_entries,
+                    tcp_pending_closures
+                );
                 crate::err!(
                     "UDP endpoint cache: {} endpoints, {} peers",
                     udp_endpoint_entries,
@@ -770,6 +848,7 @@ impl Device {
             packet_cache.pop_all()
         };
         for el in pending_packets {
+            let id = el.id();
             let pending = el.value;
             // Set any verdict. Driver will unload after that and the filter will not be active.
             if let Some(instance_id) = pending.connection_instance_id {
@@ -780,7 +859,9 @@ impl Device {
                 );
             }
             _ = self.inject_packet(pending.packet, true); // Complete ALE pends and discard all packet clones.
+            self.finish_pending_request(id);
         }
+        self.drain_tcp_endpoint_closures();
 
         {
             let mut endpoint_cache = self.tcp_endpoint_cache.write_lock();
@@ -843,25 +924,174 @@ impl Device {
         direction: crate::connection::Direction,
         ale_layer: bool,
     ) {
+        let key = pending.key;
+        let connection_instance_id = pending.connection_instance_id;
         let info = {
-            let mut packet_cache = self.packet_cache.write_lock();
-            packet_cache.push(
-                (pending.key, pending.packet),
-                pending.connection_instance_id,
-                process_id,
-                direction,
-                ale_layer,
-            )
+            // Connection publication already holds the family map's read guard.
+            // Take closure state before the packet cache, matching endpoint-close
+            // and verdict-completion lock order, so a new request cannot escape an
+            // existing closure waiter.
+            let mut closure_cache = self.tcp_closure_cache.write_lock();
+            let queued = {
+                let mut packet_cache = self.packet_cache.write_lock();
+                packet_cache.push(
+                    (pending.key, pending.packet),
+                    connection_instance_id,
+                    process_id,
+                    direction,
+                    ale_layer,
+                )
+            };
+            queued.map(|(id, info)| {
+                closure_cache.add_request(id, &key, connection_instance_id);
+                info
+            })
         };
         if let Some(info) = info {
             let _ = self.event_queue.push(info);
         }
     }
 
-    /// Cancels queued decisions for connection instances whose native lifetime has
-    /// ended. Packet ownership is removed under the cache lock, then every ALE pend
-    /// is completed as blocked after the lock has been released.
-    pub(crate) fn discard_pending_connection_instances(&self, instance_ids: &[u64]) {
+    /// Pends one native TCP endpoint closure when packet decisions for this flow
+    /// were already published. The closure lock is held while the packet-cache
+    /// snapshot is taken and the native classification is pended, so a concurrently
+    /// finishing verdict either disappears before the snapshot or observes the
+    /// inserted waiter afterwards. If there is nothing to wait for, the exact
+    /// connection generation is ended under the same family-map write guard.
+    pub(crate) fn defer_tcp_endpoint_closure(
+        &self,
+        endpoint: TcpEndpointConnection,
+        process_id: u64,
+        data: &mut CalloutData,
+    ) -> Result<(), String> {
+        let defer_end = || {
+            let mut closure_cache = self.tcp_closure_cache.write_lock();
+            let request_ids = {
+                let packet_cache = self.packet_cache.write_lock();
+                packet_cache.tcp_endpoint_request_ids(&endpoint.key, endpoint.instance_id)
+            };
+            if request_ids.is_empty() {
+                return Ok(false);
+            }
+
+            let classify = data.pend_classify()?;
+            let closure = PendingTcpClosure::new(endpoint, process_id, classify, request_ids);
+            let inserted = closure_cache.insert(closure);
+            drop(closure_cache);
+            match inserted {
+                Ok(()) => Ok(true),
+                Err(duplicate) => {
+                    duplicate.classify.complete();
+                    Err(alloc::format!(
+                        "duplicate TCP endpoint closure for connection instance {}",
+                        endpoint.instance_id
+                    ))
+                }
+            }
+        };
+
+        if endpoint.key.is_ipv6() {
+            if let Some(connection) = self.connection_cache.end_connection_instance_v6_unless(
+                endpoint.key,
+                endpoint.instance_id,
+                defer_end,
+            )? {
+                self.retire_pending_connection_instances(&[endpoint.instance_id]);
+                crate::ale_callouts::emit_connection_end_v6(self, connection, process_id);
+            }
+        } else if let Some(connection) = self.connection_cache.end_connection_instance_v4_unless(
+            endpoint.key,
+            endpoint.instance_id,
+            defer_end,
+        )? {
+            self.retire_pending_connection_instances(&[endpoint.instance_id]);
+            crate::ale_callouts::emit_connection_end_v4(self, connection, process_id);
+        }
+        Ok(())
+    }
+
+    /// Marks one claimed verdict as complete and releases every endpoint closure
+    /// whose current request set is now empty.
+    fn finish_pending_request(&self, id: u64) {
+        let ready = {
+            let mut closure_cache = self.tcp_closure_cache.write_lock();
+            {
+                let mut packet_cache = self.packet_cache.write_lock();
+                packet_cache.finish_id(id);
+            }
+            closure_cache.finish_request(id)
+        };
+
+        for endpoint in ready {
+            self.complete_ready_tcp_endpoint_closure(endpoint);
+        }
+    }
+
+    /// Claims a ready closure and ends its exact connection generation while the
+    /// family map is write-locked. Packet publication holds the corresponding read
+    /// lock through closure-cache insertion, so it cannot add an untracked request
+    /// between the final empty check and the lifecycle end.
+    fn complete_ready_tcp_endpoint_closure(&self, endpoint: TcpEndpointConnection) {
+        if endpoint.key.is_ipv6() {
+            let completed = self.connection_cache.end_connection_instance_v6_after(
+                endpoint.key,
+                endpoint.instance_id,
+                || {
+                    let mut closure_cache = self.tcp_closure_cache.write_lock();
+                    closure_cache.take_ready(endpoint.instance_id)
+                },
+            );
+            if let Some((connection, closure)) = completed {
+                if let Some(connection) = connection {
+                    self.retire_pending_connection_instances(&[endpoint.instance_id]);
+                    crate::ale_callouts::emit_connection_end_v6(
+                        self,
+                        connection,
+                        closure.process_id,
+                    );
+                }
+                closure.classify.complete();
+            }
+            return;
+        }
+
+        let completed = self.connection_cache.end_connection_instance_v4_after(
+            endpoint.key,
+            endpoint.instance_id,
+            || {
+                let mut closure_cache = self.tcp_closure_cache.write_lock();
+                closure_cache.take_ready(endpoint.instance_id)
+            },
+        );
+        if let Some((connection, closure)) = completed {
+            if let Some(connection) = connection {
+                self.retire_pending_connection_instances(&[endpoint.instance_id]);
+                crate::ale_callouts::emit_connection_end_v4(self, connection, closure.process_id);
+            }
+            closure.classify.complete();
+        }
+    }
+
+    fn complete_tcp_endpoint_closure(&self, closure: PendingTcpClosure) {
+        crate::ale_callouts::end_tcp_connection(self, closure.endpoint, closure.process_id);
+        closure.classify.complete();
+    }
+
+    fn drain_tcp_endpoint_closures(&self) {
+        let closures = {
+            let mut closure_cache = self.tcp_closure_cache.write_lock();
+            closure_cache.drain()
+        };
+        for closure in closures {
+            self.complete_tcp_endpoint_closure(closure);
+        }
+    }
+
+    /// Retires queued decisions for connection instances whose native lifetime
+    /// has ended. Outbound UDP network packets remain pending as packet-only
+    /// requests; every other packet is removed under the cache lock and any ALE
+    /// operation is completed as blocked after the lock has been released.
+    pub(crate) fn retire_pending_connection_instances(&self, instance_ids: &[u64]) {
         if instance_ids.is_empty() {
             return;
         }
@@ -876,9 +1106,11 @@ impl Device {
 
         let pending_packets = {
             let mut packet_cache = self.packet_cache.write_lock();
-            packet_cache.pop_connection_instances(&sorted_instance_ids)
+            packet_cache.retire_connection_instances(&sorted_instance_ids)
         };
-        for pending in pending_packets {
+        for entry in pending_packets {
+            let id = entry.id();
+            let pending = entry.value;
             if let Err(err) = self.inject_packet(pending.packet, true) {
                 crate::err!(
                     "failed to discard pending packet for ended connection {}: {}",
@@ -886,6 +1118,7 @@ impl Device {
                     err
                 );
             }
+            self.finish_pending_request(id);
         }
     }
 
@@ -909,7 +1142,7 @@ impl Device {
                 let packet_list = defer.complete(!blocked)?;
                 if !blocked {
                     if let Some(packet_list) = packet_list {
-                        self.injector.inject_packet_list_transport(packet_list)?;
+                        self.injector.inject_ale_packet(packet_list)?;
                     }
                 }
 

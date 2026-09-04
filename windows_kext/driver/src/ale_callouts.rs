@@ -1,3 +1,4 @@
+use crate::ale_policy::self_injected_packet_needs_tcp_accept_authorization;
 use crate::connection::{Connection, ConnectionV4, ConnectionV6, Direction, Verdict};
 use crate::connection_map::Key;
 use crate::device::{Device, Packet};
@@ -12,9 +13,7 @@ use wdk::filter_engine::layer::{
     FieldsAleAuthRecvAcceptV6, ValueType,
 };
 use wdk::filter_engine::net_buffer::NetBufferList;
-use wdk::filter_engine::packet::{
-    Injector, PacketInjectionOrigin, TransportPacketList, TransportProtocol,
-};
+use wdk::filter_engine::packet::{PacketInjectionOrigin, TransportPacketList, TransportProtocol};
 use wdk::filter_engine::{callout_data::CalloutData, PacketDirection as WfpPacketDirection};
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_DIRECTION_OUTBOUND;
 
@@ -25,6 +24,7 @@ use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_DIRECTI
 struct AleLayerData {
     is_ipv6: bool,
     reauthorize: bool,
+    loopback: bool,
     process_id: u64,
     protocol: IpProtocol,
     /// Direction assigned to the ALE flow, derived from its authorization layer.
@@ -86,6 +86,11 @@ fn get_u32_or_zero(data: &CalloutData, index: usize) -> u32 {
     }
 }
 
+fn has_u32_flag(data: &CalloutData, index: usize, flag: u32) -> bool {
+    matches!(data.get_value_type(index), ValueType::FwpUint32)
+        && data.get_value_u32(index) & flag != 0
+}
+
 /// Resolves the current packet direction without changing the direction assigned
 /// to the ALE flow. WFP supplies packet-direction metadata only for
 /// reauthorization; its absence means the authorization layer direction applies.
@@ -122,6 +127,11 @@ pub fn ale_layer_connect_v4(data: CalloutData) {
     let ale_data = AleLayerData {
         is_ipv6: false,
         reauthorize: data.is_reauthorize(Fields::Flags as usize),
+        loopback: has_u32_flag(
+            &data,
+            Fields::Flags as usize,
+            wdk::consts::FWP_CONDITION_FLAG_IS_LOOPBACK,
+        ),
         process_id: data.get_process_id().unwrap_or(0),
         protocol: get_protocol(&data, Fields::IpProtocol as usize),
         connection_direction: Direction::Outbound,
@@ -143,6 +153,11 @@ pub fn ale_layer_connect_v6(data: CalloutData) {
     let ale_data = AleLayerData {
         is_ipv6: true,
         reauthorize: data.is_reauthorize(Fields::Flags as usize),
+        loopback: has_u32_flag(
+            &data,
+            Fields::Flags as usize,
+            wdk::consts::FWP_CONDITION_FLAG_IS_LOOPBACK,
+        ),
         process_id: data.get_process_id().unwrap_or(0),
         protocol: get_protocol(&data, Fields::IpProtocol as usize),
         connection_direction: Direction::Outbound,
@@ -169,6 +184,11 @@ pub fn ale_layer_recv_accept_v4(data: CalloutData) {
     let ale_data = AleLayerData {
         is_ipv6: false,
         reauthorize: data.is_reauthorize(Fields::Flags as usize),
+        loopback: has_u32_flag(
+            &data,
+            Fields::Flags as usize,
+            wdk::consts::FWP_CONDITION_FLAG_IS_LOOPBACK,
+        ),
         process_id: data.get_process_id().unwrap_or(0),
         protocol: get_protocol(&data, Fields::IpProtocol as usize),
         connection_direction: Direction::Inbound,
@@ -190,6 +210,11 @@ pub fn ale_layer_recv_accept_v6(data: CalloutData) {
     let ale_data = AleLayerData {
         is_ipv6: true,
         reauthorize: data.is_reauthorize(Fields::Flags as usize),
+        loopback: has_u32_flag(
+            &data,
+            Fields::Flags as usize,
+            wdk::consts::FWP_CONDITION_FLAG_IS_LOOPBACK,
+        ),
         process_id: data.get_process_id().unwrap_or(0),
         protocol: get_protocol(&data, Fields::IpProtocol as usize),
         connection_direction: Direction::Inbound,
@@ -318,11 +343,26 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
             )
         }
     };
-    if network_injection_origin.is_self_injected()
-        || transport_injection_origin.is_self_injected()
-    {
-        data.action_permit();
-        return;
+    let self_injected = network_injection_origin.is_self_injected()
+        || transport_injection_origin.is_self_injected();
+    if self_injected {
+        if !self_injected_packet_needs_tcp_accept_authorization(
+            ale_data.protocol,
+            ale_data.loopback,
+            ale_data.connection_direction,
+            ale_data.packet_direction,
+        ) {
+            data.action_permit();
+            return;
+        }
+        // A packet-layer temporary verdict can network-send a loopback TCP SYN
+        // before the server side has reached ALE_AUTH_RECV_ACCEPT. That incoming
+        // copy is ours, but bypassing it here would also bypass the server's
+        // authorization and leave its child endpoint without a connection-cache
+        // identity. Process this one terminating receive/accept path normally.
+        // Registration happens before its verdict clone is injected, so that
+        // self-injected copy takes the cached permit path below rather than
+        // creating a reinjection loop.
     }
     let injected_by_other = network_injection_origin.is_injected_by_other()
         || transport_injection_origin.is_injected_by_other();
@@ -725,7 +765,7 @@ fn create_packet_list(
         _ => return Err(String::from("unsupported ALE transport protocol")),
     };
 
-    Ok(Some(Injector::from_ale_callout(
+    Ok(Some(device.injector.from_ale_callout(
         transport_protocol,
         ale_data.is_ipv6,
         callout_data,
@@ -733,17 +773,18 @@ fn create_packet_list(
         event_data_offset,
         address,
         inbound,
+        ale_data.loopback,
         ale_data.interface_index,
         ale_data.sub_interface_index,
     )?))
 }
 
-fn discard_pending_connections<T: Connection>(device: &Device, connections: &[T]) {
+fn retire_pending_connections<T: Connection>(device: &Device, connections: &[T]) {
     let instance_ids: Vec<u64> = connections
         .iter()
         .map(Connection::get_instance_id)
         .collect();
-    device.discard_pending_connection_instances(&instance_ids);
+    device.retire_pending_connection_instances(&instance_ids);
 }
 
 pub(crate) fn emit_connection_end_v4(device: &Device, conn: ConnectionV4, process_id: u64) {
@@ -943,50 +984,69 @@ pub(crate) unsafe extern "system" fn udp_flow_delete(
             .connection_cache
             .end_connection_instance_v6(key, context.connection_instance_id)
         {
-            discard_pending_connections(device, core::slice::from_ref(&conn));
+            retire_pending_connections(device, core::slice::from_ref(&conn));
             emit_connection_end_v6(device, conn, context.process_id);
         }
     } else if let Some(conn) = device
         .connection_cache
         .end_connection_instance_v4(key, context.connection_instance_id)
     {
-        discard_pending_connections(device, core::slice::from_ref(&conn));
+        retire_pending_connections(device, core::slice::from_ref(&conn));
         emit_connection_end_v4(device, conn, context.process_id);
     }
 
     device.udp_flow_cache.finish_callback();
 }
 
-fn end_tcp_endpoint(device: &Device, endpoint_handle: u64, process_id: u64) -> bool {
-    // Keep endpoint identity serialized with the exact-instance end operation.
-    // A concurrent reauthorization can either validate and publish before this
-    // block, or observe the ended instance afterwards, but cannot republish it
-    // between consuming the association and ending the connection.
-    let mut endpoint_cache = device.tcp_endpoint_cache.write_lock();
-    let Some(endpoint) = endpoint_cache.take(endpoint_handle) else {
+pub(crate) fn end_tcp_connection(
+    device: &Device,
+    endpoint: crate::tcp_endpoint_cache::TcpEndpointConnection,
+    process_id: u64,
+) {
+    let key = endpoint.key;
+    if key.is_ipv6() {
+        if let Some(conn) = device
+            .connection_cache
+            .end_connection_instance_v6(key, endpoint.instance_id)
+        {
+            retire_pending_connections(device, core::slice::from_ref(&conn));
+            emit_connection_end_v6(device, conn, process_id);
+        }
+        return;
+    }
+
+    if let Some(conn) = device
+        .connection_cache
+        .end_connection_instance_v4(key, endpoint.instance_id)
+    {
+        retire_pending_connections(device, core::slice::from_ref(&conn));
+        emit_connection_end_v4(device, conn, process_id);
+    }
+}
+
+fn close_tcp_endpoint(
+    device: &Device,
+    data: &mut CalloutData,
+    endpoint_handle: u64,
+    process_id: u64,
+) -> bool {
+    // Consume native endpoint identity immediately so duplicate or delayed closure
+    // indications cannot target a tuple replacement. The connection generation
+    // remains live while WFP holds a pended endpoint-closure classification.
+    let endpoint = {
+        let mut endpoint_cache = device.tcp_endpoint_cache.write_lock();
+        endpoint_cache.take(endpoint_handle)
+    };
+    let Some(endpoint) = endpoint else {
         return false;
     };
 
-    let key = endpoint.key;
-    if key.is_ipv6() {
-        let conn = device
-            .connection_cache
-            .end_connection_instance_v6(key, endpoint.instance_id);
-        drop(endpoint_cache);
-        if let Some(conn) = conn {
-            discard_pending_connections(device, core::slice::from_ref(&conn));
-            emit_connection_end_v6(device, conn, process_id);
+    match device.defer_tcp_endpoint_closure(endpoint, process_id, data) {
+        Ok(()) => {}
+        Err(err) => {
+            crate::err!("failed to pend TCP endpoint closure: {}", err);
+            end_tcp_connection(device, endpoint, process_id);
         }
-        return true;
-    }
-
-    let conn = device
-        .connection_cache
-        .end_connection_instance_v4(key, endpoint.instance_id);
-    drop(endpoint_cache);
-    if let Some(conn) = conn {
-        discard_pending_connections(device, core::slice::from_ref(&conn));
-        emit_connection_end_v4(device, conn, process_id);
     }
     true
 }
@@ -1019,8 +1079,8 @@ fn end_udp_endpoint(device: &Device, endpoint_handle: u64, process_id: u64) -> b
         }
     }
 
-    discard_pending_connections(device, &ended_v4);
-    discard_pending_connections(device, &ended_v6);
+    retire_pending_connections(device, &ended_v4);
+    retire_pending_connections(device, &ended_v6);
     for conn in ended_v4 {
         emit_connection_end_v4(device, conn, process_id);
     }
@@ -1042,7 +1102,7 @@ fn end_local_endpoint_v4(
         local_address,
         (process_id != 0).then_some(process_id),
     ) {
-        discard_pending_connections(device, &conns);
+        retire_pending_connections(device, &conns);
         for conn in conns {
             emit_connection_end_v4(device, conn, process_id);
         }
@@ -1061,14 +1121,14 @@ fn end_local_endpoint_v6(
         local_address,
         (process_id != 0).then_some(process_id),
     ) {
-        discard_pending_connections(device, &conns);
+        retire_pending_connections(device, &conns);
         for conn in conns {
             emit_connection_end_v6(device, conn, process_id);
         }
     }
 }
 
-pub fn endpoint_closure_v4(data: CalloutData) {
+pub fn endpoint_closure_v4(mut data: CalloutData) {
     type Fields = layer::FieldsAleEndpointClosureV4;
     let Some(device) = crate::entry::get_device() else {
         return;
@@ -1091,7 +1151,9 @@ pub fn endpoint_closure_v4(data: CalloutData) {
                 }
                 return;
             };
-            if !end_tcp_endpoint(device, endpoint_handle, process_id) && connected_endpoint {
+            if !close_tcp_endpoint(device, &mut data, endpoint_handle, process_id)
+                && connected_endpoint
+            {
                 crate::err!("TCP endpoint closure did not match a tracked connection");
             }
         }
@@ -1121,7 +1183,7 @@ pub fn endpoint_closure_v4(data: CalloutData) {
             // globally authoritative, so consult both protocol-specific maps
             // without attempting a tuple or local-port fallback.
             if let Some(endpoint_handle) = endpoint_handle {
-                if !end_tcp_endpoint(device, endpoint_handle, process_id) {
+                if !close_tcp_endpoint(device, &mut data, endpoint_handle, process_id) {
                     let _ = end_udp_endpoint(device, endpoint_handle, process_id);
                 }
             }
@@ -1130,7 +1192,7 @@ pub fn endpoint_closure_v4(data: CalloutData) {
     }
 }
 
-pub fn endpoint_closure_v6(data: CalloutData) {
+pub fn endpoint_closure_v6(mut data: CalloutData) {
     type Fields = layer::FieldsAleEndpointClosureV6;
     let Some(device) = crate::entry::get_device() else {
         return;
@@ -1153,7 +1215,9 @@ pub fn endpoint_closure_v6(data: CalloutData) {
                 }
                 return;
             };
-            if !end_tcp_endpoint(device, endpoint_handle, process_id) && connected_endpoint {
+            if !close_tcp_endpoint(device, &mut data, endpoint_handle, process_id)
+                && connected_endpoint
+            {
                 crate::err!("TCP endpoint closure did not match a tracked connection");
             }
         }
@@ -1176,7 +1240,7 @@ pub fn endpoint_closure_v6(data: CalloutData) {
         }
         None => {
             if let Some(endpoint_handle) = endpoint_handle {
-                if !end_tcp_endpoint(device, endpoint_handle, process_id) {
+                if !close_tcp_endpoint(device, &mut data, endpoint_handle, process_id) {
                     let _ = end_udp_endpoint(device, endpoint_handle, process_id);
                 }
             }
