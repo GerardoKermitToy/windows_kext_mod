@@ -926,11 +926,13 @@ impl Device {
     ) {
         let key = pending.key;
         let connection_instance_id = pending.connection_instance_id;
-        let info = {
+        let infos = {
             // Connection publication already holds the family map's read guard.
             // Take closure state before the packet cache, matching endpoint-close
             // and verdict-completion lock order, so a new request cannot escape an
-            // existing closure waiter.
+            // existing closure waiter. `IdCache::push` expands a multi-NET_BUFFER
+            // packet-layer indication into one independently decided request per
+            // packet while both locks remain held.
             let mut closure_cache = self.tcp_closure_cache.write_lock();
             let queued = {
                 let mut packet_cache = self.packet_cache.write_lock();
@@ -942,12 +944,12 @@ impl Device {
                     ale_layer,
                 )
             };
-            queued.map(|(id, info)| {
-                closure_cache.add_request(id, &key, connection_instance_id);
-                info
-            })
+            for (id, _) in &queued {
+                closure_cache.add_request(*id, &key, connection_instance_id);
+            }
+            queued
         };
-        if let Some(info) = info {
+        for (_, info) in infos {
             let _ = self.event_queue.push(info);
         }
     }

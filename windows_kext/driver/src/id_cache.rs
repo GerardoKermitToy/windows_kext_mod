@@ -62,21 +62,48 @@ impl IdCache {
         process_id: u64,
         direction: Direction,
         ale_layer: bool,
-    ) -> Option<(u64, Info)> {
+    ) -> Vec<(u64, Info)> {
         let _guard = self.lock.write_lock();
-        let id = self.next_id;
-        let info = build_info(&value.0, id, process_id, direction, &value.1, ale_layer);
-        self.values.push_back(Entry {
-            value: PendingPacket {
-                key: value.0,
-                packet: value.1,
-                connection_instance_id,
-            },
-            id,
-        });
-        self.next_id = self.next_id.wrapping_add(1); // Assuming this will not overflow.
+        let (key, packet) = value;
 
-        return info.map(|info| (id, info));
+        // One outgoing WFP indication can contain several NET_BUFFER packets.
+        // Userspace decides packets rather than indications, so give every clone
+        // its own cache entry, event and verdict ID. Keep this expansion under the
+        // same lock (and the caller's connection-liveness guard) so endpoint closure
+        // cannot observe only part of the original batch.
+        match packet {
+            Packet::PacketLayer(nbls, inject_info) => {
+                let mut queued = Vec::with_capacity(nbls.len());
+                for nbl in nbls {
+                    let packet = Packet::PacketLayer(alloc::vec![nbl], inject_info);
+                    if let Some(entry) = push_packet(
+                        &mut self.values,
+                        &mut self.next_id,
+                        key,
+                        packet,
+                        connection_instance_id,
+                        process_id,
+                        direction,
+                        ale_layer,
+                    ) {
+                        queued.push(entry);
+                    }
+                }
+                queued
+            }
+            packet => push_packet(
+                &mut self.values,
+                &mut self.next_id,
+                key,
+                packet,
+                connection_instance_id,
+                process_id,
+                direction,
+                ale_layer,
+            )
+            .into_iter()
+            .collect(),
+        }
     }
 
     pub fn pop_id(&mut self, id: u64) -> Option<PendingPacket> {
@@ -140,10 +167,9 @@ impl IdCache {
     /// instance. The application's send completed before the packet was absorbed,
     /// and endpoint closure must not revoke that already accepted datagram. A later
     /// verdict therefore remains valid for the clone, but cannot update a reused
-    /// connection tuple. Retained entries are never merged: each WFP indication
-    /// keeps its original request ID. Other packets are removed and returned for
-    /// fail-closed completion after both the cache lock and its outer Device lock
-    /// are released.
+    /// connection tuple. Every NET_BUFFER packet retains its own request ID; entries
+    /// are never merged. Other packets are removed and returned for fail-closed
+    /// completion after both the cache lock and its outer Device lock are released.
     pub fn retire_connection_instances(
         &mut self,
         sorted_instance_ids: &[u64],
@@ -190,6 +216,30 @@ impl IdCache {
 
         return values;
     }
+}
+
+fn push_packet(
+    values: &mut VecDeque<Entry<PendingPacket>>,
+    next_id: &mut u64,
+    key: Key,
+    packet: Packet,
+    connection_instance_id: Option<u64>,
+    process_id: u64,
+    direction: Direction,
+    ale_layer: bool,
+) -> Option<(u64, Info)> {
+    let id = *next_id;
+    let info = build_info(&key, id, process_id, direction, &packet, ale_layer)?;
+    values.push_back(Entry {
+        value: PendingPacket {
+            key,
+            packet,
+            connection_instance_id,
+        },
+        id,
+    });
+    *next_id = next_id.wrapping_add(1); // Assuming this will not overflow.
+    Some((id, info))
 }
 
 fn get_payload(packet: &Packet) -> Option<&[u8]> {
