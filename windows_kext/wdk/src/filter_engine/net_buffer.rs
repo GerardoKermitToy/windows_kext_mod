@@ -361,10 +361,20 @@ pub unsafe fn read_packet_partial(nbl: *mut NET_BUFFER_LIST, buffer: &mut [u8]) 
                 return Err(());
             }
 
-            let ptr = NdisGetDataBuffer(nb, buffer.len() as u32, buffer.as_mut_ptr(), 1, 0);
-            if !ptr.is_null() {
-                return Ok(());
+            let storage = buffer.as_mut_ptr();
+            let ptr = NdisGetDataBuffer(nb, buffer.len() as u32, storage, 1, 0);
+            if ptr.is_null() {
+                return Err(());
             }
+
+            // When the requested bytes are already contiguous, NDIS returns a
+            // pointer into the original NET_BUFFER and does not populate Storage.
+            // Copy that range explicitly so this helper always fulfils its contract
+            // of writing the caller-provided buffer.
+            if ptr != storage {
+                buffer.copy_from_slice(core::slice::from_raw_parts(ptr, buffer.len()));
+            }
+            return Ok(());
         }
     }
     return Err(());
