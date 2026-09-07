@@ -8,6 +8,7 @@ use alloc::{boxed::Box, string::String, vec::Vec};
 use smoltcp::wire::{
     IpAddress, IpProtocol, Ipv4Address, Ipv6Address, IPV4_HEADER_LEN, IPV6_HEADER_LEN,
 };
+use wdk::consts::{FWP_CONDITION_FLAG_IS_LOOPBACK, FWP_CONDITION_FLAG_IS_REAUTHORIZE};
 use wdk::filter_engine::layer::{
     self, FieldsAleAuthConnectV4, FieldsAleAuthConnectV6, FieldsAleAuthRecvAcceptV4,
     FieldsAleAuthRecvAcceptV6, ValueType,
@@ -75,20 +76,19 @@ fn get_u16_if_present(data: &CalloutData, index: usize) -> Option<u16> {
 }
 
 /// Reads a `FWP_UINT32` field, returning 0 when the field is not populated.
-///
-/// Several fields are only filled in at some layers. Reading the union member
-/// regardless yields an unrelated value rather than an error, so the type is
-/// checked first.
+/// `CalloutData` validates both the field index and its type before reading the
+/// native union, so a separate type lookup here would only repeat that work.
 fn get_u32_or_zero(data: &CalloutData, index: usize) -> u32 {
-    match data.get_value_type(index) {
-        ValueType::FwpUint32 => data.get_value_u32(index),
-        _ => 0,
-    }
+    data.get_value_u32(index)
 }
 
-fn has_u32_flag(data: &CalloutData, index: usize, flag: u32) -> bool {
-    matches!(data.get_value_type(index), ValueType::FwpUint32)
-        && data.get_value_u32(index) & flag != 0
+/// Reads the shared ALE flags field once for both classifications.
+fn get_ale_flags(data: &CalloutData, index: usize) -> (bool, bool) {
+    let flags = get_u32_or_zero(data, index);
+    (
+        flags & FWP_CONDITION_FLAG_IS_REAUTHORIZE != 0,
+        flags & FWP_CONDITION_FLAG_IS_LOOPBACK != 0,
+    )
 }
 
 /// Resolves the current packet direction without changing the direction assigned
@@ -124,14 +124,11 @@ fn get_ipv6_address_if_present(data: &CalloutData, index: usize) -> Option<IpAdd
 
 pub fn ale_layer_connect_v4(data: CalloutData) {
     type Fields = FieldsAleAuthConnectV4;
+    let (reauthorize, loopback) = get_ale_flags(&data, Fields::Flags as usize);
     let ale_data = AleLayerData {
         is_ipv6: false,
-        reauthorize: data.is_reauthorize(Fields::Flags as usize),
-        loopback: has_u32_flag(
-            &data,
-            Fields::Flags as usize,
-            wdk::consts::FWP_CONDITION_FLAG_IS_LOOPBACK,
-        ),
+        reauthorize,
+        loopback,
         process_id: data.get_process_id().unwrap_or(0),
         protocol: get_protocol(&data, Fields::IpProtocol as usize),
         connection_direction: Direction::Outbound,
@@ -149,15 +146,12 @@ pub fn ale_layer_connect_v4(data: CalloutData) {
 
 pub fn ale_layer_connect_v6(data: CalloutData) {
     type Fields = FieldsAleAuthConnectV6;
+    let (reauthorize, loopback) = get_ale_flags(&data, Fields::Flags as usize);
 
     let ale_data = AleLayerData {
         is_ipv6: true,
-        reauthorize: data.is_reauthorize(Fields::Flags as usize),
-        loopback: has_u32_flag(
-            &data,
-            Fields::Flags as usize,
-            wdk::consts::FWP_CONDITION_FLAG_IS_LOOPBACK,
-        ),
+        reauthorize,
+        loopback,
         process_id: data.get_process_id().unwrap_or(0),
         protocol: get_protocol(&data, Fields::IpProtocol as usize),
         connection_direction: Direction::Outbound,
@@ -180,15 +174,12 @@ pub fn ale_layer_connect_v6(data: CalloutData) {
 
 pub fn ale_layer_recv_accept_v4(data: CalloutData) {
     type Fields = FieldsAleAuthRecvAcceptV4;
+    let (reauthorize, loopback) = get_ale_flags(&data, Fields::Flags as usize);
 
     let ale_data = AleLayerData {
         is_ipv6: false,
-        reauthorize: data.is_reauthorize(Fields::Flags as usize),
-        loopback: has_u32_flag(
-            &data,
-            Fields::Flags as usize,
-            wdk::consts::FWP_CONDITION_FLAG_IS_LOOPBACK,
-        ),
+        reauthorize,
+        loopback,
         process_id: data.get_process_id().unwrap_or(0),
         protocol: get_protocol(&data, Fields::IpProtocol as usize),
         connection_direction: Direction::Inbound,
@@ -206,15 +197,12 @@ pub fn ale_layer_recv_accept_v4(data: CalloutData) {
 
 pub fn ale_layer_recv_accept_v6(data: CalloutData) {
     type Fields = FieldsAleAuthRecvAcceptV6;
+    let (reauthorize, loopback) = get_ale_flags(&data, Fields::Flags as usize);
 
     let ale_data = AleLayerData {
         is_ipv6: true,
-        reauthorize: data.is_reauthorize(Fields::Flags as usize),
-        loopback: has_u32_flag(
-            &data,
-            Fields::Flags as usize,
-            wdk::consts::FWP_CONDITION_FLAG_IS_LOOPBACK,
-        ),
+        reauthorize,
+        loopback,
         process_id: data.get_process_id().unwrap_or(0),
         protocol: get_protocol(&data, Fields::IpProtocol as usize),
         connection_direction: Direction::Inbound,
@@ -337,6 +325,15 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
         return;
     };
 
+    // Only TCP and UDP are associated with an ALE connection. Avoid the two WFP
+    // injection-state queries for protocols that are always handled at packet layer.
+    if !matches!(ale_data.protocol, IpProtocol::Tcp | IpProtocol::Udp) {
+        // Outbound: will be handled by packet layer next.
+        // Inbound: was already handled by packet layer.
+        data.action_permit();
+        return;
+    }
+
     // Network-layer reinjection is used by the packet path, while packets held at
     // ALE receive/accept are returned with the transport injector. Either kind can
     // be indicated here again and must be permitted without creating another pend.
@@ -362,40 +359,27 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
     };
     let self_injected = network_injection_origin.is_self_injected()
         || transport_injection_origin.is_self_injected();
-    if self_injected {
-        if !self_injected_packet_needs_tcp_accept_authorization(
+    if self_injected
+        && !self_injected_packet_needs_tcp_accept_authorization(
             ale_data.protocol,
             ale_data.loopback,
             ale_data.connection_direction,
             ale_data.packet_direction,
-        ) {
-            data.action_permit();
-            return;
-        }
-        // A packet-layer temporary verdict can network-send a loopback TCP SYN
-        // before the server side has reached ALE_AUTH_RECV_ACCEPT. That incoming
-        // copy is ours, but bypassing it here would also bypass the server's
-        // authorization and leave its child endpoint without a connection-cache
-        // identity. Process this one terminating receive/accept path normally.
-        // Registration happens before its verdict clone is injected, so that
-        // self-injected copy takes the cached permit path below rather than
-        // creating a reinjection loop.
+        )
+    {
+        data.action_permit();
+        return;
     }
+    // A packet-layer temporary verdict can network-send a loopback TCP SYN
+    // before the server side has reached ALE_AUTH_RECV_ACCEPT. If the indication
+    // reaching this point is self-injected, it is that incoming copy; bypassing it
+    // would also bypass the server's authorization and leave its child endpoint
+    // without a connection-cache identity. Process this one terminating
+    // receive/accept path normally. Registration happens before its verdict clone
+    // is injected, so that self-injected copy takes the cached permit path below
+    // rather than creating a reinjection loop.
     let injected_by_other = network_injection_origin.is_injected_by_other()
         || transport_injection_origin.is_injected_by_other();
-
-    match ale_data.protocol {
-        IpProtocol::Tcp | IpProtocol::Udp => {
-            // Only TCP and UDP make sense to be supported in the ALE layer.
-            // Everything else is not associated with a connection and will be handled in the packet layer.
-        }
-        _ => {
-            // Outbound: Will be handled by packet layer next.
-            // Inbound: Was already handled by the packet layer.
-            data.action_permit();
-            return;
-        }
-    }
 
     // A foreign network injector can create a synthetic System-owned ALE flow and
     // expose one shared raw endpoint handle for many unrelated TCP/UDP tuples. It
@@ -415,7 +399,11 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
     // Reauthorization of an already cached TCP connection may omit this metadata;
     // in that case the association saved by the initial indication remains valid.
     let endpoint_handle = transport_endpoint_handle(&data);
-    let parent_endpoint_handle = parent_endpoint_handle(&data);
+    let parent_endpoint_handle = if matches!(ale_data.protocol, IpProtocol::Tcp) {
+        parent_endpoint_handle(&data)
+    } else {
+        None
+    };
 
     // Outbound UDP is decided at the IP packet layer, not here.
     //
@@ -730,14 +718,15 @@ fn create_packet_list(
         return Ok(None);
     }
 
-    if callout_data.get_layer_data().is_null() {
+    let layer_data = callout_data.get_layer_data();
+    if layer_data.is_null() {
         return Ok(None);
     }
 
     // SAFETY: This function runs synchronously inside an ALE classify callback.
     // WFP owns the non-null layer-data NBL and keeps it live through callback
     // return; this borrowed wrapper is dropped after cloning and never escapes.
-    let mut nbl = unsafe { NetBufferList::new(callout_data.get_layer_data() as _) };
+    let mut nbl = unsafe { NetBufferList::new(layer_data as _) };
     let mut inbound = false;
     let mut event_data_offset = 0;
     if let Direction::Inbound = ale_data.packet_direction {
@@ -811,11 +800,19 @@ fn create_packet_list(
 }
 
 fn retire_pending_connections<T: Connection>(device: &Device, connections: &[T]) {
-    let instance_ids: Vec<u64> = connections
-        .iter()
-        .map(Connection::get_instance_id)
-        .collect();
-    device.retire_pending_connection_instances(&instance_ids);
+    match connections {
+        [] => {}
+        [connection] => {
+            device.retire_pending_connection_instances(&[connection.get_instance_id()]);
+        }
+        _ => {
+            let instance_ids: Vec<u64> = connections
+                .iter()
+                .map(Connection::get_instance_id)
+                .collect();
+            device.retire_pending_connection_instances_owned(instance_ids);
+        }
+    }
 }
 
 pub(crate) fn emit_connection_end_v4(device: &Device, conn: ConnectionV4, process_id: u64) {
@@ -887,6 +884,7 @@ fn associate_udp_flow_context(
     device: &Device,
     data: &CalloutData,
     key: Key,
+    process_id: u64,
     endpoint_handle: Option<u64>,
     connection_instance_id: u64,
 ) {
@@ -909,7 +907,7 @@ fn associate_udp_flow_context(
     );
     let flow_context = Box::into_raw(Box::new(UdpFlowContext {
         key,
-        process_id: data.get_process_id().unwrap_or(0),
+        process_id,
         connection_instance_id,
         endpoint_handle,
     })) as u64;
@@ -1219,12 +1217,13 @@ pub fn endpoint_closure_v4(mut data: CalloutData) {
 
     match protocol {
         Some(IpProtocol::Tcp) => {
-            let connected_endpoint = get_ipv4_address_if_present(
-                &data,
-                Fields::IpRemoteAddress as usize,
-            )
-            .is_some()
-                && get_u16_if_present(&data, Fields::IpRemotePort as usize).is_some();
+            let connected_endpoint = matches!(
+                data.get_value_type(Fields::IpRemoteAddress as usize),
+                ValueType::FwpUint32
+            ) && matches!(
+                data.get_value_type(Fields::IpRemotePort as usize),
+                ValueType::FwpUint16
+            );
             let Some(endpoint_handle) = endpoint_handle else {
                 if connected_endpoint {
                     crate::err!("connected TCP closure has no endpoint handle");
@@ -1287,12 +1286,13 @@ pub fn endpoint_closure_v6(mut data: CalloutData) {
 
     match protocol {
         Some(IpProtocol::Tcp) => {
-            let connected_endpoint = get_ipv6_address_if_present(
-                &data,
-                Fields::IpRemoteAddress as usize,
-            )
-            .is_some()
-                && get_u16_if_present(&data, Fields::IpRemotePort as usize).is_some();
+            let connected_endpoint = matches!(
+                data.get_value_type(Fields::IpRemoteAddress as usize),
+                ValueType::FwpByteArray16Type
+            ) && matches!(
+                data.get_value_type(Fields::IpRemotePort as usize),
+                ValueType::FwpUint16
+            );
             let Some(endpoint_handle) = endpoint_handle else {
                 if connected_endpoint {
                     crate::err!("connected TCP closure has no endpoint handle");
@@ -1337,39 +1337,20 @@ pub fn endpoint_closure_v6(mut data: CalloutData) {
     }
 }
 
-/// Returns the IP version when this is an outbound TCP or UDP flow-established
-/// indication. A missing or mistyped direction is not treated as outbound.
-fn outbound_transport_flow_ip_version(data: &CalloutData) -> Option<bool> {
-    let (protocol_index, direction_index, is_ipv6) = match data.get_layer() {
-        layer::Layer::AleFlowEstablishedV4 => (
-            layer::FieldsAleFlowEstablishedV4::IpProtocol as usize,
-            layer::FieldsAleFlowEstablishedV4::Direction as usize,
-            false,
-        ),
-        layer::Layer::AleFlowEstablishedV6 => (
-            layer::FieldsAleFlowEstablishedV6::IpProtocol as usize,
-            layer::FieldsAleFlowEstablishedV6::Direction as usize,
-            true,
-        ),
-        _ => return None,
-    };
-
-    if !matches!(
-        get_protocol_if_present(data, protocol_index),
-        Some(IpProtocol::Tcp | IpProtocol::Udp)
-    ) || !matches!(data.get_value_type(direction_index), ValueType::FwpUint32)
+/// Checks injection state for a parsed TCP/UDP flow-established indication.
+/// A missing or mistyped direction is not treated as outbound.
+fn is_injected_outbound_transport_flow(
+    device: &Device,
+    data: &CalloutData,
+    direction_index: usize,
+    is_ipv6: bool,
+) -> bool {
+    if !matches!(data.get_value_type(direction_index), ValueType::FwpUint32)
         || data.get_value_u32(direction_index) != FWP_DIRECTION_OUTBOUND as u32
     {
-        return None;
+        return false;
     }
 
-    Some(is_ipv6)
-}
-
-fn is_injected_outbound_transport_flow(device: &Device, data: &CalloutData) -> bool {
-    let Some(is_ipv6) = outbound_transport_flow_ip_version(data) else {
-        return false;
-    };
     let layer_data = data.get_layer_data();
     if layer_data.is_null() {
         return false;
@@ -1410,9 +1391,8 @@ pub fn ale_flow_established_monitor(data: CalloutData) {
     let Some(device) = crate::entry::get_device() else {
         return;
     };
-    let process_id = data.get_process_id().filter(|pid| *pid != 0);
 
-    let key = match data.get_layer() {
+    let (key, direction_index, is_ipv6) = match data.get_layer() {
         layer::Layer::AleFlowEstablishedV4 => {
             type Fields = layer::FieldsAleFlowEstablishedV4;
 
@@ -1432,13 +1412,17 @@ pub fn ale_flow_established_monitor(data: CalloutData) {
                 return;
             };
 
-            Key {
-                protocol,
-                local_address,
-                local_port,
-                remote_address,
-                remote_port,
-            }
+            (
+                Key {
+                    protocol,
+                    local_address,
+                    local_port,
+                    remote_address,
+                    remote_port,
+                },
+                Fields::Direction as usize,
+                false,
+            )
         }
         layer::Layer::AleFlowEstablishedV6 => {
             type Fields = layer::FieldsAleFlowEstablishedV6;
@@ -1459,13 +1443,17 @@ pub fn ale_flow_established_monitor(data: CalloutData) {
                 return;
             };
 
-            Key {
-                protocol,
-                local_address,
-                local_port,
-                remote_address,
-                remote_port,
-            }
+            (
+                Key {
+                    protocol,
+                    local_address,
+                    local_port,
+                    remote_address,
+                    remote_port,
+                },
+                Fields::Direction as usize,
+                true,
+            )
         }
         _ => return,
     };
@@ -1477,7 +1465,7 @@ pub fn ale_flow_established_monitor(data: CalloutData) {
     // resolution so neither can produce false correlation errors, overwrite
     // attribution, or own application lifecycle state. Injection state is the
     // discriminator; a raw-socket flag alone would also match legitimate traffic.
-    if is_injected_outbound_transport_flow(device, &data) {
+    if is_injected_outbound_transport_flow(device, &data, direction_index, is_ipv6) {
         return;
     }
 
@@ -1514,14 +1502,22 @@ pub fn ale_flow_established_monitor(data: CalloutData) {
         // Refresh attribution before exposing the context to WFP: a flow can begin
         // terminating as soon as it has been associated. Use the same exact
         // instance selected above rather than a second tuple-only update.
-        if let Some(process_id) = process_id {
+        let process_id = data.get_process_id().unwrap_or(0);
+        if process_id != 0 {
             device.connection_cache.update_process_id_instance(
                 &key,
                 connection_instance_id,
                 process_id,
             );
         }
-        associate_udp_flow_context(device, &data, key, endpoint_handle, connection_instance_id);
+        associate_udp_flow_context(
+            device,
+            &data,
+            key,
+            process_id,
+            endpoint_handle,
+            connection_instance_id,
+        );
     } else {
         let Some(established_endpoint_handle) = transport_endpoint_handle(&data) else {
             crate::err!("established TCP flow has no endpoint handle: {}", key);
@@ -1560,7 +1556,7 @@ pub fn ale_flow_established_monitor(data: CalloutData) {
             return;
         };
 
-        if let Some(process_id) = process_id {
+        if let Some(process_id) = data.get_process_id().filter(|pid| *pid != 0) {
             device.connection_cache.update_process_id_instance(
                 &endpoint.key,
                 endpoint.instance_id,

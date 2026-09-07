@@ -1150,21 +1150,33 @@ impl Device {
     /// requests; every other packet is removed under the cache lock and any ALE
     /// operation is completed as blocked after the lock has been released.
     pub(crate) fn retire_pending_connection_instances(&self, instance_ids: &[u64]) {
+        if instance_ids.len() <= 1 {
+            if instance_ids.first().copied().unwrap_or(0) != 0 {
+                self.retire_sorted_pending_connection_instances(instance_ids);
+            }
+            return;
+        }
+
+        self.retire_pending_connection_instances_owned(instance_ids.to_vec());
+    }
+
+    /// Owned-input variant used by lifecycle paths that already collected IDs.
+    /// Sorting in place avoids cloning their temporary vector a second time.
+    pub(crate) fn retire_pending_connection_instances_owned(&self, mut instance_ids: Vec<u64>) {
+        instance_ids.retain(|instance_id| *instance_id != 0);
+        instance_ids.sort_unstable();
+        instance_ids.dedup();
         if instance_ids.is_empty() {
             return;
         }
 
-        let mut sorted_instance_ids = instance_ids.to_vec();
-        sorted_instance_ids.retain(|instance_id| *instance_id != 0);
-        sorted_instance_ids.sort_unstable();
-        sorted_instance_ids.dedup();
-        if sorted_instance_ids.is_empty() {
-            return;
-        }
+        self.retire_sorted_pending_connection_instances(&instance_ids);
+    }
 
+    fn retire_sorted_pending_connection_instances(&self, instance_ids: &[u64]) {
         let pending_packets = {
             let mut packet_cache = self.packet_cache.write_lock();
-            packet_cache.retire_connection_instances(&sorted_instance_ids)
+            packet_cache.retire_connection_instances(instance_ids)
         };
         for entry in pending_packets {
             let id = entry.id();
