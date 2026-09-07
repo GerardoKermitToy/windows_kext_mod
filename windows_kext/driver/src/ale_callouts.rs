@@ -286,8 +286,25 @@ fn track_udp_endpoint_instance(
     let Some(endpoint_handle) = endpoint_handle else {
         return;
     };
-    let mut endpoint_cache = device.udp_endpoint_cache.write_lock();
-    let _ = endpoint_cache.associate_instance(endpoint_handle, key, instance_id);
+
+    // Endpoint closure takes the same outer lock before ending connection state.
+    // Revalidate the instance while that lock is held, so closure cannot pass an
+    // empty endpoint cache and let a stale association be inserted afterwards.
+    let associated = {
+        let mut endpoint_cache = device.udp_endpoint_cache.write_lock();
+        device
+            .connection_cache
+            .with_live_connection_instance(&key, instance_id, |_| {
+                let _ = endpoint_cache.associate_instance(endpoint_handle, key, instance_id);
+                Some(())
+            })
+            .is_some()
+    };
+    if associated {
+        let _ = device
+            .connection_cache
+            .mark_connection_instance_tracked(&key, instance_id);
+    }
 }
 
 fn track_endpoint_instance(
@@ -423,7 +440,11 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
     if matches!(ale_data.protocol, IpProtocol::Udp)
         && matches!(ale_data.packet_direction, Direction::Outbound)
     {
-        match device.connection_cache.register_connection(
+        // Start as untracked. Endpoint association below promotes the exact live
+        // instance only after it has installed the identity needed by closure. If
+        // WFP omitted that metadata, the cached verdict remains usable but periodic
+        // cleanup gives the otherwise unbounded fallback state an idle lifetime.
+        match device.connection_cache.register_untracked_connection(
             &key,
             ale_data.process_id,
             ale_data.connection_direction,
@@ -593,12 +614,22 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
 
         // Register before publishing the request. The cache performs the live
         // lookup and insertion under one write guard, so a concurrent classify
-        // callback cannot create another live entry for this tuple.
-        let registration = match device.connection_cache.register_connection(
-            &key,
-            ale_data.process_id,
-            ale_data.connection_direction,
-        ) {
+        // callback cannot create another live entry for this tuple. UDP starts
+        // untracked and is promoted only after endpoint association succeeds.
+        let registration_result = if matches!(ale_data.protocol, IpProtocol::Udp) {
+            device.connection_cache.register_untracked_connection(
+                &key,
+                ale_data.process_id,
+                ale_data.connection_direction,
+            )
+        } else {
+            device.connection_cache.register_connection(
+                &key,
+                ale_data.process_id,
+                ale_data.connection_direction,
+            )
+        };
+        let registration = match registration_result {
             Ok(registration) => {
                 if registration.inserted {
                     crate::dbg!(
@@ -905,11 +936,12 @@ fn associate_udp_flow_context(
         .udp_flow_cache
         .mark_associated(flow_context, connection_instance_id)
     {
-        // Touch only the exact cache instance that received this context, so a
-        // concurrently reused tuple cannot record activity on its replacement.
+        // This WFP-owned context now provides an exact flowDeleteFn lifetime even
+        // when authorization omitted the transport endpoint handle. Promote only
+        // the same live cache generation; a reused tuple cannot inherit it.
         let _ = device
             .connection_cache
-            .touch_connection_instance(&key, connection_instance_id);
+            .mark_connection_instance_tracked(&key, connection_instance_id);
     }
 }
 
@@ -1128,6 +1160,54 @@ fn end_local_endpoint_v6(
     }
 }
 
+fn end_untracked_local_endpoint_v4(
+    device: &Device,
+    local_port: u16,
+    local_address: Option<IpAddress>,
+    process_id: u64,
+) {
+    if let Some(conns) = device.connection_cache.end_untracked_on_endpoint_v4(
+        (IpProtocol::Udp, local_port),
+        local_address,
+        (process_id != 0).then_some(process_id),
+    ) {
+        retire_pending_connections(device, &conns);
+        for conn in conns {
+            emit_connection_end_v4(device, conn, process_id);
+        }
+    }
+}
+
+fn end_untracked_local_endpoint_v6(
+    device: &Device,
+    local_port: u16,
+    local_address: Option<IpAddress>,
+    process_id: u64,
+) {
+    if let Some(conns) = device.connection_cache.end_untracked_on_endpoint_v6(
+        (IpProtocol::Udp, local_port),
+        local_address,
+        (process_id != 0).then_some(process_id),
+    ) {
+        retire_pending_connections(device, &conns);
+        for conn in conns {
+            emit_connection_end_v6(device, conn, process_id);
+        }
+    }
+}
+
+pub(crate) fn expire_inactive_untracked_connections(device: &Device) {
+    let (ended_v4, ended_v6) = device.connection_cache.end_inactive_untracked_connections();
+    retire_pending_connections(device, &ended_v4);
+    retire_pending_connections(device, &ended_v6);
+    for conn in ended_v4 {
+        emit_connection_end_v4(device, conn, 0);
+    }
+    for conn in ended_v6 {
+        emit_connection_end_v6(device, conn, 0);
+    }
+}
+
 pub fn endpoint_closure_v4(mut data: CalloutData) {
     type Fields = layer::FieldsAleEndpointClosureV4;
     let Some(device) = crate::entry::get_device() else {
@@ -1158,25 +1238,29 @@ pub fn endpoint_closure_v4(mut data: CalloutData) {
             }
         }
         Some(IpProtocol::Udp) => {
-            // UDP closure is socket-level and may omit its remote tuple. A
-            // concrete endpoint handle is authoritative: consume its exact peers
-            // when tracked and otherwise ignore the indication. Falling back by
-            // local port for an unknown handle could end a replacement socket.
+            // UDP closure is socket-level and may omit its remote tuple. A concrete
+            // endpoint handle ends exact tracked peers. Packet-layer fallbacks have
+            // no handle by definition, so also end only those untracked entries by
+            // the closure's local endpoint; tracked replacements remain protected.
+            let local_port = get_u16_if_present(&data, Fields::IpLocalPort as usize);
+            let local_address = get_ipv4_address_if_present(&data, Fields::IpLocalAddress as usize);
             if let Some(endpoint_handle) = endpoint_handle {
                 let _ = end_udp_endpoint(device, endpoint_handle, process_id);
+                if let Some(local_port) = local_port {
+                    end_untracked_local_endpoint_v4(device, local_port, local_address, process_id);
+                }
                 return;
             }
 
-            let Some(local_port) = get_u16_if_present(&data, Fields::IpLocalPort as usize) else {
-                return;
-            };
-            end_local_endpoint_v4(
-                device,
-                IpProtocol::Udp,
-                local_port,
-                get_ipv4_address_if_present(&data, Fields::IpLocalAddress as usize),
-                process_id,
-            );
+            if let Some(local_port) = local_port {
+                end_local_endpoint_v4(
+                    device,
+                    IpProtocol::Udp,
+                    local_port,
+                    local_address,
+                    process_id,
+                );
+            }
         }
         None => {
             // A generic closure may omit the protocol. Endpoint handles remain
@@ -1222,21 +1306,25 @@ pub fn endpoint_closure_v6(mut data: CalloutData) {
             }
         }
         Some(IpProtocol::Udp) => {
+            let local_port = get_u16_if_present(&data, Fields::IpLocalPort as usize);
+            let local_address = get_ipv6_address_if_present(&data, Fields::IpLocalAddress as usize);
             if let Some(endpoint_handle) = endpoint_handle {
                 let _ = end_udp_endpoint(device, endpoint_handle, process_id);
+                if let Some(local_port) = local_port {
+                    end_untracked_local_endpoint_v6(device, local_port, local_address, process_id);
+                }
                 return;
             }
 
-            let Some(local_port) = get_u16_if_present(&data, Fields::IpLocalPort as usize) else {
-                return;
-            };
-            end_local_endpoint_v6(
-                device,
-                IpProtocol::Udp,
-                local_port,
-                get_ipv6_address_if_present(&data, Fields::IpLocalAddress as usize),
-                process_id,
-            );
+            if let Some(local_port) = local_port {
+                end_local_endpoint_v6(
+                    device,
+                    IpProtocol::Udp,
+                    local_port,
+                    local_address,
+                    process_id,
+                );
+            }
         }
         None => {
             if let Some(endpoint_handle) = endpoint_handle {
@@ -1395,16 +1483,24 @@ pub fn ale_flow_established_monitor(data: CalloutData) {
 
     if matches!(key.protocol, IpProtocol::Udp) {
         let endpoint_handle = transport_endpoint_handle(&data);
-        // Authorization records the exact cache instance under the endpoint
-        // handle. Resolve and validate it while both endpoint and connection
-        // guards are held, so endpoint closure cannot turn an old flow callback
-        // into a tuple-only match against a replacement connection.
+        // Authorization normally records the exact cache instance under the
+        // endpoint handle. A packet-layer fallback has no such association yet;
+        // FLOW_ESTABLISHED is its one safe opportunity to acquire the endpoint and
+        // native flow identity. Only an explicitly untracked exact tuple may use
+        // that fallback, so a tracked replacement is never claimed by lookup alone.
         let connection_instance_id = if let Some(endpoint_handle) = endpoint_handle {
-            let endpoint_cache = device.udp_endpoint_cache.read_lock();
-            endpoint_cache.with_instance_id(endpoint_handle, &key, |instance_id| {
+            let associated = {
+                let endpoint_cache = device.udp_endpoint_cache.read_lock();
+                endpoint_cache.with_instance_id(endpoint_handle, &key, |instance_id| {
+                    device
+                        .connection_cache
+                        .with_live_connection_instance(&key, instance_id, Some)
+                })
+            };
+            associated.or_else(|| {
                 device
                     .connection_cache
-                    .with_live_connection_instance(&key, instance_id, Some)
+                    .get_untracked_connection_instance_id(&key)
             })
         } else {
             device.connection_cache.get_connection_instance_id(&key)
@@ -1412,6 +1508,8 @@ pub fn ale_flow_established_monitor(data: CalloutData) {
         let Some(connection_instance_id) = connection_instance_id else {
             return;
         };
+
+        track_udp_endpoint_instance(device, endpoint_handle, key, connection_instance_id);
 
         // Refresh attribution before exposing the context to WFP: a flow can begin
         // terminating as soon as it has been associated. Use the same exact

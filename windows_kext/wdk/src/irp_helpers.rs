@@ -367,6 +367,14 @@ impl WriteRequest {
     pub fn fail(&mut self, status: NTSTATUS) -> NTSTATUS {
         self.irp.complete(status, 0)
     }
+
+    pub fn fail_with_bytes_consumed(
+        &mut self,
+        status: NTSTATUS,
+        bytes_consumed: usize,
+    ) -> NTSTATUS {
+        self.irp.complete(status, bytes_consumed.min(self.buffer_len))
+    }
 }
 
 pub struct DeviceControlRequest {

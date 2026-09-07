@@ -547,10 +547,11 @@ fn ip_packet_layer(
             } else {
                 // An outbound TCP/UDP packet should normally have been registered at
                 // ALE_AUTH_CONNECT. Preserve the defensive fallback for packets that
-                // reach this layer without a cache entry.
+                // reach this layer without a cache entry, but mark it untracked: this
+                // layer exposes no endpoint identity that could retire it on closure.
                 process_id = 0;
 
-                match device.connection_cache.register_connection(
+                match device.connection_cache.register_untracked_connection(
                     &key,
                     process_id,
                     effective_direction,
@@ -559,7 +560,7 @@ fn ip_packet_layer(
                         connection_instance_id = Some(registration.instance_id);
                         if registration.inserted {
                             crate::dbg!(
-                                "packet layer added connection: {} PID: {}",
+                                "packet layer added untracked connection: {} PID: {}",
                                 key,
                                 process_id
                             );

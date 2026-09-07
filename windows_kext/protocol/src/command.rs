@@ -112,7 +112,43 @@ pub fn parse_type(bytes: &[u8]) -> Option<CommandType> {
         .and_then(|value| CommandType::from_u8(value))
 }
 
-/// Checks that a write contains exactly one complete command payload.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommandParseError {
+    Empty,
+    UnknownType(u8),
+    TruncatedPayload {
+        command: CommandType,
+        expected: usize,
+        actual: usize,
+    },
+}
+
+/// Splits the first complete command from a buffer of concatenated commands.
+///
+/// Command payload sizes are fixed by [`CommandType`], so no additional batch
+/// header or per-command length field is required.
+pub fn split_first_command(bytes: &[u8]) -> Result<(CommandType, &[u8], &[u8]), CommandParseError> {
+    let Some(value) = bytes.first().copied() else {
+        return Err(CommandParseError::Empty);
+    };
+    let Some(command) = CommandType::from_u8(value) else {
+        return Err(CommandParseError::UnknownType(value));
+    };
+
+    let expected = command.payload_size();
+    let payload_end = 1 + expected;
+    if bytes.len() < payload_end {
+        return Err(CommandParseError::TruncatedPayload {
+            command,
+            expected,
+            actual: bytes.len() - 1,
+        });
+    }
+
+    Ok((command, &bytes[1..payload_end], &bytes[payload_end..]))
+}
+
+/// Checks that a slice contains exactly one complete command payload.
 pub fn has_valid_payload_length(command: CommandType, payload: &[u8]) -> bool {
     payload.len() == command.payload_size()
 }
@@ -258,6 +294,49 @@ fn rejects_empty_and_wrong_sized_payloads() {
     assert!(parse_update_v6(&[0; UPDATE_V6_PAYLOAD_SIZE - 1]).is_none());
     assert!(!has_valid_payload_length(CommandType::Shutdown, &[0]));
     assert!(has_valid_payload_length(CommandType::Shutdown, &[]));
+}
+
+#[test]
+fn splits_concatenated_commands() {
+    let mut batch = vec![CommandType::GetLogs as u8, CommandType::Verdict as u8];
+    batch.extend_from_slice(&[0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x02]);
+    batch.push(CommandType::ClearCache as u8);
+
+    let (command, payload, remaining) = split_first_command(&batch).unwrap();
+    assert_eq!(command, CommandType::GetLogs);
+    assert!(payload.is_empty());
+
+    let (command, payload, remaining) = split_first_command(remaining).unwrap();
+    assert_eq!(command, CommandType::Verdict);
+    assert_eq!(
+        parse_verdict(payload),
+        Some(Verdict {
+            id: 0x0102_0304_0506_0708,
+            verdict: 2,
+        })
+    );
+
+    let (command, payload, remaining) = split_first_command(remaining).unwrap();
+    assert_eq!(command, CommandType::ClearCache);
+    assert!(payload.is_empty());
+    assert!(remaining.is_empty());
+}
+
+#[test]
+fn rejects_invalid_command_boundaries() {
+    assert_eq!(split_first_command(&[]), Err(CommandParseError::Empty));
+    assert_eq!(
+        split_first_command(&[0xff]),
+        Err(CommandParseError::UnknownType(0xff))
+    );
+    assert_eq!(
+        split_first_command(&[CommandType::Verdict as u8, 1, 2, 3]),
+        Err(CommandParseError::TruncatedPayload {
+            command: CommandType::Verdict,
+            expected: VERDICT_PAYLOAD_SIZE,
+            actual: 3,
+        })
+    );
 }
 
 #[test]

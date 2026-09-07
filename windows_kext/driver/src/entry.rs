@@ -707,12 +707,16 @@ unsafe extern "system" fn driver_write(
 
     match device.write(&write_request) {
         Ok(()) => {
-            // Report the input as consumed only after the complete command has
-            // been validated and accepted by Device::write.
+            // Report the complete input as consumed only when every command in the
+            // buffer has been parsed and applied successfully.
             write_request.mark_all_as_read();
             write_request.complete()
         }
-        Err(status) => write_request.fail(status),
+        Err(error) => {
+            // Commands before the failing record have already taken effect. Preserve
+            // their exact byte count in IoStatus.Information for the caller.
+            write_request.fail_with_bytes_consumed(error.status, error.bytes_processed)
+        }
     }
 }
 

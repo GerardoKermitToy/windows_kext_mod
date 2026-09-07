@@ -387,8 +387,8 @@ bool Driver::SendCommand(const uint8_t* data, size_t len, std::string& error) {
         return false;
     }
     // Writes come from both the polling thread and the Ctrl+C handler while the
-    // reader thread sits blocked in the driver. Serialise them so two commands
-    // never interleave in the driver's single-command-per-write parser.
+    // reader thread sits blocked in the driver. Serialise them to preserve command
+    // ordering; each buffer may contain one or more complete command records.
     std::lock_guard<std::mutex> guard(write_mutex_);
 
     Overlap ov;

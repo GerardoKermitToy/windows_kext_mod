@@ -123,6 +123,32 @@ where
     (None, ended_match)
 }
 
+const UNTRACKED_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+fn should_expire_untracked<T: Connection>(connection: &T, cutoff: u64) -> bool {
+    !connection.has_ended()
+        && !connection.has_native_lifecycle()
+        && matches!(connection.get_direction(), Direction::Outbound)
+        && connection.get_last_accessed_time() < cutoff
+}
+
+fn matches_endpoint<T: Connection>(
+    connection: &T,
+    local_address: Option<IpAddress>,
+    process_id: Option<u64>,
+    untracked_only: bool,
+) -> bool {
+    let address_matches = local_address
+        .map(|address| connection.get_local_address() == address)
+        .unwrap_or(true);
+    let process_matches = process_id
+        .map(|pid| connection.get_process_id() == 0 || connection.get_process_id() == pid)
+        .unwrap_or(true);
+    let lifecycle_matches = !untracked_only || !connection.has_native_lifecycle();
+
+    !connection.has_ended() && address_matches && process_matches && lifecycle_matches
+}
+
 #[inline]
 fn get_monotonic_timestamp_ms() -> u64 {
     #[cfg(not(test))]
@@ -200,6 +226,20 @@ impl<T: Connection + Clone> ConnectionMap<T> {
         }
 
         None
+    }
+
+    /// Returns the live fallback instance for an exact tuple, if one exists.
+    /// This does not refresh activity; a caller that successfully binds native
+    /// lifecycle state performs the exact-instance update separately.
+    pub fn untracked_instance_id(&self, key: &Key) -> Option<u64> {
+        let connections = self.0.get(&key.small())?;
+        let range = equal_range(connections, (key.remote_address, key.remote_port));
+        connections[range]
+            .iter()
+            .find(|conn| {
+                conn.remote_equals(key) && !conn.has_ended() && !conn.has_native_lifecycle()
+            })
+            .map(Connection::get_instance_id)
     }
 
     /// Returns whether one exact connection-cache instance is still live.
@@ -377,8 +417,8 @@ impl<T: Connection + Clone> ConnectionMap<T> {
         None
     }
 
-    /// Refreshes one exact live cache instance.
-    pub fn touch_instance(&mut self, key: &Key, instance_id: u64) -> bool {
+    /// Binds native endpoint/flow lifetime to one exact live fallback instance.
+    pub fn mark_native_lifecycle_instance(&mut self, key: &Key, instance_id: u64) -> bool {
         if let Some(connections) = self.0.get_mut(&key.small()) {
             let range = equal_range(connections, (key.remote_address, key.remote_port));
             for conn in &mut connections[range] {
@@ -387,6 +427,7 @@ impl<T: Connection + Clone> ConnectionMap<T> {
                     && !conn.has_ended()
                 {
                     conn.set_last_accessed_time(get_monotonic_timestamp_ms());
+                    conn.mark_native_lifecycle();
                     return true;
                 }
             }
@@ -433,24 +474,80 @@ impl<T: Connection + Clone> ConnectionMap<T> {
         local_address: Option<IpAddress>,
         process_id: Option<u64>,
     ) -> Option<Vec<T>> {
-        if let Some(connections) = self.0.get_mut(&key) {
-            let mut vec = Vec::with_capacity(connections.len());
-            for conn in connections.iter_mut() {
-                let address_matches = local_address
-                    .map(|address| conn.get_local_address() == address)
-                    .unwrap_or(true);
-                let process_matches = process_id
-                    .map(|pid| conn.get_process_id() == 0 || conn.get_process_id() == pid)
-                    .unwrap_or(true);
+        self.end_matching_on_endpoint(key, local_address, process_id, false)
+    }
 
-                if !conn.has_ended() && address_matches && process_matches {
-                    conn.end(get_monotonic_timestamp_ms());
+    /// Ends only fallback entries that lack native endpoint/flow identity.
+    ///
+    /// A closure carrying an unknown endpoint handle cannot safely end tracked
+    /// generations by tuple, because that handle may belong to an older socket.
+    /// Untracked entries have no stronger identity available, so the closure's
+    /// local endpoint is their authoritative best-effort lifetime signal.
+    pub fn end_untracked_on_endpoint(
+        &mut self,
+        key: (IpProtocol, u16),
+        local_address: Option<IpAddress>,
+        process_id: Option<u64>,
+    ) -> Option<Vec<T>> {
+        self.end_matching_on_endpoint(key, local_address, process_id, true)
+    }
+
+    fn end_matching_on_endpoint(
+        &mut self,
+        key: (IpProtocol, u16),
+        local_address: Option<IpAddress>,
+        process_id: Option<u64>,
+        untracked_only: bool,
+    ) -> Option<Vec<T>> {
+        if let Some(connections) = self.0.get_mut(&key) {
+            let count = connections
+                .iter()
+                .filter(|connection| {
+                    matches_endpoint(*connection, local_address, process_id, untracked_only)
+                })
+                .count();
+            let mut vec = Vec::with_capacity(count);
+            let timestamp = get_monotonic_timestamp_ms();
+            for conn in connections.iter_mut() {
+                if matches_endpoint(conn, local_address, process_id, untracked_only) {
+                    conn.end(timestamp);
                     vec.push(conn.clone());
                 }
             }
             return Some(vec);
         }
-        return None;
+        None
+    }
+
+    /// Ends outbound fallback entries not observed for one minute.
+    ///
+    /// Native endpoint and flow callbacks remain authoritative for tracked state.
+    /// Inbound fallbacks are not idle-expired: after ALE authorizes their flow, a
+    /// later packet might not revisit ALE and must continue to find cached policy.
+    pub fn end_inactive_untracked_connections(&mut self) -> Vec<T> {
+        let now = get_monotonic_timestamp_ms();
+        let cutoff = now.saturating_sub(UNTRACKED_IDLE_TIMEOUT.as_millis() as u64);
+        let count = self
+            .0
+            .values()
+            .map(|connections| {
+                connections
+                    .iter()
+                    .filter(|connection| should_expire_untracked(*connection, cutoff))
+                    .count()
+            })
+            .sum();
+        let mut ended = Vec::with_capacity(count);
+
+        for connections in self.0.values_mut() {
+            for conn in connections.iter_mut() {
+                if should_expire_untracked(conn, cutoff) {
+                    conn.end(now);
+                    ended.push(conn.clone());
+                }
+            }
+        }
+        ended
     }
 
     pub fn clear(&mut self) {
@@ -469,6 +566,13 @@ impl<T: Connection + Clone> ConnectionMap<T> {
             // `retain` preserves the relative order of the entries it keeps, so
             // the sort order the lookups depend on survives the sweep.
             connections.retain(|c| !c.has_ended() || c.get_end_time() >= before_one_minute);
+            // A listener can leave a large high-water vector after thousands of
+            // remote tuples end. Empty vectors are dropped with their map entry
+            // below; release excess capacity for a bucket that still has a few
+            // live peers instead of retaining the scan-sized allocation forever.
+            if !connections.is_empty() && connections.len() <= connections.capacity() / 4 {
+                connections.shrink_to_fit();
+            }
         }
         self.0.retain(|_, v| !v.is_empty());
     }
@@ -495,6 +599,14 @@ impl<T: Connection + Clone> ConnectionMap<T> {
         }
         return count;
     }
+
+    pub fn get_untracked_count(&self) -> usize {
+        self.0
+            .values()
+            .flat_map(|connections| connections.iter())
+            .filter(|connection| !connection.has_ended() && !connection.has_native_lifecycle())
+            .count()
+    }
 }
 
 #[cfg(test)]
@@ -516,6 +628,10 @@ mod tests {
 
     fn live(key: &Key, process_id: u64) -> ConnectionV4 {
         ConnectionV4::from_key(key, process_id, Direction::Outbound).expect("IPv4 key")
+    }
+
+    fn untracked(key: &Key, process_id: u64) -> ConnectionV4 {
+        ConnectionV4::from_untracked_key(key, process_id, Direction::Outbound).expect("IPv4 key")
     }
 
     fn ended(key: &Key, process_id: u64) -> ConnectionV4 {
@@ -683,6 +799,57 @@ mod tests {
     }
 
     #[test]
+    fn inactive_untracked_udp_ends_without_expiring_tracked_peer() {
+        let fallback_tuple = key([203, 0, 113, 2], 443);
+        let tracked_tuple = key([203, 0, 113, 3], 443);
+        let mut map = ConnectionMap::new();
+        map.add(untracked(&fallback_tuple, 0));
+        map.add(live(&tracked_tuple, 20));
+
+        let ended = map.end_inactive_untracked_connections();
+
+        assert_eq!(ended.len(), 1);
+        assert!(ended[0].has_ended());
+        assert!(ended[0].get_key() == fallback_tuple);
+        assert_eq!(map.read(&fallback_tuple, read_process_id), None);
+        assert_eq!(map.read(&tracked_tuple, read_process_id), Some(20));
+    }
+
+    #[test]
+    fn inactive_untracked_inbound_waits_for_socket_closure() {
+        let tuple = key([203, 0, 113, 4], 443);
+        let connection =
+            ConnectionV4::from_untracked_key(&tuple, 20, Direction::Inbound).expect("IPv4 key");
+        let mut map = ConnectionMap::new();
+        map.add(connection);
+
+        assert!(map.end_inactive_untracked_connections().is_empty());
+        assert_eq!(map.read(&tuple, read_process_id), Some(20));
+    }
+
+    #[test]
+    fn endpoint_closure_ends_only_untracked_fallbacks() {
+        let fallback_tuple = key([203, 0, 113, 2], 443);
+        let tracked_tuple = key([203, 0, 113, 3], 443);
+        let mut map = ConnectionMap::new();
+        map.add(untracked(&fallback_tuple, 0));
+        map.add(live(&tracked_tuple, 20));
+
+        let ended = map
+            .end_untracked_on_endpoint(
+                (IpProtocol::Udp, fallback_tuple.local_port),
+                Some(fallback_tuple.local_address),
+                Some(20),
+            )
+            .expect("local endpoint bucket");
+
+        assert_eq!(ended.len(), 1);
+        assert!(ended[0].get_key() == fallback_tuple);
+        assert_eq!(map.read(&fallback_tuple, read_process_id), None);
+        assert_eq!(map.read(&tracked_tuple, read_process_id), Some(20));
+    }
+
+    #[test]
     fn cleanup_keeps_inactive_live_tcp_until_lifecycle_end() {
         let mut tuple = key([203, 0, 113, 4], 443);
         tuple.protocol = IpProtocol::Tcp;
@@ -708,6 +875,30 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_releases_scan_sized_capacity_while_bucket_remains() {
+        let live_tuple = key([203, 0, 113, 255], 443);
+        let mut map = ConnectionMap::new();
+        for last_octet in 1..=64 {
+            map.add(ended(&key([203, 0, 113, last_octet], 443), 10));
+        }
+        map.add(live(&live_tuple, 20));
+        let bucket_key = live_tuple.small();
+        let capacity_before = map
+            .0
+            .get(&bucket_key)
+            .expect("connection bucket")
+            .capacity();
+        assert!(capacity_before >= 65);
+
+        map.clean_ended_connections();
+
+        let connections = map.0.get(&bucket_key).expect("live connection bucket");
+        assert_eq!(connections.len(), 1);
+        assert!(connections.capacity() < capacity_before);
+        assert_eq!(map.read(&live_tuple, read_process_id), Some(20));
+    }
+
+    #[test]
     fn stale_flow_instance_cannot_end_reused_tuple() {
         let tuple = key([198, 51, 100, 1], 443);
         let old = live(&tuple, 10);
@@ -722,14 +913,15 @@ mod tests {
     }
 
     #[test]
-    fn exact_live_instance_can_be_touched() {
+    fn exact_live_fallback_can_acquire_native_lifecycle() {
         let tuple = key([198, 51, 100, 3], 443);
-        let conn = live(&tuple, 10);
+        let conn = untracked(&tuple, 10);
         let instance_id = conn.get_instance_id();
         let mut map = ConnectionMap::new();
         map.add(conn);
 
-        assert!(map.touch_instance(&tuple, instance_id));
+        assert!(map.mark_native_lifecycle_instance(&tuple, instance_id));
+        assert!(map.end_inactive_untracked_connections().is_empty());
         assert_eq!(map.get_count(), 1);
     }
 
@@ -791,17 +983,17 @@ mod tests {
     }
 
     #[test]
-    fn stale_instance_cannot_refresh_reused_tuple() {
+    fn stale_instance_cannot_promote_reused_tuple() {
         let tuple = key([198, 51, 100, 2], 443);
-        let old = live(&tuple, 10);
+        let old = untracked(&tuple, 10);
         let old_instance_id = old.get_instance_id();
         let mut map = ConnectionMap::new();
         map.add(old);
         map.clear();
-        map.add(live(&tuple, 20));
+        map.add(untracked(&tuple, 20));
 
-        assert!(!map.touch_instance(&tuple, old_instance_id));
-        assert_eq!(map.read(&tuple, read_process_id), Some(20));
+        assert!(!map.mark_native_lifecycle_instance(&tuple, old_instance_id));
+        assert_eq!(map.end_inactive_untracked_connections().len(), 1);
     }
 
     #[test]

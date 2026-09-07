@@ -4,7 +4,10 @@ use core::{
     sync::atomic::{AtomicPtr, AtomicU32, Ordering},
 };
 use num_traits::FromPrimitive;
-use protocol::{command::CommandType, info::Info};
+use protocol::{
+    command::{CommandParseError, CommandType},
+    info::Info,
+};
 use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Address, Ipv6Address};
 use wdk::{
     driver::Driver,
@@ -80,6 +83,20 @@ struct PendingRequestGuard<'a> {
 impl Drop for PendingRequestGuard<'_> {
     fn drop(&mut self) {
         self.device.finish_pending_request(self.id);
+    }
+}
+
+pub(crate) struct CommandWriteError {
+    pub(crate) status: NTSTATUS,
+    pub(crate) bytes_processed: usize,
+}
+
+impl CommandWriteError {
+    fn new(status: NTSTATUS, bytes_processed: usize) -> Self {
+        Self {
+            status,
+            bytes_processed,
+        }
     }
 }
 
@@ -332,29 +349,57 @@ impl Device {
         read_request.complete()
     }
 
-    /// Applies exactly one command supplied by a user-mode WriteFile request.
-    /// Malformed commands fail without consuming input bytes or mutating state.
-    pub fn write(&self, write_request: &WriteRequest) -> Result<(), NTSTATUS> {
-        // Every WriteFile contains exactly one command. Validate the command byte
-        // and complete payload before reading any field from user-controlled data.
-        let buffer = write_request.get_buffer();
-        let Some(command) = protocol::command::parse_type(buffer) else {
-            match buffer.first() {
-                Some(command) => err!("Unknown command number: {}", command),
-                None => err!("Rejecting empty command write"),
-            }
-            return Err(STATUS_INVALID_PARAMETER);
-        };
-        let payload = &buffer[1..];
-        if !protocol::command::has_valid_payload_length(command, payload) {
-            err!(
-                "Invalid command payload length: expected {}, received {}",
-                command.payload_size(),
-                payload.len()
-            );
-            return Err(STATUS_INVALID_PARAMETER);
+    /// Applies commands in buffer order until the write is exhausted or one is invalid.
+    /// Commands completed before an error remain applied.
+    pub(crate) fn write(
+        &self,
+        write_request: &WriteRequest,
+    ) -> Result<(), CommandWriteError> {
+        let mut remaining = write_request.get_buffer();
+        if remaining.is_empty() {
+            err!("Rejecting empty command write");
+            return Err(CommandWriteError::new(STATUS_INVALID_PARAMETER, 0));
         }
 
+        let mut offset = 0;
+        while !remaining.is_empty() {
+            let (command, payload, next) = match protocol::command::split_first_command(remaining) {
+                Ok(command) => command,
+                Err(CommandParseError::Empty) => {
+                    err!("Missing command at byte {}", offset);
+                    return Err(CommandWriteError::new(STATUS_INVALID_PARAMETER, offset));
+                }
+                Err(CommandParseError::UnknownType(command)) => {
+                    err!("Unknown command number {} at byte {}", command, offset);
+                    return Err(CommandWriteError::new(STATUS_INVALID_PARAMETER, offset));
+                }
+                Err(CommandParseError::TruncatedPayload {
+                    command,
+                    expected,
+                    actual,
+                }) => {
+                    err!(
+                        "Truncated {:?} command at byte {}: expected {} payload bytes, received {}",
+                        command,
+                        offset,
+                        expected,
+                        actual
+                    );
+                    return Err(CommandWriteError::new(STATUS_INVALID_PARAMETER, offset));
+                }
+            };
+
+            if let Err(status) = self.apply_command(command, payload) {
+                return Err(CommandWriteError::new(status, offset));
+            }
+            offset += 1 + payload.len();
+            remaining = next;
+        }
+
+        Ok(())
+    }
+
+    fn apply_command(&self, command: CommandType, payload: &[u8]) -> Result<(), NTSTATUS> {
         match command {
             CommandType::Shutdown => {
                 wdk::dbg!("Shutdown command");
@@ -370,9 +415,8 @@ impl Device {
                 let Some(action): Option<crate::connection::Verdict> =
                     FromPrimitive::from_u8(verdict.verdict)
                 else {
-                    // Validate the action before consuming the pending packet. A
-                    // malformed command must not mutate driver state before its
-                    // WriteFile request is failed.
+                    // Validate the action before consuming this command's pending
+                    // packet. Earlier commands from the same write remain applied.
                     err!("invalid verdict value: {}", verdict.verdict);
                     return Err(STATUS_INVALID_PARAMETER);
                 };
@@ -605,6 +649,8 @@ impl Device {
                 };
                 let (connection_v4_entries, connection_v6_entries) =
                     self.connection_cache.get_entries_counts();
+                let (untracked_connection_v4_entries, untracked_connection_v6_entries) =
+                    self.connection_cache.get_untracked_entries_counts();
                 let (bandwidth_tcp_v4, bandwidth_tcp_v6, bandwidth_udp_v4, bandwidth_udp_v6) =
                     self.bandwidth_stats.get_entries_counts();
                 let tcp_endpoint_entries = {
@@ -633,6 +679,11 @@ impl Device {
                     connection_v6_entries
                 );
                 crate::err!(
+                    "Untracked connection cache: IPv4 {} entries, IPv6 {} entries",
+                    untracked_connection_v4_entries,
+                    untracked_connection_v6_entries
+                );
+                crate::err!(
                     "BandwidthStats cache: TCPv4 {}, TCPv6 {}, UDPv4 {}, UDPv6 {} entries",
                     bandwidth_tcp_v4,
                     bandwidth_tcp_v6,
@@ -659,6 +710,11 @@ impl Device {
             CommandType::CleanEndedConnections => {
                 wdk::dbg!("CleanEndedConnections command");
                 self.connection_cache.clean_ended_connections();
+                // An outbound packet-layer fallback has no native endpoint identity
+                // and can therefore receive no exact closure callback. End it after
+                // one inactive minute and emit the same lifecycle event as native WFP
+                // teardown. Tracked and inbound connections remain exempt.
+                crate::ale_callouts::expire_inactive_untracked_connections(self);
                 // Reconcile endpoint and flow bookkeeping for connection instances
                 // that native lifecycle callbacks have already ended. Removing a WFP
                 // callout context does not close the UDP socket or flow; it merely asks

@@ -1,7 +1,4 @@
-use alloc::{
-    boxed::Box,
-    string::{String, ToString},
-};
+use alloc::string::{String, ToString};
 use core::{
     fmt::{Debug, Display},
     sync::atomic::{AtomicU64, Ordering},
@@ -121,6 +118,10 @@ impl Debug for Direction {
 pub struct ConnectionExtra {
     pub(crate) end_timestamp: u64,
     pub(crate) direction: Direction,
+    /// True when a native WFP endpoint or flow can identify this exact cache
+    /// generation and report when it ends. Outbound packet-layer fallback entries
+    /// have no such identity and are expired by periodic cleanup instead.
+    pub(crate) native_lifecycle: bool,
 }
 
 pub trait Connection {
@@ -219,8 +220,14 @@ pub trait Connection {
     }
     /// Returns the timestamp when the connection ended.
     fn get_end_time(&self) -> u64;
+    /// Returns the timestamp when the connection was last accessed.
+    fn get_last_accessed_time(&self) -> u64;
     /// Sets the timestamp when the connection was last accessed.
     fn set_last_accessed_time(&self, timestamp: u64);
+    /// Returns whether native WFP state can report this connection's end.
+    fn has_native_lifecycle(&self) -> bool;
+    /// Marks a fallback entry as owned by a native WFP lifecycle association.
+    fn mark_native_lifecycle(&mut self);
 }
 
 pub struct ConnectionV4 {
@@ -233,7 +240,7 @@ pub struct ConnectionV4 {
     pub(crate) process_id: u64,
     pub(crate) instance_id: u64,
     pub(crate) last_accessed_timestamp: AtomicU64,
-    pub(crate) extra: Box<ConnectionExtra>,
+    pub(crate) extra: ConnectionExtra,
 }
 
 pub struct ConnectionV6 {
@@ -246,7 +253,7 @@ pub struct ConnectionV6 {
     pub(crate) process_id: u64,
     pub(crate) instance_id: u64,
     pub(crate) last_accessed_timestamp: AtomicU64,
-    pub(crate) extra: Box<ConnectionExtra>,
+    pub(crate) extra: ConnectionExtra,
 }
 
 #[derive(Debug)]
@@ -262,6 +269,23 @@ pub struct RedirectInfo {
 impl ConnectionV4 {
     /// Creates a new ipv4 connection from the given key.
     pub fn from_key(key: &Key, process_id: u64, direction: Direction) -> Result<Self, String> {
+        Self::from_key_with_lifecycle(key, process_id, direction, true)
+    }
+
+    pub(crate) fn from_untracked_key(
+        key: &Key,
+        process_id: u64,
+        direction: Direction,
+    ) -> Result<Self, String> {
+        Self::from_key_with_lifecycle(key, process_id, direction, false)
+    }
+
+    fn from_key_with_lifecycle(
+        key: &Key,
+        process_id: u64,
+        direction: Direction,
+        native_lifecycle: bool,
+    ) -> Result<Self, String> {
         let IpAddress::Ipv4(local_address) = key.local_address else {
             return Err("wrong ip address version".to_string());
         };
@@ -282,10 +306,11 @@ impl ConnectionV4 {
             process_id,
             instance_id: next_connection_instance_id(),
             last_accessed_timestamp: AtomicU64::new(timestamp),
-            extra: Box::new(ConnectionExtra {
+            extra: ConnectionExtra {
                 direction,
                 end_timestamp: 0,
-            }),
+                native_lifecycle,
+            },
         })
     }
 }
@@ -397,9 +422,21 @@ impl Connection for ConnectionV4 {
         self.extra.end_timestamp
     }
 
+    fn get_last_accessed_time(&self) -> u64 {
+        self.last_accessed_timestamp.load(Ordering::Relaxed)
+    }
+
     fn set_last_accessed_time(&self, timestamp: u64) {
         self.last_accessed_timestamp
             .store(timestamp, Ordering::Relaxed);
+    }
+
+    fn has_native_lifecycle(&self) -> bool {
+        self.extra.native_lifecycle
+    }
+
+    fn mark_native_lifecycle(&mut self) {
+        self.extra.native_lifecycle = true;
     }
 }
 
@@ -425,6 +462,23 @@ impl Clone for ConnectionV4 {
 impl ConnectionV6 {
     /// Creates a new ipv6 connection from the given key.
     pub fn from_key(key: &Key, process_id: u64, direction: Direction) -> Result<Self, String> {
+        Self::from_key_with_lifecycle(key, process_id, direction, true)
+    }
+
+    pub(crate) fn from_untracked_key(
+        key: &Key,
+        process_id: u64,
+        direction: Direction,
+    ) -> Result<Self, String> {
+        Self::from_key_with_lifecycle(key, process_id, direction, false)
+    }
+
+    fn from_key_with_lifecycle(
+        key: &Key,
+        process_id: u64,
+        direction: Direction,
+        native_lifecycle: bool,
+    ) -> Result<Self, String> {
         let IpAddress::Ipv6(local_address) = key.local_address else {
             return Err("wrong ip address version".to_string());
         };
@@ -444,10 +498,11 @@ impl ConnectionV6 {
             process_id,
             instance_id: next_connection_instance_id(),
             last_accessed_timestamp: AtomicU64::new(timestamp),
-            extra: Box::new(ConnectionExtra {
+            extra: ConnectionExtra {
                 direction,
                 end_timestamp: 0,
-            }),
+                native_lifecycle,
+            },
         })
     }
 }
@@ -558,9 +613,21 @@ impl Connection for ConnectionV6 {
         self.extra.end_timestamp
     }
 
+    fn get_last_accessed_time(&self) -> u64 {
+        self.last_accessed_timestamp.load(Ordering::Relaxed)
+    }
+
     fn set_last_accessed_time(&self, timestamp: u64) {
         self.last_accessed_timestamp
             .store(timestamp, Ordering::Relaxed);
+    }
+
+    fn has_native_lifecycle(&self) -> bool {
+        self.extra.native_lifecycle
+    }
+
+    fn mark_native_lifecycle(&mut self) {
+        self.extra.native_lifecycle = true;
     }
 }
 

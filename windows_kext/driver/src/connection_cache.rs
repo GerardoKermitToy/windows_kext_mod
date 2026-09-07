@@ -88,11 +88,42 @@ impl ConnectionCache {
         process_id: u64,
         direction: Direction,
     ) -> Result<ConnectionRegistration, String> {
+        self.register_connection_with_lifecycle(key, process_id, direction, true)
+    }
+
+    /// Registers a fallback connection for which WFP exposed no endpoint identity.
+    /// Its verdict remains cacheable. Outbound fallbacks are idle-expired because no
+    /// native callback can identify their exact lifetime; inbound state waits for
+    /// socket closure so an already-authorized flow cannot bypass cached policy.
+    pub fn register_untracked_connection(
+        &self,
+        key: &Key,
+        process_id: u64,
+        direction: Direction,
+    ) -> Result<ConnectionRegistration, String> {
+        self.register_connection_with_lifecycle(key, process_id, direction, false)
+    }
+
+    fn register_connection_with_lifecycle(
+        &self,
+        key: &Key,
+        process_id: u64,
+        direction: Direction,
+        native_lifecycle: bool,
+    ) -> Result<ConnectionRegistration, String> {
         if key.is_ipv6() {
-            let connection = ConnectionV6::from_key(key, process_id, direction)?;
+            let connection = if native_lifecycle {
+                ConnectionV6::from_key(key, process_id, direction)?
+            } else {
+                ConnectionV6::from_untracked_key(key, process_id, direction)?
+            };
             Ok(self.register_connection_v6(connection))
         } else {
-            let connection = ConnectionV4::from_key(key, process_id, direction)?;
+            let connection = if native_lifecycle {
+                ConnectionV4::from_key(key, process_id, direction)?
+            } else {
+                ConnectionV4::from_untracked_key(key, process_id, direction)?
+            };
             Ok(self.register_connection_v4(connection))
         }
     }
@@ -100,67 +131,51 @@ impl ConnectionCache {
     fn register_connection_v4(&self, connection: ConnectionV4) -> ConnectionRegistration {
         let key = connection.get_key();
         let process_id = connection.process_id;
-        let (rejected, registration) = {
-            let mut connections = self.connections_v4.write_lock();
-            match connections.insert_if_absent(connection) {
-                Ok(instance_id) => (
-                    None,
-                    ConnectionRegistration {
-                        inserted: true,
-                        instance_id,
-                    },
-                ),
-                Err((connection, instance_id)) => {
-                    if let Some(existing) = connections.get_mut_instance(&key, instance_id) {
-                        merge_process_id(&mut existing.process_id, process_id);
+        let native_lifecycle = connection.has_native_lifecycle();
+        let mut connections = self.connections_v4.write_lock();
+        match connections.insert_if_absent(connection) {
+            Ok(instance_id) => ConnectionRegistration {
+                inserted: true,
+                instance_id,
+            },
+            Err((_connection, instance_id)) => {
+                if let Some(existing) = connections.get_mut_instance(&key, instance_id) {
+                    merge_process_id(&mut existing.process_id, process_id);
+                    if native_lifecycle {
+                        existing.mark_native_lifecycle();
                     }
-                    (
-                        Some(connection),
-                        ConnectionRegistration {
-                            inserted: false,
-                            instance_id,
-                        },
-                    )
+                }
+                ConnectionRegistration {
+                    inserted: false,
+                    instance_id,
                 }
             }
-        };
-
-        // A Connection owns heap state. Drop a rejected candidate only after the
-        // map guard has restored the caller's original IRQL.
-        drop(rejected);
-        registration
+        }
     }
 
     fn register_connection_v6(&self, connection: ConnectionV6) -> ConnectionRegistration {
         let key = connection.get_key();
         let process_id = connection.process_id;
-        let (rejected, registration) = {
-            let mut connections = self.connections_v6.write_lock();
-            match connections.insert_if_absent(connection) {
-                Ok(instance_id) => (
-                    None,
-                    ConnectionRegistration {
-                        inserted: true,
-                        instance_id,
-                    },
-                ),
-                Err((connection, instance_id)) => {
-                    if let Some(existing) = connections.get_mut_instance(&key, instance_id) {
-                        merge_process_id(&mut existing.process_id, process_id);
+        let native_lifecycle = connection.has_native_lifecycle();
+        let mut connections = self.connections_v6.write_lock();
+        match connections.insert_if_absent(connection) {
+            Ok(instance_id) => ConnectionRegistration {
+                inserted: true,
+                instance_id,
+            },
+            Err((_connection, instance_id)) => {
+                if let Some(existing) = connections.get_mut_instance(&key, instance_id) {
+                    merge_process_id(&mut existing.process_id, process_id);
+                    if native_lifecycle {
+                        existing.mark_native_lifecycle();
                     }
-                    (
-                        Some(connection),
-                        ConnectionRegistration {
-                            inserted: false,
-                            instance_id,
-                        },
-                    )
+                }
+                ConnectionRegistration {
+                    inserted: false,
+                    instance_id,
                 }
             }
-        };
-
-        drop(rejected);
-        registration
+        }
     }
 
     /// Runs `use_instance` only while the exact cache instance is still live.
@@ -258,14 +273,27 @@ impl ConnectionCache {
         }
     }
 
-    /// Refreshes one exact live cache instance.
-    pub fn touch_connection_instance(&self, key: &Key, instance_id: u64) -> bool {
+    /// Returns an exact live entry that still lacks native lifecycle identity.
+    pub fn get_untracked_connection_instance_id(&self, key: &Key) -> Option<u64> {
+        if key.is_ipv6() {
+            let connections = self.connections_v6.read_lock();
+            connections.untracked_instance_id(key)
+        } else {
+            let connections = self.connections_v4.read_lock();
+            connections.untracked_instance_id(key)
+        }
+    }
+
+    /// Promotes a fallback entry after it is successfully associated with a native
+    /// endpoint or flow. An exact instance check prevents a delayed association from
+    /// changing a replacement connection that reused the tuple.
+    pub fn mark_connection_instance_tracked(&self, key: &Key, instance_id: u64) -> bool {
         if key.is_ipv6() {
             let mut connections = self.connections_v6.write_lock();
-            connections.touch_instance(key, instance_id)
+            connections.mark_native_lifecycle_instance(key, instance_id)
         } else {
             let mut connections = self.connections_v4.write_lock();
-            connections.touch_instance(key, instance_id)
+            connections.mark_native_lifecycle_instance(key, instance_id)
         }
     }
 
@@ -459,6 +487,39 @@ impl ConnectionCache {
         connections.end_all_on_endpoint(key, local_address, process_id)
     }
 
+    pub fn end_untracked_on_endpoint_v4(
+        &self,
+        key: (IpProtocol, u16),
+        local_address: Option<IpAddress>,
+        process_id: Option<u64>,
+    ) -> Option<Vec<ConnectionV4>> {
+        let mut connections = self.connections_v4.write_lock();
+        connections.end_untracked_on_endpoint(key, local_address, process_id)
+    }
+
+    pub fn end_untracked_on_endpoint_v6(
+        &self,
+        key: (IpProtocol, u16),
+        local_address: Option<IpAddress>,
+        process_id: Option<u64>,
+    ) -> Option<Vec<ConnectionV6>> {
+        let mut connections = self.connections_v6.write_lock();
+        connections.end_untracked_on_endpoint(key, local_address, process_id)
+    }
+
+    /// Ends inactive outbound entries that have no native endpoint or flow callback.
+    pub fn end_inactive_untracked_connections(&self) -> (Vec<ConnectionV4>, Vec<ConnectionV6>) {
+        let v4 = {
+            let mut connections = self.connections_v4.write_lock();
+            connections.end_inactive_untracked_connections()
+        };
+        let v6 = {
+            let mut connections = self.connections_v6.write_lock();
+            connections.end_inactive_untracked_connections()
+        };
+        (v4, v6)
+    }
+
     /// Removes retained ended history after its late-packet grace period.
     pub fn clean_ended_connections(&self) {
         {
@@ -511,6 +572,20 @@ impl ConnectionCache {
 
         (v4, v6)
     }
+
+    #[allow(dead_code)]
+    pub fn get_untracked_entries_counts(&self) -> (usize, usize) {
+        let v4 = {
+            let connections = self.connections_v4.read_lock();
+            connections.get_untracked_count()
+        };
+        let v6 = {
+            let connections = self.connections_v6.read_lock();
+            connections.get_untracked_count()
+        };
+
+        (v4, v6)
+    }
 }
 
 #[cfg(test)]
@@ -531,6 +606,29 @@ mod tests {
             remote_address: IpAddress::Ipv4(Ipv4Address::from_bytes(&remote_address)),
             remote_port,
         }
+    }
+
+    #[test]
+    fn native_registration_promotes_existing_fallback_instance() {
+        let cache = ConnectionCache::new();
+        let tuple = key([192, 0, 2, 10], 443);
+        let fallback = cache
+            .register_untracked_connection(&tuple, 0, Direction::Outbound)
+            .expect("fallback registration");
+        assert!(fallback.inserted);
+
+        let tracked = cache
+            .register_connection(&tuple, 100, Direction::Outbound)
+            .expect("native registration");
+        assert!(!tracked.inserted);
+        assert_eq!(tracked.instance_id, fallback.instance_id);
+        let (expired_v4, expired_v6) = cache.end_inactive_untracked_connections();
+        assert!(expired_v4.is_empty());
+        assert!(expired_v6.is_empty());
+        assert_eq!(
+            cache.read_connection_v4(&tuple, |connection| Some(connection.process_id)),
+            Some(100)
+        );
     }
 
     #[test]
