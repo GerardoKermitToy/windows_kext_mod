@@ -172,18 +172,6 @@ pub trait Connection {
         }
     }
 
-    /// Returns the remote endpoint as an orderable tuple.
-    ///
-    /// This is the coarse sort key of the per-port vectors in `ConnectionMap`.
-    /// Every connection that `remote_equals` can accept must compare equal here,
-    /// but the converse is intentionally not true: entries with the same remote
-    /// endpoint can still differ in local address and are disambiguated by
-    /// `remote_equals`. `IpAddress` orders by variant first, so a key of the wrong
-    /// address family does not enter the candidate range.
-    fn remote_key(&self) -> (IpAddress, u16) {
-        (self.get_remote_address(), self.get_remote_port())
-    }
-
     /// Returns true if the connection has the same local and remote endpoint as
     /// the given key. The map already groups by protocol and local port, but the
     /// local address still has to be checked here: two local addresses can use
