@@ -2,7 +2,7 @@ use alloc::string::{String, ToString};
 use smoltcp::wire::{IPV4_HEADER_LEN, IPV6_HEADER_LEN};
 use wdk::filter_engine::callout_data::CalloutData;
 use wdk::filter_engine::layer;
-use wdk::filter_engine::net_buffer::{NetBufferList, NetBufferListIter};
+use wdk::filter_engine::net_buffer::{NetBufferList, NetBufferListClones, NetBufferListIter};
 use wdk::filter_engine::packet::InjectInfo;
 
 use crate::connection::{
@@ -12,11 +12,7 @@ use crate::connection::{
 use crate::connection_cache::ConnectionCache;
 use crate::connection_map::Key;
 use crate::device::{Device, Packet};
-use crate::packet_util::{
-    get_icmp_echo_from_nbl, get_key_from_nbl_v4, get_key_from_nbl_v6, is_fragment_v4,
-    is_fragment_v6, is_icmp_port_unreachable_from_nbl, is_tcp_reset_from_nbl,
-    recalc_header_checksums, Redirect,
-};
+use crate::packet_util::{inspect_packet, recalc_header_checksums, Redirect};
 
 // IP packet layers
 pub fn ip_packet_layer_outbound_v4(data: CalloutData) {
@@ -118,43 +114,6 @@ fn retreat_to_ip_header(
     nbl.retreat(size, true)
 }
 
-/// Returns true if the packet described by this indication is an individual IP
-/// fragment rather than a whole datagram.
-///
-/// Reads the fragment fields from the IP header itself. For inbound packets the
-/// header sits before the current data pointer, so the buffer is retreated first;
-/// the retreat is undone when the local `NetBufferList` goes out of scope.
-///
-/// For IPv6 the fragment information sits in an extension header after the base
-/// header, so the chain is walked rather than reading a fixed field.
-fn is_ip_fragment(
-    data: &CalloutData,
-    ipv6: bool,
-    direction: Direction,
-    wfp_ip_header_size: Option<u32>,
-) -> bool {
-    // SAFETY: This helper is reached only from the IP-packet classify functions.
-    // WFP owns their layer-data NBL chain and keeps it stable until the callback
-    // returns; the iterator and every yielded wrapper remain inside this call.
-    let mut nbls = unsafe { NetBufferListIter::new(data.get_layer_data() as _) };
-    let Some(mut nbl) = nbls.next() else {
-        return false;
-    };
-
-    if let Direction::Inbound = direction {
-        if let Err(err) = retreat_to_ip_header(&mut nbl, ipv6, wfp_ip_header_size) {
-            crate::err!("failed to retreat packet to IP header: {}", err);
-            return false;
-        }
-    }
-
-    if ipv6 {
-        is_fragment_v6(&nbl)
-    } else {
-        is_fragment_v4(&nbl)
-    }
-}
-
 struct ConnectionInfo {
     verdict: Verdict,
     process_id: u64,
@@ -165,25 +124,34 @@ struct ConnectionInfo {
 
 impl ConnectionInfo {
     fn from_connection<T: Connection>(conn: &T) -> Self {
+        let verdict = conn.get_verdict();
         ConnectionInfo {
-            verdict: conn.get_verdict(),
+            verdict,
             process_id: conn.get_process_id(),
             direction: conn.get_direction(),
             instance_id: conn.get_instance_id(),
-            redirect_info: conn.redirect_info(),
+            // Avoid a second redirect-policy dispatch for the overwhelmingly
+            // common non-redirect verdicts.
+            redirect_info: if matches!(
+                verdict,
+                Verdict::RedirectNameServer
+                    | Verdict::RedirectTunnel
+                    | Verdict::RedirectSplitTunnel
+            ) {
+                conn.redirect_info()
+            } else {
+                None
+            },
         }
     }
 }
 
-fn fast_track_pm_packets(key: &Key, _: Direction) -> bool {
-    if key.local_port == PM_DNS_PORT
+#[inline]
+fn fast_track_pm_packets(key: &Key) -> bool {
+    (key.local_port == PM_DNS_PORT
         || key.local_port == PM_SPN_PORT
-        || key.local_port == PM_SPLIT_TUN_PORT
-    {
-        return key.local_address == key.remote_address;
-    }
-
-    return false;
+        || key.local_port == PM_SPLIT_TUN_PORT)
+        && key.local_address == key.remote_address
 }
 
 fn ip_packet_layer(
@@ -197,14 +165,22 @@ fn ip_packet_layer(
     // Make the default path as drop.
     data.block_and_absorb();
 
-    // How far back an inbound buffer has to be moved to reach the IP header.
-    // Read once here: it is needed both by the fragment check below and by every
-    // retreat in the loop.
+    // Read indication-wide metadata and the layer-data pointer once. Every clone
+    // receives the same routing context, and WFP keeps the NBL chain stable until
+    // this callback returns.
     let wfp_ip_header_size = data.get_ip_header_size();
-    // Preserve the namespace/routing context for every clone that can outlive
-    // this classify callback. The injector falls back to WFP's unspecified
-    // compartment only when this metadata is absent.
     let compartment_id = data.get_compartment_id();
+    let reassembled = data.is_reassembled(flags_index);
+    let layer_data = data.get_layer_data();
+    let inbound = matches!(direction, Direction::Inbound);
+
+    // SAFETY: `ip_packet_layer` is called only by IP-packet classify handlers.
+    // WFP owns this NBL chain for the complete callback, and every yielded wrapper
+    // remains inside it.
+    let mut nbls = unsafe { NetBufferListIter::new(layer_data as _) };
+    let Some(mut first_nbl) = nbls.next() else {
+        return;
+    };
 
     // A fragmented datagram is indicated twice at this layer: once per individual
     // fragment, and once more as the reassembled whole (verified on Windows 11:
@@ -216,31 +192,63 @@ fn ip_packet_layer(
     // ports at the transport offset returns payload data - that is where the bogus
     // `0 -> 0` connection keys came from.
     //
-    // Skip the individual fragments and decide on the reassembled packet, which
-    // gives Portmaster the correct ports and the true datagram size.
-    //
-    // Note: the fragment flag is not set on every fragment indication (the first
-    // pass reports flags=0x0), so the IP header's own fragment fields are the
-    // reliable discriminator. A packet is an individual fragment when it either
-    // has a non-zero offset or has the more-fragments bit set; an unfragmented
-    // packet has neither, and the reassembled one is explicitly flagged.
-    if !data.is_reassembled(flags_index)
-        && is_ip_fragment(&data, ipv6, direction, wfp_ip_header_size)
-    {
-        data.action_permit();
-        return;
+    // Inspect the first NBL once and retain both its retreat and parsed metadata for
+    // the main loop. Previously the fragment pass restored the inbound data offset,
+    // then the normal pass retreated and read the same header again.
+    let mut first_retreated = false;
+    let mut first_inspection = None;
+    if !reassembled {
+        if !inbound {
+            let inspection = inspect_packet(&first_nbl, ipv6, direction);
+            if inspection.is_fragment {
+                data.action_permit();
+                return;
+            }
+            if inspection.metadata.is_ok() {
+                first_inspection = Some(inspection);
+            }
+        } else {
+            match retreat_to_ip_header(&mut first_nbl, ipv6, wfp_ip_header_size) {
+                Ok(()) => {
+                    first_retreated = true;
+                    let inspection = inspect_packet(&first_nbl, ipv6, direction);
+                    if inspection.is_fragment {
+                        data.action_permit();
+                        return;
+                    }
+                    if inspection.metadata.is_ok() {
+                        first_inspection = Some(inspection);
+                    }
+                }
+                Err(err) => {
+                    // Preserve the self-injection bypass below. A non-self packet
+                    // gets the same second retreat attempt the old normal pass made.
+                    crate::err!("failed to retreat packet to IP header: {}", err);
+                }
+            }
+        }
     }
 
     let Some(device) = crate::entry::get_device() else {
         return;
     };
-    // SAFETY: `ip_packet_layer` is called only by IP-packet classify handlers.
-    // Their layer data is a WFP-owned NBL chain that stays live throughout this
-    // callback, and the injection-state query is synchronous.
+
+    // Portmaster's own local redirect traffic and automatic port-unreachable
+    // responses are unconditional permits. Their already parsed first packet does
+    // not need the comparatively expensive WFP injection-state query.
+    if let Some(metadata) = first_inspection.and_then(|inspection| inspection.metadata.ok()) {
+        if fast_track_pm_packets(&metadata.key) || metadata.is_icmp_port_unreachable {
+            data.action_permit();
+            return;
+        }
+    }
+
+    // SAFETY: The WFP-owned layer data is still live. Querying injection metadata
+    // is synchronous and does not depend on the first net buffer's data offset.
     let injection_origin = unsafe {
         device
             .injector
-            .network_packet_injection_origin(data.get_layer_data() as _, ipv6)
+            .network_packet_injection_origin(layer_data as _, ipv6)
     };
     if injection_origin.is_self_injected() {
         data.action_permit();
@@ -253,60 +261,70 @@ fn ip_packet_layer(
     // Read it only on the outbound path; inbound processing can run in an
     // unrelated thread context.
     let injected_by_other = injection_origin.is_injected_by_other();
-    let other_injector_process_id = if injected_by_other
-        && matches!(direction, Direction::Outbound)
-    {
+    let other_injector_process_id = if injected_by_other && !inbound {
         wdk::utils::current_process_id()
     } else {
         0
     };
 
-    // SAFETY: The same WFP callback contract keeps the complete NBL chain stable;
-    // all yielded wrappers are consumed by this loop before the callback returns.
-    let nbls = unsafe { NetBufferListIter::new(data.get_layer_data() as _) };
-    for mut nbl in nbls {
-        if let Direction::Inbound = direction {
-            // The header is not part of the NBL for incoming packets. Move the beginning of the buffer back so we get access to it.
-            // The NBL will auto advance after it loses scope.
-            if let Err(err) = retreat_to_ip_header(&mut nbl, ipv6, wfp_ip_header_size) {
-                crate::err!("failed to retreat packet to IP header: {}", err);
-                return;
+    let mut first = true;
+    for mut nbl in core::iter::once(first_nbl).chain(nbls) {
+        let inspection = if first {
+            first = false;
+            if inbound && !first_retreated {
+                // The first fragment probe can fail its retreat. Retry here after
+                // the self-injection check, matching the previous two-pass path.
+                if let Err(err) = retreat_to_ip_header(&mut nbl, ipv6, wfp_ip_header_size) {
+                    crate::err!("failed to retreat packet to IP header: {}", err);
+                    return;
+                }
             }
-        }
-
-        // Get key from packet.
-        let key = match if ipv6 {
-            get_key_from_nbl_v6(&nbl, direction)
+            first_inspection
+                .take()
+                .unwrap_or_else(|| inspect_packet(&nbl, ipv6, direction))
         } else {
-            get_key_from_nbl_v4(&nbl, direction)
-        } {
-            Ok(key) => key,
+            if inbound {
+                // At inbound packet layers the current offset follows the IP header.
+                // The wrapper restores it automatically when this iteration ends.
+                if let Err(err) = retreat_to_ip_header(&mut nbl, ipv6, wfp_ip_header_size) {
+                    crate::err!("failed to retreat packet to IP header: {}", err);
+                    return;
+                }
+            }
+            inspect_packet(&nbl, ipv6, direction)
+        };
+
+        let packet_metadata = match inspection.metadata {
+            Ok(metadata) => metadata,
             Err(err) => {
                 crate::err!("failed to get key from nbl: {}", err);
                 return;
             }
         };
+        let key = packet_metadata.key;
 
-        if fast_track_pm_packets(&key, direction) {
+        if fast_track_pm_packets(&key) || packet_metadata.is_icmp_port_unreachable {
             data.action_permit();
             return;
         }
 
-        // The local IP stack emits this response when a UDP datagram reaches a
-        // port with no listener. It has no user-space owner or meaningful verdict
-        // target, so permit it without publishing a PID-0 request to Portmaster.
-        // Match the semantic equivalent in both families: ICMPv4 type 3/code 3
-        // and ICMPv6 type 1/code 4.
-        if matches!(direction, Direction::Outbound)
-            && matches!(
-                key.protocol,
-                smoltcp::wire::IpProtocol::Icmp | smoltcp::wire::IpProtocol::Icmpv6
+        let transport_protocol = matches!(
+            key.protocol,
+            smoltcp::wire::IpProtocol::Tcp | smoltcp::wire::IpProtocol::Udp
+        );
+        // Read connection state once. Cached TCP resets previously acquired and
+        // searched the same spin-locked map here and then again below.
+        let connection_info = if transport_protocol {
+            get_connection_info(
+                &device.connection_cache,
+                &key,
+                ipv6,
+                direction,
+                !injected_by_other,
             )
-            && is_icmp_port_unreachable_from_nbl(&nbl, ipv6)
-        {
-            data.action_permit();
-            return;
-        }
+        } else {
+            None
+        };
 
         // A TCP reset emitted by the local stack in response to a packet for
         // which no socket is listening has no user-space connection behind it.
@@ -314,18 +332,7 @@ fn ip_packet_layer(
         // a PID-0 connection and do not send a request that cannot be meaningfully
         // decided. Existing cached connections are deliberately handled below so
         // their configured policy still applies.
-        if matches!(direction, Direction::Outbound)
-            && key.protocol == smoltcp::wire::IpProtocol::Tcp
-            && is_tcp_reset_from_nbl(&nbl, ipv6)
-            && get_connection_info(
-                &device.connection_cache,
-                &key,
-                ipv6,
-                direction,
-                !injected_by_other,
-            )
-            .is_none()
-        {
+        if packet_metadata.is_tcp_reset && connection_info.is_none() {
             data.action_permit();
             return;
         }
@@ -362,13 +369,10 @@ fn ip_packet_layer(
         //
         // An inbound echo reply is therefore matched against the request that caused
         // it, using the identifier the sender chose and the responder echoed back.
-        if !matches!(
-            key.protocol,
-            smoltcp::wire::IpProtocol::Tcp | smoltcp::wire::IpProtocol::Udp
-        ) {
+        if !transport_protocol {
             match direction {
                 Direction::Outbound => {
-                    if let Some(echo) = get_icmp_echo_from_nbl(&nbl, ipv6) {
+                    if let Some(echo) = packet_metadata.icmp_echo {
                         if !echo.is_request {
                             // This is an echo reply reported as OUTBOUND. Two cases:
                             // 1. Reply to our own request (loopback or external): we
@@ -425,7 +429,7 @@ fn ip_packet_layer(
                     // Inbound ICMP echo replies are straightforward: someone sent us
                     // a request, they're getting their reply back. Try to attribute
                     // it to their original request if we cached it.
-                    if let Some(echo) = get_icmp_echo_from_nbl(&nbl, ipv6) {
+                    if let Some(echo) = packet_metadata.icmp_echo {
                         if !echo.is_request {
                             process_id = {
                                 let mut icmp_echo_cache = device.icmp_echo_cache.write_lock();
@@ -439,17 +443,8 @@ fn ip_packet_layer(
             }
         }
 
-        if matches!(
-            key.protocol,
-            smoltcp::wire::IpProtocol::Tcp | smoltcp::wire::IpProtocol::Udp
-        ) {
-            if let Some(mut conn_info) = get_connection_info(
-                &device.connection_cache,
-                &key,
-                ipv6,
-                direction,
-                !injected_by_other,
-            ) {
+        if transport_protocol {
+            if let Some(mut conn_info) = connection_info {
                 // A new inbound connection must reach ALE_AUTH_RECV_ACCEPT so it
                 // can be attributed and authorized there. Keep permitting it while
                 // that authorization is still pending and the owning process is
@@ -491,12 +486,15 @@ fn ip_packet_layer(
                             match clone_packet(
                                 device,
                                 nbl,
-                                effective_direction,
-                                ipv6,
-                                key.is_loopback(),
-                                compartment_id,
-                                interface_index,
-                                sub_interface_index,
+                                packet_inject_info(
+                                    effective_direction,
+                                    ipv6,
+                                    key.is_loopback(),
+                                    compartment_id,
+                                    interface_index,
+                                    sub_interface_index,
+                                ),
+                                CloneChecksum::RedirectWillRecalculate,
                             ) {
                                 Ok(mut packet) => match packet.redirect(redirect_info) {
                                     Ok(()) => {
@@ -581,12 +579,15 @@ fn ip_packet_layer(
             let packet = match clone_packet(
                 device,
                 nbl,
-                effective_direction,
-                ipv6,
-                key.is_loopback(),
-                compartment_id,
-                interface_index,
-                sub_interface_index,
+                packet_inject_info(
+                    effective_direction,
+                    ipv6,
+                    key.is_loopback(),
+                    compartment_id,
+                    interface_index,
+                    sub_interface_index,
+                ),
+                CloneChecksum::Recalculate,
             ) {
                 Ok(p) => p,
                 Err(err) => {
@@ -615,47 +616,68 @@ fn ip_packet_layer(
     }
 }
 
-fn clone_packet(
-    device: &Device,
-    nbl: NetBufferList,
+enum CloneChecksum {
+    Recalculate,
+    RedirectWillRecalculate,
+}
+
+#[inline]
+fn packet_inject_info(
     direction: Direction,
     ipv6: bool,
     loopback: bool,
     compartment_id: Option<u32>,
     interface_index: u32,
     sub_interface_index: u32,
-) -> Result<Packet, String> {
-    let mut clones = nbl.clone_all(&device.network_allocator)?;
-    let inbound = match direction {
-        Direction::Outbound => false,
-        Direction::Inbound => true,
-    };
+) -> InjectInfo {
+    InjectInfo {
+        ipv6,
+        inbound: matches!(direction, Direction::Inbound),
+        loopback,
+        compartment_id,
+        interface_index,
+        sub_interface_index,
+    }
+}
 
-    for clone in &mut clones {
-        let Some(data) = clone.get_data_mut() else {
-            return Err("failed to access cloned packet data".to_string());
-        };
-        // Outbound packets intercepted at the IP layer may carry only a partial
-        // pseudo-header checksum because the TCP/IP stack asked the NIC to finish
-        // checksum offload. `clone_all` copies the packet bytes into a fresh NBL;
-        // it does not copy the original NBL's checksum-offload metadata. The fresh
-        // NBL must therefore carry complete software checksums before network-send
-        // reinjection. An IPv6 packet whose extension chain cannot be resolved must
-        // not enter the pending cache with a checksum that can never be made valid.
-        recalc_header_checksums(data, ipv6)?;
+fn clone_packet(
+    device: &Device,
+    nbl: NetBufferList,
+    inject_info: InjectInfo,
+    checksum: CloneChecksum,
+) -> Result<Packet, String> {
+    let mut clones = nbl.clone_packets(&device.network_allocator)?;
+
+    if matches!(checksum, CloneChecksum::Recalculate) {
+        match &mut clones {
+            NetBufferListClones::Single(clone) => {
+                recalculate_clone_checksum(clone, inject_info.ipv6)?;
+            }
+            NetBufferListClones::Batch(clones) => {
+                for clone in clones {
+                    recalculate_clone_checksum(clone, inject_info.ipv6)?;
+                }
+            }
+        }
     }
 
-    Ok(Packet::PacketLayer(
-        clones,
-        InjectInfo {
-            ipv6,
-            inbound,
-            loopback,
-            compartment_id,
-            interface_index,
-            sub_interface_index,
-        },
-    ))
+    Ok(match clones {
+        NetBufferListClones::Single(clone) => Packet::Network(clone, inject_info),
+        NetBufferListClones::Batch(clones) => Packet::NetworkBatch(clones, inject_info),
+    })
+}
+
+fn recalculate_clone_checksum(clone: &mut NetBufferList, ipv6: bool) -> Result<(), String> {
+    let Some(data) = clone.get_data_mut() else {
+        return Err("failed to access cloned packet data".to_string());
+    };
+    // Outbound packets intercepted at the IP layer may carry only a partial
+    // pseudo-header checksum because the TCP/IP stack asked the NIC to finish
+    // checksum offload. Packet cloning copies the bytes into a fresh NBL but does
+    // not copy the original checksum-offload metadata, so a pending clone needs
+    // complete software checksums. Cached redirects defer this pass because they
+    // immediately write the final addresses, port and checksum in one traversal.
+    recalc_header_checksums(data, ipv6)
 }
 
 fn get_connection_info(

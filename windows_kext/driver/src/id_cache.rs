@@ -72,10 +72,10 @@ impl IdCache {
         // same lock (and the caller's connection-liveness guard) so endpoint closure
         // cannot observe only part of the original batch.
         match packet {
-            Packet::PacketLayer(nbls, inject_info) => {
+            Packet::NetworkBatch(nbls, inject_info) => {
                 let mut queued = Vec::with_capacity(nbls.len());
                 for nbl in nbls {
-                    let packet = Packet::PacketLayer(alloc::vec![nbl], inject_info);
+                    let packet = Packet::Network(nbl, inject_info);
                     if let Some(entry) = push_packet(
                         &mut self.values,
                         &mut self.next_id,
@@ -244,7 +244,8 @@ fn push_packet(
 
 fn get_payload(packet: &Packet) -> Option<&[u8]> {
     match packet {
-        Packet::PacketLayer(nbls, _) => nbls.first().and_then(|nbl| nbl.get_data()),
+        Packet::Network(nbl, _) => nbl.get_data(),
+        Packet::NetworkBatch(nbls, _) => nbls.first().and_then(|nbl| nbl.get_data()),
         Packet::AleLayer(defer) => defer
             .packet_list()
             .and_then(|packet_list| packet_list.get_event_data()),

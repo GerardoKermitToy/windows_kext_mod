@@ -8,9 +8,9 @@ use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Address, Ipv6Address};
 
 use crate::connection_map::Key;
 
-pub static PM_DNS_PORT:       u16 = 53;
-pub static PM_SPN_PORT:       u16 = 717;
-pub static PM_SPLIT_TUN_PORT: u16 = 719;
+pub const PM_DNS_PORT: u16 = 53;
+pub const PM_SPN_PORT: u16 = 717;
+pub const PM_SPLIT_TUN_PORT: u16 = 719;
 
 static NEXT_CONNECTION_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 

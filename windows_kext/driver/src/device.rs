@@ -45,7 +45,11 @@ use crate::{
 };
 
 pub enum Packet {
-    PacketLayer(Vec<NetBufferList>, InjectInfo),
+    /// One independently decided network-layer packet.
+    Network(NetBufferList, InjectInfo),
+    /// Temporary owner used only while a WFP NBL batch is being cloned, redirected
+    /// immediately, or split into independent pending requests.
+    NetworkBatch(Vec<NetBufferList>, InjectInfo),
     AleLayer(ClassifyDefer),
 }
 
@@ -68,7 +72,12 @@ impl Packet {
     /// network packets still depend on their live connection lifecycle.
     pub(crate) fn survives_connection_end(&self, key: &Key) -> bool {
         key.protocol == IpProtocol::Udp
-            && matches!(self, Self::PacketLayer(_, inject_info) if !inject_info.inbound)
+            && matches!(
+                self,
+                Self::Network(_, inject_info)
+                    | Self::NetworkBatch(_, inject_info)
+                    if !inject_info.inbound
+            )
     }
 }
 
@@ -1194,7 +1203,13 @@ impl Device {
 
     pub fn inject_packet(&self, packet: Packet, blocked: bool) -> Result<(), String> {
         match packet {
-            Packet::PacketLayer(nbls, inject_info) => {
+            Packet::Network(nbl, inject_info) => {
+                if !blocked {
+                    self.injector.inject_net_buffer_list(nbl, inject_info)?;
+                }
+                Ok(())
+            }
+            Packet::NetworkBatch(nbls, inject_info) => {
                 if !blocked {
                     for nbl in nbls {
                         self.injector.inject_net_buffer_list(nbl, inject_info)?;

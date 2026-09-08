@@ -132,6 +132,20 @@ fn should_expire_untracked<T: Connection>(connection: &T, cutoff: u64) -> bool {
         && connection.get_last_accessed_time() < cutoff
 }
 
+/// Refreshes the only connections whose lifetime depends on packet activity.
+/// Native WFP state retires tracked connections, while inbound fallbacks wait for
+/// endpoint closure, so reading the system clock and storing a timestamp for either
+/// category cannot affect cleanup.
+#[inline]
+fn refresh_untracked_activity<T: Connection>(connection: &T) {
+    if !connection.has_ended()
+        && !connection.has_native_lifecycle()
+        && matches!(connection.get_direction(), Direction::Outbound)
+    {
+        connection.set_last_accessed_time(get_monotonic_timestamp_ms());
+    }
+}
+
 fn matches_endpoint<T: Connection>(
     connection: &T,
     local_address: Option<IpAddress>,
@@ -219,7 +233,7 @@ impl<T: Connection + Clone> ConnectionMap<T> {
             let range = equal_range(connections, (key.remote_address, key.remote_port));
             for conn in &mut connections[range] {
                 if conn.remote_equals(key) && !conn.has_ended() {
-                    conn.set_last_accessed_time(get_monotonic_timestamp_ms());
+                    refresh_untracked_activity(conn);
                     return Some(conn);
                 }
             }
@@ -297,7 +311,6 @@ impl<T: Connection + Clone> ConnectionMap<T> {
             return None;
         }
 
-        let timestamp = get_monotonic_timestamp_ms();
         if let Some(connections) = self.0.get_mut(&key.small()) {
             let range = equal_range(connections, (key.remote_address, key.remote_port));
             if let Some(index) = range.clone().find(|index| {
@@ -307,7 +320,7 @@ impl<T: Connection + Clone> ConnectionMap<T> {
                     && !conn.has_ended()
             }) {
                 let conn = &mut connections[index];
-                conn.set_last_accessed_time(timestamp);
+                refresh_untracked_activity(conn);
                 return Some(conn);
             }
 
@@ -317,7 +330,7 @@ impl<T: Connection + Clone> ConnectionMap<T> {
                         && conn.get_instance_id() == instance_id
                         && !conn.has_ended()
                 }) {
-                    conn.set_last_accessed_time(timestamp);
+                    refresh_untracked_activity(conn);
                     return Some(conn);
                 }
             }
@@ -380,7 +393,7 @@ impl<T: Connection + Clone> ConnectionMap<T> {
                 live_and_ended_match(&connections[range], |conn| conn.remote_equals(key));
 
             if let Some(conn) = live_exact {
-                conn.set_last_accessed_time(get_monotonic_timestamp_ms());
+                refresh_untracked_activity(conn);
                 return read_connection(conn);
             }
 
@@ -409,7 +422,7 @@ impl<T: Connection + Clone> ConnectionMap<T> {
                 None
             };
             if let Some(conn) = live_redirect.or(ended_match) {
-                conn.set_last_accessed_time(get_monotonic_timestamp_ms());
+                refresh_untracked_activity(conn);
                 return read_connection(conn);
             }
         }
@@ -426,7 +439,6 @@ impl<T: Connection + Clone> ConnectionMap<T> {
                     && conn.get_instance_id() == instance_id
                     && !conn.has_ended()
                 {
-                    conn.set_last_accessed_time(get_monotonic_timestamp_ms());
                     conn.mark_native_lifecycle();
                     return true;
                 }
@@ -813,6 +825,17 @@ mod tests {
         assert!(ended[0].get_key() == fallback_tuple);
         assert_eq!(map.read(&fallback_tuple, read_process_id), None);
         assert_eq!(map.read(&tracked_tuple, read_process_id), Some(20));
+    }
+
+    #[test]
+    fn packet_lookup_refreshes_outbound_untracked_activity() {
+        let tuple = key([203, 0, 113, 7], 443);
+        let mut map = ConnectionMap::new();
+        map.add(untracked(&tuple, 10));
+
+        assert_eq!(map.read(&tuple, read_process_id), Some(10));
+        assert!(map.end_inactive_untracked_connections().is_empty());
+        assert_eq!(map.get_count(), 1);
     }
 
     #[test]

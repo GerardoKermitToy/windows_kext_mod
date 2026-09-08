@@ -443,22 +443,16 @@ impl<'a> CalloutData<'a> {
     }
 
     pub fn is_reauthorize(&self, flags_index: usize) -> bool {
-        self.get_value_type(flags_index) == ValueType::FwpUint32
-            && self.get_value_u32(flags_index) & FWP_CONDITION_FLAG_IS_REAUTHORIZE > 0
+        self.get_value_u32(flags_index) & FWP_CONDITION_FLAG_IS_REAUTHORIZE != 0
     }
 
     /// Returns true if WFP indicated this packet as a reassembled datagram, i.e.
     /// the individual fragments have been merged back into one packet with a
     /// complete transport header.
     ///
-    /// Reads false when the FLAGS field is not a u32, so an unexpected layout
-    /// cannot cause a fragment to be mistaken for a reassembled packet.
+    /// `get_value_u32` returns zero for both a missing and a mistyped field, so one
+    /// bounds/type check is sufficient and neither case can look reassembled.
     pub fn is_reassembled(&self, flags_index: usize) -> bool {
-        match self.get_value_type(flags_index) {
-            ValueType::FwpUint32 => {
-                self.get_value_u32(flags_index) & FWP_CONDITION_FLAG_IS_REASSEMBLED > 0
-            }
-            _ => false,
-        }
+        self.get_value_u32(flags_index) & FWP_CONDITION_FLAG_IS_REASSEMBLED != 0
     }
 }

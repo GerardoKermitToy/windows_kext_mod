@@ -26,6 +26,12 @@ pub struct NetBufferList {
     advance_on_drop: Option<u32>,
 }
 
+/// Owned result of cloning every independent packet in one native NBL.
+pub enum NetBufferListClones {
+    Single(NetBufferList),
+    Batch(Vec<NetBufferList>),
+}
+
 // Owned packet clones are deliberately transferred from classify callbacks to
 // the verdict path and later to an asynchronous injection completion callback.
 // WFP/NDIS own synchronization of the native NBL; this wrapper never shares
@@ -96,6 +102,52 @@ impl NetBufferList {
         return Err(());
     }
 
+    /// Copies as much of the first net buffer as fits in `buffer` and returns the
+    /// copied length. Unlike `get_data_length`, this never sums independent net
+    /// buffers in a batched NBL. The common path needs one NDIS read; if a full
+    /// prefix cannot be materialized, `fallback_length` preserves a smaller parse.
+    pub fn read_bytes_up_to(&self, buffer: &mut [u8], fallback_length: usize) -> Result<usize, ()> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+
+        unsafe {
+            let Some(nbl) = self.nbl.as_ref() else {
+                return Err(());
+            };
+            let Some(nb) = nbl.Header.first_net_buffer.as_ref() else {
+                return Err(());
+            };
+            let length = core::cmp::min(nb.nbSize.DataLength as usize, buffer.len());
+            if length == 0 {
+                return Err(());
+            }
+
+            let storage = buffer.as_mut_ptr();
+            let ptr = NdisGetDataBuffer(nb, length as u32, storage, 1, 0);
+            if !ptr.is_null() {
+                if ptr != storage {
+                    buffer[..length].copy_from_slice(core::slice::from_raw_parts(ptr, length));
+                }
+                return Ok(length);
+            }
+
+            let fallback_length = core::cmp::min(length, fallback_length);
+            if fallback_length == 0 || fallback_length == length {
+                return Err(());
+            }
+            let ptr = NdisGetDataBuffer(nb, fallback_length as u32, storage, 1, 0);
+            if ptr.is_null() {
+                return Err(());
+            }
+            if ptr != storage {
+                buffer[..fallback_length]
+                    .copy_from_slice(core::slice::from_raw_parts(ptr, fallback_length));
+            }
+            Ok(fallback_length)
+        }
+    }
+
     pub fn clone(&self, net_allocator: &NetworkAllocator) -> Result<NetBufferList, String> {
         unsafe {
             let Some(nbl) = self.nbl.as_ref() else {
@@ -148,14 +200,32 @@ impl NetBufferList {
     ///
     /// WFP may batch multiple packets in one NET_BUFFER_LIST. Each returned
     /// NBL owns its packet data and can be injected independently.
-    pub fn clone_all(&self, net_allocator: &NetworkAllocator) -> Result<Vec<NetBufferList>, String> {
+    pub fn clone_packets(
+        &self,
+        net_allocator: &NetworkAllocator,
+    ) -> Result<NetBufferListClones, String> {
         unsafe {
             let Some(nbl) = self.nbl.as_ref() else {
                 return Err("net buffer list is null".to_string());
             };
 
-            let mut packets = Vec::new();
+            let mut packet_count = 0;
             let mut nb = nbl.Header.first_net_buffer;
+            while let Some(nb_ref) = nb.as_ref() {
+                packet_count += 1;
+                nb = nb_ref.Next;
+            }
+            if packet_count == 0 {
+                return Err("net buffer list has no packets".to_string());
+            }
+            if packet_count == 1 {
+                return self.clone(net_allocator).map(NetBufferListClones::Single);
+            }
+
+            // Batched sends can contain dozens of packets. Reserve their exact count
+            // so the owning vector never has to grow while cloning at DISPATCH_LEVEL.
+            let mut packets = Vec::with_capacity(packet_count);
+            nb = nbl.Header.first_net_buffer;
             while let Some(nb_ref) = nb.as_ref() {
                 let data_length = nb_ref.nbSize.DataLength;
                 if data_length == 0 {
@@ -184,10 +254,7 @@ impl NetBufferList {
                 nb = nb_ref.Next;
             }
 
-            if packets.is_empty() {
-                return Err("net buffer list has no packets".to_string());
-            }
-            Ok(packets)
+            Ok(NetBufferListClones::Batch(packets))
         }
     }
     pub fn get_data_mut(&mut self) -> Option<&mut [u8]> {
@@ -294,7 +361,7 @@ impl Drop for NetBufferList {
             self.advance(advance_amount);
         }
         if self.data.is_some() {
-            // SAFETY: `data` is set only by `clone` and `clone_all`, which pair
+            // SAFETY: `data` is set only by `clone` and `clone_packets`, which pair
             // this NBL with the backing allocation used to build its MDL. This
             // wrapper has exclusive ownership and is consuming that pair now.
             unsafe { NetworkAllocator::free_net_buffer(self.nbl) };
@@ -495,7 +562,6 @@ impl NetworkAllocator {
             }
         });
     }
-
 }
 
 impl Drop for NetworkAllocator {
