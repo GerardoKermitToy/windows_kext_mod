@@ -129,52 +129,44 @@ impl ConnectionCache {
     }
 
     fn register_connection_v4(&self, connection: ConnectionV4) -> ConnectionRegistration {
-        let key = connection.get_key();
         let process_id = connection.process_id;
         let native_lifecycle = connection.has_native_lifecycle();
         let mut connections = self.connections_v4.write_lock();
-        match connections.insert_if_absent(connection) {
+        match connections.insert_if_absent_with(connection, |existing| {
+            merge_process_id(&mut existing.process_id, process_id);
+            if native_lifecycle {
+                existing.mark_native_lifecycle();
+            }
+        }) {
             Ok(instance_id) => ConnectionRegistration {
                 inserted: true,
                 instance_id,
             },
-            Err((_connection, instance_id)) => {
-                if let Some(existing) = connections.get_mut_instance(&key, instance_id) {
-                    merge_process_id(&mut existing.process_id, process_id);
-                    if native_lifecycle {
-                        existing.mark_native_lifecycle();
-                    }
-                }
-                ConnectionRegistration {
-                    inserted: false,
-                    instance_id,
-                }
-            }
+            Err((_connection, instance_id)) => ConnectionRegistration {
+                inserted: false,
+                instance_id,
+            },
         }
     }
 
     fn register_connection_v6(&self, connection: ConnectionV6) -> ConnectionRegistration {
-        let key = connection.get_key();
         let process_id = connection.process_id;
         let native_lifecycle = connection.has_native_lifecycle();
         let mut connections = self.connections_v6.write_lock();
-        match connections.insert_if_absent(connection) {
+        match connections.insert_if_absent_with(connection, |existing| {
+            merge_process_id(&mut existing.process_id, process_id);
+            if native_lifecycle {
+                existing.mark_native_lifecycle();
+            }
+        }) {
             Ok(instance_id) => ConnectionRegistration {
                 inserted: true,
                 instance_id,
             },
-            Err((_connection, instance_id)) => {
-                if let Some(existing) = connections.get_mut_instance(&key, instance_id) {
-                    merge_process_id(&mut existing.process_id, process_id);
-                    if native_lifecycle {
-                        existing.mark_native_lifecycle();
-                    }
-                }
-                ConnectionRegistration {
-                    inserted: false,
-                    instance_id,
-                }
-            }
+            Err((_connection, instance_id)) => ConnectionRegistration {
+                inserted: false,
+                instance_id,
+            },
         }
     }
 
@@ -365,6 +357,26 @@ impl ConnectionCache {
     ) -> Option<T> {
         let connections = self.connections_v6.read_lock();
         connections.read(key, process_connection)
+    }
+
+    /// Reads retained IPv4 state for an exact ended generation without refreshing it.
+    pub fn read_ended_connection_v4<T>(
+        &self,
+        key: &Key,
+        process_connection: fn(&ConnectionV4) -> Option<T>,
+    ) -> Option<T> {
+        let connections = self.connections_v4.read_lock();
+        connections.read_ended_exact(key, process_connection)
+    }
+
+    /// IPv6 counterpart of [`Self::read_ended_connection_v4`].
+    pub fn read_ended_connection_v6<T>(
+        &self,
+        key: &Key,
+        process_connection: fn(&ConnectionV6) -> Option<T>,
+    ) -> Option<T> {
+        let connections = self.connections_v6.read_lock();
+        connections.read_ended_exact(key, process_connection)
     }
 
     /// Reads IPv4 policy for one packet indication. Inbound lookups use live

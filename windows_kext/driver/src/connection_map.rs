@@ -1,7 +1,10 @@
-use core::{fmt::Display, ops::Bound, time::Duration};
+use core::{fmt::Display, time::Duration};
 
 use crate::connection::{is_redirect_port, Connection, Direction};
-use alloc::{collections::BTreeMap, vec::Vec};
+use alloc::{
+    collections::{btree_map::Entry, BTreeMap},
+    vec::Vec,
+};
 use smoltcp::wire::{IpAddress, IpProtocol};
 
 #[derive(Clone, Copy, PartialEq, PartialOrd, Eq, Ord)]
@@ -62,66 +65,114 @@ impl Key {
     }
 }
 
-/// Orderable identity used inside one `(protocol, local port)` bucket.
+/// Compact family-specific key for one remote endpoint.
 ///
-/// The remote endpoint is the searchable prefix. The map-local sequence makes
-/// retained generations distinct and preserves their insertion order without moving
-/// existing connection objects when a new remote endpoint is inserted.
+/// `ConnectionV4` uses a `u32` address and `ConnectionV6` uses two `u64` words.
+/// The separate family maps therefore avoid carrying an `IpAddress` discriminant
+/// through every B-tree comparison.
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
-struct ConnectionIndex {
-    remote_address: IpAddress,
-    remote_port: u16,
-    sequence: u64,
+struct RemoteEndpoint<A> {
+    address: A,
+    port: u16,
 }
 
-impl ConnectionIndex {
-    fn from_connection<T: Connection>(connection: &T, sequence: u64) -> Self {
-        Self {
-            remote_address: connection.get_remote_address(),
-            remote_port: connection.get_remote_port(),
-            sequence,
-        }
-    }
-
-    fn first(key: &Key) -> Self {
-        Self {
-            remote_address: key.remote_address,
-            remote_port: key.remote_port,
-            sequence: 0,
-        }
-    }
-
-    fn last(key: &Key) -> Self {
-        Self {
-            remote_address: key.remote_address,
-            remote_port: key.remote_port,
-            sequence: u64::MAX,
-        }
+fn remote_endpoint_from_connection<T: Connection>(
+    connection: &T,
+) -> RemoteEndpoint<T::RemoteAddressKey> {
+    RemoteEndpoint {
+        address: connection.get_remote_address_key(),
+        port: connection.get_remote_port(),
     }
 }
 
-/// Connections grouped by `(protocol, local port)` and indexed by remote endpoint.
+#[inline]
+fn remote_endpoint_from_key<T: Connection>(
+    key: &Key,
+) -> Option<RemoteEndpoint<T::RemoteAddressKey>> {
+    Some(RemoteEndpoint {
+        address: T::remote_address_key(key)?,
+        port: key.remote_port,
+    })
+}
+
+/// Usually one connection generation, with allocation reserved for tuple reuse.
 ///
-/// Busy listeners retain many ended generations for late packets. A contiguous,
-/// sorted vector made each randomly ordered remote insertion move O(n) connection
-/// objects while holding the map's write spin lock. The inner B-tree keeps exact
-/// lookup and insertion O(log n) without relocating unrelated generations.
-///
-/// The remote endpoint prefix is deliberately not the complete tuple. Two local
-/// addresses can use the same port and remote endpoint, so exact operations still
-/// validate `Connection::remote_equals`. A sequence assigned under exclusive map
-/// access preserves the previous insertion-order choice within that candidate range.
-pub struct ConnectionMap<T: Connection>(
-    BTreeMap<(IpProtocol, u16), BTreeMap<ConnectionIndex, T>>,
-    u64,
-);
-
-fn connection_range(key: &Key) -> (Bound<ConnectionIndex>, Bound<ConnectionIndex>) {
-    (
-        Bound::Included(ConnectionIndex::first(key)),
-        Bound::Included(ConnectionIndex::last(key)),
-    )
+/// Ended generations remain addressable for late packets for one minute. Keeping
+/// the common case inline avoids one allocation per active remote endpoint. A small
+/// vector is created only when the same remote endpoint has retained generations or
+/// is shared by connections on different local addresses.
+enum ConnectionBucket<T> {
+    One(T),
+    Multiple(Vec<T>),
 }
+
+impl<T> ConnectionBucket<T> {
+    #[inline]
+    fn iter(&self) -> core::slice::Iter<'_, T> {
+        match self {
+            Self::One(connection) => core::slice::from_ref(connection).iter(),
+            Self::Multiple(connections) => connections.iter(),
+        }
+    }
+
+    #[inline]
+    fn iter_mut(&mut self) -> core::slice::IterMut<'_, T> {
+        match self {
+            Self::One(connection) => core::slice::from_mut(connection).iter_mut(),
+            Self::Multiple(connections) => connections.iter_mut(),
+        }
+    }
+
+    fn push(&mut self, connection: T) {
+        match self {
+            Self::One(_) => {
+                let previous = core::mem::replace(self, Self::Multiple(Vec::new()));
+                let Self::One(previous) = previous else {
+                    unreachable!();
+                };
+                *self = Self::Multiple(alloc::vec![previous, connection]);
+            }
+            Self::Multiple(connections) => connections.push(connection),
+        }
+    }
+
+    fn retain(&mut self, mut retain: impl FnMut(&T) -> bool) -> bool {
+        match self {
+            Self::One(connection) => retain(connection),
+            Self::Multiple(connections) => {
+                connections.retain(|connection| retain(connection));
+                let remaining = connections.len();
+                if remaining == 1 {
+                    let connection = connections.pop().expect("one retained connection");
+                    *self = Self::One(connection);
+                }
+                remaining != 0
+            }
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::One(_) => 1,
+            Self::Multiple(connections) => connections.len(),
+        }
+    }
+}
+
+type RemoteConnections<T> =
+    BTreeMap<RemoteEndpoint<<T as Connection>::RemoteAddressKey>, ConnectionBucket<T>>;
+
+/// Connections grouped by `(protocol, local port)`, then by remote endpoint.
+///
+/// Busy listeners retain many ended generations for late packets. Indexing each
+/// remote endpoint directly keeps unrelated insertion and lookup O(log n), while
+/// the inline bucket preserves insertion order among generations without paying for
+/// a second B-tree bound search on every packet.
+///
+/// The remote endpoint is deliberately not the complete tuple. Two local addresses
+/// can use the same port and remote endpoint, so exact operations still validate
+/// `Connection::remote_equals` within the normally single-element bucket.
+pub struct ConnectionMap<T: Connection>(BTreeMap<(IpProtocol, u16), RemoteConnections<T>>);
 
 /// Returns the first live match and remembers the first ended match as a
 /// possible late-packet fallback.
@@ -210,25 +261,24 @@ fn get_monotonic_timestamp_ms() -> u64 {
 
 impl<T: Connection + Clone> ConnectionMap<T> {
     pub fn new() -> Self {
-        Self(BTreeMap::new(), 1)
-    }
-
-    fn next_sequence(&mut self) -> u64 {
-        loop {
-            let sequence = self.1;
-            self.1 = self.1.wrapping_add(1);
-            if sequence != 0 {
-                return sequence;
-            }
-        }
+        Self(BTreeMap::new())
     }
 
     #[cfg(test)]
     fn add(&mut self, conn: T) {
         let key = conn.get_key().small();
-        let sequence = self.next_sequence();
-        let index = ConnectionIndex::from_connection(&conn, sequence);
-        self.0.entry(key).or_default().insert(index, conn);
+        let endpoint = remote_endpoint_from_connection(&conn);
+        match self.0.entry(key).or_default().entry(endpoint) {
+            Entry::Occupied(entry) => entry.into_mut().push(conn),
+            Entry::Vacant(entry) => {
+                entry.insert(ConnectionBucket::One(conn));
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_if_absent(&mut self, conn: T) -> Result<u64, (T, u64)> {
+        self.insert_if_absent_with(conn, |_| {})
     }
 
     /// Inserts `conn` only when its exact tuple has no live cache entry.
@@ -236,26 +286,50 @@ impl<T: Connection + Clone> ConnectionMap<T> {
     /// The caller owns the map exclusively for this entire check-and-insert, so
     /// two classify callbacks cannot both observe absence and create duplicate
     /// live entries. Retained ended history deliberately does not block tuple
-    /// reuse. The live instance ID is returned on both paths so callers can bind
-    /// follow-up state to the same entry without a second tuple lookup.
-    pub(crate) fn insert_if_absent(&mut self, conn: T) -> Result<u64, (T, u64)> {
+    /// reuse. When a live entry exists, `update_existing` runs while that already
+    /// located entry is borrowed, avoiding a second endpoint lookup for process or
+    /// lifecycle updates. The selected instance ID is returned on both paths.
+    pub(crate) fn insert_if_absent_with(
+        &mut self,
+        conn: T,
+        update_existing: impl FnOnce(&mut T),
+    ) -> Result<u64, (T, u64)> {
         let key = conn.get_key();
+        let endpoint = remote_endpoint_from_connection(&conn);
         let instance_id = conn.get_instance_id();
-        let sequence = self.next_sequence();
         let connections = self.0.entry(key.small()).or_default();
 
-        if let Some(existing_id) = connections
-            .range(connection_range(&key))
-            .map(|(_, connection)| connection)
-            .find(|existing| existing.remote_equals(&key) && !existing.has_ended())
-            .map(Connection::get_instance_id)
-        {
-            return Err((conn, existing_id));
+        match connections.entry(endpoint) {
+            Entry::Occupied(entry) => {
+                let bucket = entry.into_mut();
+                if let Some(existing) = bucket
+                    .iter_mut()
+                    .find(|existing| existing.remote_equals(&key) && !existing.has_ended())
+                {
+                    let existing_id = existing.get_instance_id();
+                    update_existing(existing);
+                    return Err((conn, existing_id));
+                }
+                bucket.push(conn);
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(ConnectionBucket::One(conn));
+            }
         }
 
-        let index = ConnectionIndex::from_connection(&conn, sequence);
-        connections.insert(index, conn);
         Ok(instance_id)
+    }
+
+    #[inline]
+    fn bucket(&self, key: &Key) -> Option<&ConnectionBucket<T>> {
+        let endpoint = remote_endpoint_from_key::<T>(key)?;
+        self.0.get(&key.small())?.get(&endpoint)
+    }
+
+    #[inline]
+    fn bucket_mut(&mut self, key: &Key) -> Option<&mut ConnectionBucket<T>> {
+        let endpoint = remote_endpoint_from_key::<T>(key)?;
+        self.0.get_mut(&key.small())?.get_mut(&endpoint)
     }
 
     /// Returns the live connection matching `key` for mutation.
@@ -265,26 +339,20 @@ impl<T: Connection + Clone> ConnectionMap<T> {
     /// connection; mutating retained history would make a stale verdict visible
     /// to late packets without changing the active flow.
     pub fn get_mut(&mut self, key: &Key) -> Option<&mut T> {
-        if let Some(connections) = self.0.get_mut(&key.small()) {
-            for (_, conn) in connections.range_mut(connection_range(key)) {
-                if conn.remote_equals(key) && !conn.has_ended() {
-                    refresh_untracked_activity(conn);
-                    return Some(conn);
-                }
-            }
-        }
-
-        None
+        let conn = self
+            .bucket_mut(key)?
+            .iter_mut()
+            .find(|conn| conn.remote_equals(key) && !conn.has_ended())?;
+        refresh_untracked_activity(conn);
+        Some(conn)
     }
 
     /// Returns the live fallback instance for an exact tuple, if one exists.
     /// This does not refresh activity; a caller that successfully binds native
     /// lifecycle state performs the exact-instance update separately.
     pub fn untracked_instance_id(&self, key: &Key) -> Option<u64> {
-        let connections = self.0.get(&key.small())?;
-        connections
-            .range(connection_range(key))
-            .map(|(_, connection)| connection)
+        self.bucket(key)?
+            .iter()
             .find(|conn| {
                 conn.remote_equals(key) && !conn.has_ended() && !conn.has_native_lifecycle()
             })
@@ -300,15 +368,12 @@ impl<T: Connection + Clone> ConnectionMap<T> {
             return false;
         }
 
-        self.0.get(&key.small()).is_some_and(|connections| {
-            connections
-                .range(connection_range(key))
-                .map(|(_, connection)| connection)
-                .any(|conn| {
-                    conn.remote_equals(key)
-                        && conn.get_instance_id() == instance_id
-                        && !conn.has_ended()
-                })
+        self.bucket(key).is_some_and(|bucket| {
+            bucket.iter().any(|conn| {
+                conn.remote_equals(key)
+                    && conn.get_instance_id() == instance_id
+                    && !conn.has_ended()
+            })
         })
     }
 
@@ -328,11 +393,14 @@ impl<T: Connection + Clone> ConnectionMap<T> {
         }
 
         self.0.get(&key.small()).is_some_and(|connections| {
-            connections.values().any(|conn| {
-                conn.redirect_equals(key)
-                    && conn.get_instance_id() == instance_id
-                    && !conn.has_ended()
-            })
+            connections
+                .values()
+                .flat_map(ConnectionBucket::iter)
+                .any(|conn| {
+                    conn.redirect_equals(key)
+                        && conn.get_instance_id() == instance_id
+                        && !conn.has_ended()
+                })
         })
     }
 
@@ -347,31 +415,46 @@ impl<T: Connection + Clone> ConnectionMap<T> {
             return None;
         }
 
-        if let Some(connections) = self.0.get_mut(&key.small()) {
-            let index = connections
-                .range(connection_range(key))
-                .find_map(|(index, conn)| {
-                    (conn.remote_equals(key)
-                        && conn.get_instance_id() == instance_id
-                        && !conn.has_ended())
-                    .then_some(*index)
-                });
-            if let Some(index) = index {
-                let conn = connections.get_mut(&index)?;
-                refresh_untracked_activity(conn);
-                return Some(conn);
-            }
+        let endpoint = remote_endpoint_from_key::<T>(key)?;
+        let connections = self.0.get_mut(&key.small())?;
 
-            if is_redirect_port(key.remote_port) {
-                if let Some(conn) = connections.values_mut().find(|conn| {
-                    conn.redirect_equals(key)
-                        && conn.get_instance_id() == instance_id
-                        && !conn.has_ended()
-                }) {
-                    refresh_untracked_activity(conn);
-                    return Some(conn);
-                }
-            }
+        if !is_redirect_port(key.remote_port) {
+            let conn = connections.get_mut(&endpoint)?.iter_mut().find(|conn| {
+                conn.remote_equals(key)
+                    && conn.get_instance_id() == instance_id
+                    && !conn.has_ended()
+            })?;
+            refresh_untracked_activity(conn);
+            return Some(conn);
+        }
+
+        // Redirect ports need a fallback scan. Locate an exact candidate without
+        // retaining a mutable bucket borrow across that scan; this uncommon path
+        // may perform a second direct lookup so the normal packet path never does.
+        let exact_index = connections.get(&endpoint).and_then(|bucket| {
+            bucket.iter().position(|conn| {
+                conn.remote_equals(key)
+                    && conn.get_instance_id() == instance_id
+                    && !conn.has_ended()
+            })
+        });
+        if let Some(index) = exact_index {
+            let conn = connections.get_mut(&endpoint)?.iter_mut().nth(index)?;
+            refresh_untracked_activity(conn);
+            return Some(conn);
+        }
+
+        if let Some(conn) = connections
+            .values_mut()
+            .flat_map(ConnectionBucket::iter_mut)
+            .find(|conn| {
+                conn.redirect_equals(key)
+                    && conn.get_instance_id() == instance_id
+                    && !conn.has_ended()
+            })
+        {
+            refresh_untracked_activity(conn);
+            return Some(conn);
         }
 
         None
@@ -397,6 +480,24 @@ impl<T: Connection + Clone> ConnectionMap<T> {
         read_connection: fn(&T) -> Option<C>,
     ) -> Option<C> {
         self.read_matching(key, read_connection, true)
+    }
+
+    /// Reads the most recently inserted ended generation for one exact tuple.
+    ///
+    /// This is used only to recognize a late ALE reauthorization after endpoint
+    /// closure. It deliberately ignores live and redirected entries and does not
+    /// refresh activity, so it cannot turn retained history into current state.
+    pub fn read_ended_exact<C>(
+        &self,
+        key: &Key,
+        read_connection: fn(&T) -> Option<C>,
+    ) -> Option<C> {
+        let connection = self
+            .bucket(key)?
+            .iter()
+            .rev()
+            .find(|connection| connection.remote_equals(key) && connection.has_ended())?;
+        read_connection(connection)
     }
 
     /// Reads connection policy for one packet indication.
@@ -425,13 +526,12 @@ impl<T: Connection + Clone> ConnectionMap<T> {
         use_ended_fallback: bool,
     ) -> Option<C> {
         if let Some(connections) = self.0.get(&key.small()) {
-            // Exact remote match first, over the indexed candidate range only.
-            let (live_exact, ended_exact) = live_and_ended_match(
-                connections
-                    .range(connection_range(key))
-                    .map(|(_, connection)| connection),
-                |conn| conn.remote_equals(key),
-            );
+            // Exact remote match first, using one direct endpoint lookup. The
+            // normally single-element bucket still validates the local address.
+            let (live_exact, ended_exact) = remote_endpoint_from_key::<T>(key)
+                .and_then(|endpoint| connections.get(&endpoint))
+                .map(|bucket| live_and_ended_match(bucket.iter(), |conn| conn.remote_equals(key)))
+                .unwrap_or((None, None));
 
             if let Some(conn) = live_exact {
                 refresh_untracked_activity(conn);
@@ -449,7 +549,10 @@ impl<T: Connection + Clone> ConnectionMap<T> {
             // skipped - which is what keeps an inbound flood, where every lookup
             // misses, off the O(n) path.
             let (live_redirect, ended_redirect) = if is_redirect_port(key.remote_port) {
-                live_and_ended_match(connections.values(), |conn| conn.redirect_equals(key))
+                live_and_ended_match(
+                    connections.values().flat_map(ConnectionBucket::iter),
+                    |conn| conn.redirect_equals(key),
+                )
             } else {
                 (None, None)
             };
@@ -477,16 +580,15 @@ impl<T: Connection + Clone> ConnectionMap<T> {
             return false;
         }
 
-        if let Some(connections) = self.0.get_mut(&key.small()) {
-            for (_, conn) in connections.range_mut(connection_range(key)) {
-                if conn.remote_equals(key)
+        if let Some(conn) = self.bucket_mut(key).and_then(|bucket| {
+            bucket.iter_mut().find(|conn| {
+                conn.remote_equals(key)
                     && conn.get_instance_id() == instance_id
                     && !conn.has_ended()
-                {
-                    conn.mark_native_lifecycle();
-                    return true;
-                }
-            }
+            })
+        }) {
+            conn.mark_native_lifecycle();
+            return true;
         }
         false
     }
@@ -501,18 +603,11 @@ impl<T: Connection + Clone> ConnectionMap<T> {
             return None;
         }
 
-        if let Some(connections) = self.0.get_mut(&key.small()) {
-            for (_, conn) in connections.range_mut(connection_range(&key)) {
-                if conn.remote_equals(&key)
-                    && conn.get_instance_id() == instance_id
-                    && !conn.has_ended()
-                {
-                    conn.end(get_monotonic_timestamp_ms());
-                    return Some(conn.clone());
-                }
-            }
-        }
-        None
+        let conn = self.bucket_mut(&key)?.iter_mut().find(|conn| {
+            conn.remote_equals(&key) && conn.get_instance_id() == instance_id && !conn.has_ended()
+        })?;
+        conn.end(get_monotonic_timestamp_ms());
+        Some(conn.clone())
     }
 
     /// Ends live connections for one local endpoint and returns copies of them.
@@ -561,13 +656,17 @@ impl<T: Connection + Clone> ConnectionMap<T> {
         if let Some(connections) = self.0.get_mut(&key) {
             let count = connections
                 .values()
+                .flat_map(ConnectionBucket::iter)
                 .filter(|connection| {
                     matches_endpoint(*connection, local_address, process_id, untracked_only)
                 })
                 .count();
             let mut vec = Vec::with_capacity(count);
             let timestamp = get_monotonic_timestamp_ms();
-            for conn in connections.values_mut() {
+            for conn in connections
+                .values_mut()
+                .flat_map(ConnectionBucket::iter_mut)
+            {
                 if matches_endpoint(conn, local_address, process_id, untracked_only) {
                     conn.end(timestamp);
                     vec.push(conn.clone());
@@ -592,6 +691,7 @@ impl<T: Connection + Clone> ConnectionMap<T> {
             .map(|connections| {
                 connections
                     .values()
+                    .flat_map(ConnectionBucket::iter)
                     .filter(|connection| should_expire_untracked(*connection, cutoff))
                     .count()
             })
@@ -599,7 +699,10 @@ impl<T: Connection + Clone> ConnectionMap<T> {
         let mut ended = Vec::with_capacity(count);
 
         for connections in self.0.values_mut() {
-            for conn in connections.values_mut() {
+            for conn in connections
+                .values_mut()
+                .flat_map(ConnectionBucket::iter_mut)
+            {
                 if should_expire_untracked(conn, cutoff) {
                     conn.end(now);
                     ended.push(conn.clone());
@@ -622,8 +725,10 @@ impl<T: Connection + Clone> ConnectionMap<T> {
         let before_one_minute = now.saturating_sub(Duration::from_secs(60).as_millis() as u64);
 
         for connections in self.0.values_mut() {
-            connections.retain(|_, connection| {
-                !connection.has_ended() || connection.get_end_time() >= before_one_minute
+            connections.retain(|_, bucket| {
+                bucket.retain(|connection| {
+                    !connection.has_ended() || connection.get_end_time() >= before_one_minute
+                })
             });
         }
         self.0.retain(|_, connections| !connections.is_empty());
@@ -636,7 +741,7 @@ impl<T: Connection + Clone> ConnectionMap<T> {
     /// for stale state, and inspecting an instance does not postpone its timeout.
     pub fn append_live_udp_instance_ids(&self, instance_ids: &mut Vec<u64>) {
         for connections in self.0.values() {
-            for connection in connections.values() {
+            for connection in connections.values().flat_map(ConnectionBucket::iter) {
                 if connection.get_protocol() == IpProtocol::Udp && !connection.has_ended() {
                     instance_ids.push(connection.get_instance_id());
                 }
@@ -645,17 +750,18 @@ impl<T: Connection + Clone> ConnectionMap<T> {
     }
 
     pub fn get_count(&self) -> usize {
-        let mut count = 0;
-        for conn in self.0.values() {
-            count += conn.len();
-        }
-        return count;
+        self.0
+            .values()
+            .flat_map(|connections| connections.values())
+            .map(ConnectionBucket::len)
+            .sum()
     }
 
     pub fn get_untracked_count(&self) -> usize {
         self.0
             .values()
             .flat_map(|connections| connections.values())
+            .flat_map(ConnectionBucket::iter)
             .filter(|connection| !connection.has_ended() && !connection.has_native_lifecycle())
             .count()
     }
@@ -663,10 +769,12 @@ impl<T: Connection + Clone> ConnectionMap<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConnectionMap, Key};
-    use crate::connection::{Connection, ConnectionV4, Direction, Verdict, PM_DNS_PORT};
-    use core::time::Duration;
-    use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Address};
+    use super::{remote_endpoint_from_key, ConnectionBucket, ConnectionMap, Key, RemoteEndpoint};
+    use crate::connection::{
+        Connection, ConnectionV4, ConnectionV6, Direction, Verdict, PM_DNS_PORT,
+    };
+    use core::{mem::size_of, time::Duration};
+    use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Address, Ipv6Address};
 
     fn key(remote_address: [u8; 4], remote_port: u16) -> Key {
         Key {
@@ -678,8 +786,22 @@ mod tests {
         }
     }
 
+    fn key_v6(remote_address: [u8; 16], remote_port: u16) -> Key {
+        Key {
+            protocol: IpProtocol::Udp,
+            local_address: IpAddress::Ipv6(Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+            local_port: 50_000,
+            remote_address: IpAddress::Ipv6(Ipv6Address::from_bytes(&remote_address)),
+            remote_port,
+        }
+    }
+
     fn live(key: &Key, process_id: u64) -> ConnectionV4 {
         ConnectionV4::from_key(key, process_id, Direction::Outbound).expect("IPv4 key")
+    }
+
+    fn live_v6(key: &Key, process_id: u64) -> ConnectionV6 {
+        ConnectionV6::from_key(key, process_id, Direction::Outbound).expect("IPv6 key")
     }
 
     fn untracked(key: &Key, process_id: u64) -> ConnectionV4 {
@@ -707,15 +829,86 @@ mod tests {
         Some(conn.process_id)
     }
 
+    fn read_process_id_v6(conn: &ConnectionV6) -> Option<u64> {
+        Some(conn.process_id)
+    }
+
     #[test]
-    fn indexed_range_distinguishes_local_addresses() {
+    fn remote_endpoint_indexes_are_compact() {
+        assert_eq!(size_of::<RemoteEndpoint<u32>>(), 8);
+        assert_eq!(size_of::<RemoteEndpoint<(u64, u64)>>(), 24);
+    }
+
+    #[test]
+    fn compact_ipv6_endpoints_remain_exactly_searchable() {
+        const CONNECTIONS: u16 = 1_024;
+        let mut map = ConnectionMap::new();
+
+        for ordinal in 0..CONNECTIONS {
+            let suffix = ((u32::from(ordinal) * 1_019) % u32::from(CONNECTIONS)) as u16;
+            let mut address = [0u8; 16];
+            address[..4].copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8]);
+            address[14..].copy_from_slice(&suffix.to_be_bytes());
+            let tuple = key_v6(address, 10_000 + suffix);
+            map.add(live_v6(&tuple, u64::from(suffix)));
+        }
+
+        assert_eq!(map.get_count(), usize::from(CONNECTIONS));
+        for suffix in 0..CONNECTIONS {
+            let mut address = [0u8; 16];
+            address[..4].copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8]);
+            address[14..].copy_from_slice(&suffix.to_be_bytes());
+            let tuple = key_v6(address, 10_000 + suffix);
+            assert_eq!(
+                map.read(&tuple, read_process_id_v6),
+                Some(u64::from(suffix))
+            );
+        }
+    }
+
+    #[test]
+    fn remote_endpoint_bucket_allocates_only_for_retained_generations() {
+        let tuple = key([198, 51, 100, 9], 443);
+        let endpoint = remote_endpoint_from_key::<ConnectionV4>(&tuple).expect("IPv4 endpoint");
+        let mut map = ConnectionMap::new();
+        map.add(ended(&tuple, 10));
+
+        let bucket = map
+            .0
+            .get(&tuple.small())
+            .and_then(|connections| connections.get(&endpoint))
+            .expect("inline connection bucket");
+        assert!(matches!(bucket, ConnectionBucket::One(_)));
+
+        map.add(live(&tuple, 20));
+        let bucket = map
+            .0
+            .get(&tuple.small())
+            .and_then(|connections| connections.get(&endpoint))
+            .expect("reused connection bucket");
+        assert!(
+            matches!(bucket, ConnectionBucket::Multiple(connections) if connections.len() == 2)
+        );
+
+        map.clean_ended_connections();
+        let bucket = map
+            .0
+            .get(&tuple.small())
+            .and_then(|connections| connections.get(&endpoint))
+            .expect("compacted connection bucket");
+        assert!(matches!(bucket, ConnectionBucket::One(connection) if connection.process_id == 20));
+    }
+
+    #[test]
+    fn remote_endpoint_bucket_distinguishes_local_addresses() {
         let first = key([198, 51, 100, 10], 443);
         let mut second = first;
         second.local_address = IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 2));
         let mut map = ConnectionMap::new();
-        map.add(live(&first, 10));
-        map.add(live(&second, 20));
+        assert!(map.insert_if_absent(live(&first, 10)).is_ok());
+        assert!(map.insert_if_absent(live(&second, 20)).is_ok());
 
+        assert_eq!(map.get_count(), 2);
         assert_eq!(map.read(&first, read_process_id), Some(10));
         assert_eq!(map.read(&second, read_process_id), Some(20));
     }
@@ -821,6 +1014,22 @@ mod tests {
     }
 
     #[test]
+    fn ended_exact_lookup_selects_latest_retained_generation_only() {
+        let tuple = key([8, 8, 4, 4], 443);
+        let redirect_target = key([127, 0, 0, 1], PM_DNS_PORT);
+        let mut map = ConnectionMap::new();
+        map.add(ended(&tuple, 10));
+        map.add(ended(&tuple, 20));
+        map.add(redirected(ended(&key([1, 1, 1, 1], 53), 30)));
+
+        assert_eq!(map.read_ended_exact(&tuple, read_process_id), Some(20));
+        assert_eq!(
+            map.read_ended_exact(&redirect_target, read_process_id),
+            None
+        );
+    }
+
+    #[test]
     fn insert_if_absent_rejects_duplicate_live_tuple() {
         let tuple = key([8, 8, 8, 8], 443);
         let mut map = ConnectionMap::new();
@@ -840,6 +1049,28 @@ mod tests {
         assert_eq!(rejected.process_id, 20);
         assert_eq!(map.get_count(), 1);
         assert_eq!(map.read(&tuple, read_process_id), Some(10));
+    }
+
+    #[test]
+    fn duplicate_update_reuses_the_located_live_entry() {
+        let tuple = key([8, 8, 8, 8], 8443);
+        let mut map = ConnectionMap::new();
+        let existing = untracked(&tuple, 0);
+        let existing_instance_id = existing.get_instance_id();
+        map.add(existing);
+
+        let result = map.insert_if_absent_with(live(&tuple, 20), |connection| {
+            connection.process_id = 20;
+            connection.mark_native_lifecycle();
+        });
+
+        assert!(matches!(
+            result,
+            Err((_rejected, instance_id)) if instance_id == existing_instance_id
+        ));
+        assert_eq!(map.get_count(), 1);
+        assert_eq!(map.read(&tuple, read_process_id), Some(20));
+        assert!(map.end_inactive_untracked_connections().is_empty());
     }
 
     #[test]

@@ -1,4 +1,6 @@
-use crate::ale_policy::self_injected_packet_needs_tcp_accept_authorization;
+use crate::ale_policy::{
+    can_reuse_ended_tcp_policy, self_injected_packet_needs_tcp_accept_authorization,
+};
 use crate::connection::{Connection, ConnectionV4, ConnectionV6, Direction, Verdict};
 use crate::connection_map::Key;
 use crate::device::{Device, Packet};
@@ -470,31 +472,71 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
     let cached = if ale_data.is_ipv6 {
         device
             .connection_cache
-            .read_connection_v6(&key, |conn| -> Option<(Verdict, u64)> {
+            .read_connection_v6(&key, |conn| -> Option<(Verdict, u64, bool)> {
                 // Function is behind spin lock, just copy and return.
-                Some((conn.verdict, conn.get_instance_id()))
+                Some((conn.verdict, conn.get_instance_id(), true))
             })
     } else {
         device
             .connection_cache
-            .read_connection_v4(&key, |conn| -> Option<(Verdict, u64)> {
+            .read_connection_v4(&key, |conn| -> Option<(Verdict, u64, bool)> {
                 // Function is behind spin lock, just copy and return.
-                Some((conn.verdict, conn.get_instance_id()))
+                Some((conn.verdict, conn.get_instance_id(), true))
             })
     };
+    // Completing or reinjecting a pended operation can produce one final TCP
+    // reauthorization after endpoint closure has ended its cache generation. Its
+    // optional endpoint metadata may already be incomplete. Treat the retained exact
+    // generation as policy history instead of registering a new live instance that
+    // can receive neither FLOW_ESTABLISHED nor another CLOSURE.
+    let cached = cached.or_else(|| {
+        if !can_reuse_ended_tcp_policy(ale_data.reauthorize, ale_data.protocol) {
+            return None;
+        }
+
+        if ale_data.is_ipv6 {
+            device.connection_cache.read_ended_connection_v6(
+                &key,
+                |conn| -> Option<(Verdict, u64, bool)> {
+                    Some((conn.verdict, conn.get_instance_id(), false))
+                },
+            )
+        } else {
+            device.connection_cache.read_ended_connection_v4(
+                &key,
+                |conn| -> Option<(Verdict, u64, bool)> {
+                    Some((conn.verdict, conn.get_instance_id(), false))
+                },
+            )
+        }
+    });
 
     // Connection already in cache.
-    if let Some((verdict, connection_instance_id)) = cached {
-        track_endpoint_instance(
-            device,
-            endpoint_handle,
-            parent_endpoint_handle,
-            key,
-            connection_instance_id,
-        );
+    if let Some((verdict, connection_instance_id, live)) = cached {
+        if live {
+            track_endpoint_instance(
+                device,
+                endpoint_handle,
+                parent_endpoint_handle,
+                key,
+                connection_instance_id,
+            );
+        } else {
+            crate::dbg!(
+                "processing TCP reauthorization after endpoint closure: {}",
+                key
+            );
+        }
         crate::dbg!("processing existing connection: {} {}", key, verdict);
         match verdict {
             // No verdict yet
+            Verdict::Undecided if !live => {
+                // Endpoint closure cannot leave a queued request behind: it either
+                // retired the request or waited for its verdict before ending the
+                // generation. A retained Undecided value is therefore teardown
+                // residue, not a new policy decision.
+                data.action_permit();
+            }
             Verdict::Undecided => {
                 crate::dbg!("saving packet: {}", key);
                 // Connection is already pended. Save packet and wait for verdict.

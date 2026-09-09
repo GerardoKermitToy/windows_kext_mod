@@ -2,6 +2,12 @@ use smoltcp::wire::IpProtocol;
 
 use crate::connection::Direction;
 
+/// Returns whether an ALE indication has the signature of a final TCP
+/// reauthorization racing endpoint closure.
+pub(crate) fn can_reuse_ended_tcp_policy(reauthorize: bool, protocol: IpProtocol) -> bool {
+    reauthorize && protocol == IpProtocol::Tcp
+}
+
 /// Returns whether a self-injected ALE indication must still run the server-side
 /// TCP receive/accept authorization path.
 ///
@@ -22,9 +28,16 @@ pub(crate) fn self_injected_packet_needs_tcp_accept_authorization(
 
 #[cfg(test)]
 mod tests {
-    use super::self_injected_packet_needs_tcp_accept_authorization;
+    use super::{can_reuse_ended_tcp_policy, self_injected_packet_needs_tcp_accept_authorization};
     use crate::connection::Direction;
     use smoltcp::wire::IpProtocol;
+
+    #[test]
+    fn ended_policy_is_used_only_for_tcp_reauthorization() {
+        assert!(can_reuse_ended_tcp_policy(true, IpProtocol::Tcp));
+        assert!(!can_reuse_ended_tcp_policy(false, IpProtocol::Tcp));
+        assert!(!can_reuse_ended_tcp_policy(true, IpProtocol::Udp));
+    }
 
     #[test]
     fn only_inbound_loopback_tcp_needs_accept_authorization() {

@@ -24,6 +24,19 @@ fn next_connection_instance_id() -> u64 {
 }
 
 #[inline]
+fn ipv6_address_key(address: Ipv6Address) -> (u64, u64) {
+    let bytes = address.0;
+    (
+        u64::from_be_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]),
+        u64::from_be_bytes([
+            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+        ]),
+    )
+}
+
+#[inline]
 fn get_monotonic_timestamp_ms() -> u64 {
     #[cfg(not(test))]
     {
@@ -125,6 +138,11 @@ pub struct ConnectionExtra {
 }
 
 pub trait Connection {
+    /// Compact address representation used by the connection-cache index.
+    /// IPv4 and IPv6 live in separate maps, so the index does not need the
+    /// discriminant and storage overhead of `IpAddress`.
+    type RemoteAddressKey: Copy + Ord;
+
     fn redirect_info(&self) -> Option<RedirectInfo> {
         let redirect_address = if self.is_ipv6() {
             IpAddress::Ipv6(Ipv6Address::LOOPBACK)
@@ -190,6 +208,10 @@ pub trait Connection {
     fn get_local_port(&self) -> u16;
     /// Returns the remote address of the connection.
     fn get_remote_address(&self) -> IpAddress;
+    /// Returns the compact remote-address index key.
+    fn get_remote_address_key(&self) -> Self::RemoteAddressKey;
+    /// Converts a tuple's remote address to the family-specific index key.
+    fn remote_address_key(key: &Key) -> Option<Self::RemoteAddressKey>;
     /// Returns the remote port of the connection.
     fn get_remote_port(&self) -> u16;
     /// Returns true if the connection is an IPv6 connection.
@@ -304,6 +326,8 @@ impl ConnectionV4 {
 }
 
 impl Connection for ConnectionV4 {
+    type RemoteAddressKey = u32;
+
     fn remote_equals(&self, key: &Key) -> bool {
         if self.protocol != key.protocol
             || self.local_port != key.local_port
@@ -380,6 +404,19 @@ impl Connection for ConnectionV4 {
 
     fn get_remote_address(&self) -> IpAddress {
         IpAddress::Ipv4(self.remote_address)
+    }
+
+    #[inline]
+    fn get_remote_address_key(&self) -> Self::RemoteAddressKey {
+        u32::from_be_bytes(self.remote_address.0)
+    }
+
+    #[inline]
+    fn remote_address_key(key: &Key) -> Option<Self::RemoteAddressKey> {
+        match key.remote_address {
+            IpAddress::Ipv4(address) => Some(u32::from_be_bytes(address.0)),
+            IpAddress::Ipv6(_) => None,
+        }
     }
 
     fn get_remote_port(&self) -> u16 {
@@ -496,6 +533,8 @@ impl ConnectionV6 {
 }
 
 impl Connection for ConnectionV6 {
+    type RemoteAddressKey = (u64, u64);
+
     fn remote_equals(&self, key: &Key) -> bool {
         if self.protocol != key.protocol
             || self.local_port != key.local_port
@@ -571,6 +610,19 @@ impl Connection for ConnectionV6 {
 
     fn get_remote_address(&self) -> IpAddress {
         IpAddress::Ipv6(self.remote_address)
+    }
+
+    #[inline]
+    fn get_remote_address_key(&self) -> Self::RemoteAddressKey {
+        ipv6_address_key(self.remote_address)
+    }
+
+    #[inline]
+    fn remote_address_key(key: &Key) -> Option<Self::RemoteAddressKey> {
+        match key.remote_address {
+            IpAddress::Ipv4(_) => None,
+            IpAddress::Ipv6(address) => Some(ipv6_address_key(address)),
+        }
     }
 
     fn get_remote_port(&self) -> u16 {
