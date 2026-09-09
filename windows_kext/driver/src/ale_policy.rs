@@ -58,7 +58,7 @@ pub(crate) fn classify_ale_injection(
     packet_direction: Direction,
 ) -> AleInjectionAction {
     if injection.is_self_injected()
-        && !self_injected_packet_needs_tcp_accept_authorization(
+        && !self_injected_packet_needs_accept_authorization(
             protocol,
             loopback,
             connection_direction,
@@ -105,18 +105,18 @@ pub(crate) fn should_skip_cross_direction_ale_clone(
 }
 
 /// Returns whether a self-injected ALE indication must still run the server-side
-/// TCP receive/accept authorization path.
+/// TCP/UDP receive/accept authorization path.
 ///
-/// Network reinjection of an outbound loopback SYN can be the first packet seen
-/// by the listening endpoint. Every other self-injected indication keeps the
+/// Network reinjection of the first outbound loopback packet can be the first NBL
+/// seen by the listening endpoint. Every other self-injected indication keeps the
 /// normal immediate-permit loop guard.
-pub(crate) fn self_injected_packet_needs_tcp_accept_authorization(
+pub(crate) fn self_injected_packet_needs_accept_authorization(
     protocol: IpProtocol,
     loopback: bool,
     connection_direction: Direction,
     packet_direction: Direction,
 ) -> bool {
-    protocol == IpProtocol::Tcp
+    matches!(protocol, IpProtocol::Tcp | IpProtocol::Udp)
         && loopback
         && matches!(connection_direction, Direction::Inbound)
         && matches!(packet_direction, Direction::Inbound)
@@ -126,7 +126,7 @@ pub(crate) fn self_injected_packet_needs_tcp_accept_authorization(
 mod tests {
     use super::{
         can_reuse_ended_tcp_policy, classify_ale_injection,
-        self_injected_packet_needs_tcp_accept_authorization, should_capture_ale_packet,
+        self_injected_packet_needs_accept_authorization, should_capture_ale_packet,
         should_skip_cross_direction_ale_clone, should_skip_injected_outbound_flow,
         AleInjectionAction, InjectionStatus,
     };
@@ -141,32 +141,34 @@ mod tests {
     }
 
     #[test]
-    fn only_inbound_loopback_tcp_needs_accept_authorization() {
-        assert!(self_injected_packet_needs_tcp_accept_authorization(
-            IpProtocol::Tcp,
+    fn only_inbound_loopback_transport_needs_accept_authorization() {
+        for protocol in [IpProtocol::Tcp, IpProtocol::Udp] {
+            assert!(self_injected_packet_needs_accept_authorization(
+                protocol,
+                true,
+                Direction::Inbound,
+                Direction::Inbound,
+            ));
+        }
+        assert!(!self_injected_packet_needs_accept_authorization(
+            IpProtocol::Icmp,
             true,
             Direction::Inbound,
             Direction::Inbound,
         ));
-        assert!(!self_injected_packet_needs_tcp_accept_authorization(
-            IpProtocol::Udp,
-            true,
-            Direction::Inbound,
-            Direction::Inbound,
-        ));
-        assert!(!self_injected_packet_needs_tcp_accept_authorization(
+        assert!(!self_injected_packet_needs_accept_authorization(
             IpProtocol::Tcp,
             false,
             Direction::Inbound,
             Direction::Inbound,
         ));
-        assert!(!self_injected_packet_needs_tcp_accept_authorization(
+        assert!(!self_injected_packet_needs_accept_authorization(
             IpProtocol::Tcp,
             true,
             Direction::Outbound,
             Direction::Inbound,
         ));
-        assert!(!self_injected_packet_needs_tcp_accept_authorization(
+        assert!(!self_injected_packet_needs_accept_authorization(
             IpProtocol::Tcp,
             true,
             Direction::Inbound,
@@ -203,18 +205,23 @@ mod tests {
     }
 
     #[test]
-    fn self_injected_loopback_syn_still_authorizes_server_endpoint() {
-        for transport_other in [false, true] {
-            assert_eq!(
-                classify_ale_injection(
-                    InjectionStatus::new(true, false, false, transport_other),
-                    IpProtocol::Tcp,
-                    true,
-                    Direction::Inbound,
-                    Direction::Inbound,
-                ),
-                AleInjectionAction::Process
-            );
+    fn self_injected_loopback_transport_still_authorizes_server_endpoint() {
+        for injection in [
+            InjectionStatus::new(true, false, false, false),
+            InjectionStatus::new(false, true, true, false),
+        ] {
+            for protocol in [IpProtocol::Tcp, IpProtocol::Udp] {
+                assert_eq!(
+                    classify_ale_injection(
+                        injection,
+                        protocol,
+                        true,
+                        Direction::Inbound,
+                        Direction::Inbound,
+                    ),
+                    AleInjectionAction::Process
+                );
+            }
         }
     }
 

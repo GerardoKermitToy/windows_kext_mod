@@ -39,7 +39,7 @@ For a new TCP/UDP connection:
 
 If another indication arrives while the cache entry is still `Undecided`, it is saved under a separate packet ID and another event is queued. An outgoing indication can itself contain several `NET_BUFFER` packets; the packet cache splits that batch into one event and one verdict ID per packet before publishing it.
 
-Self-injected packets normally bypass ALE authorization to prevent reinjection loops. One narrow exception preserves the two application endpoints of a loopback TCP connection: an outbound packet-layer temporary verdict can reinject the original SYN before the server has reached `ALE_AUTH_RECV_ACCEPT`. That first inbound copy still follows the normal receive/accept path, so the listener PID, provisional child endpoint, and an independent server-side verdict are recorded. Registration precedes reinjection of its verdict clone; the next self-injected copy therefore finds cached receive/accept state and is permitted without another request.
+Self-injected packets normally bypass ALE authorization to prevent reinjection loops. One narrow exception preserves both application endpoints of loopback TCP and UDP traffic: an outbound packet-layer verdict can reinject the first packet before the server has reached `ALE_AUTH_RECV_ACCEPT`. That first inbound copy still follows the normal receive/accept path, so the listener PID, endpoint identity, and an independent server-side verdict are recorded; TCP also records its provisional child endpoint. Registration precedes reinjection of the verdict clone, so the next self-injected copy finds cached receive/accept state and is permitted without another request.
 
 ### Applying a verdict
 
