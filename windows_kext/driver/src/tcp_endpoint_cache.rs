@@ -169,7 +169,10 @@ mod tests {
         assert!(cache.rebind_established(30, endpoint));
 
         assert!(cache.take(10).is_none());
-        assert_eq!(cache.take(30).expect("established endpoint").instance_id, 100);
+        assert_eq!(
+            cache.take(30).expect("established endpoint").instance_id,
+            100
+        );
     }
 
     #[test]
@@ -265,5 +268,109 @@ mod tests {
         assert!(connections
             .end_instance(current.key, current.instance_id)
             .is_some());
+    }
+
+    #[test]
+    fn identical_tuple_isolated_by_parent_endpoint() {
+        let mut cache = TcpEndpointCache::new();
+        let tuple = key();
+
+        assert!(cache.associate_instance(10, tuple, Some(20), 100));
+        assert!(cache.associate_instance(11, tuple, Some(21), 101));
+
+        assert_eq!(
+            cache
+                .resolve_live_instance(&tuple, Some(20), |_| true)
+                .expect("first listener child")
+                .instance_id,
+            100
+        );
+        assert_eq!(
+            cache
+                .resolve_live_instance(&tuple, Some(21), |_| true)
+                .expect("second listener child")
+                .instance_id,
+            101
+        );
+        assert!(cache
+            .resolve_live_instance(&tuple, None, |_| true)
+            .is_none());
+    }
+
+    #[test]
+    fn parentless_authorization_matches_only_parentless_flow() {
+        let mut cache = TcpEndpointCache::new();
+        let tuple = key();
+
+        assert!(cache.associate_instance(10, tuple, None, 100));
+        assert!(cache
+            .resolve_live_instance(&tuple, Some(20), |_| true)
+            .is_none());
+        assert_eq!(
+            cache
+                .resolve_live_instance(&tuple, None, |_| true)
+                .expect("parentless outbound endpoint")
+                .instance_id,
+            100
+        );
+    }
+
+    #[test]
+    fn established_rebind_removes_every_provisional_alias() {
+        let mut cache = TcpEndpointCache::new();
+        let tuple = key();
+
+        assert!(cache.associate_instance(10, tuple, Some(20), 100));
+        assert!(cache.associate_instance(11, tuple, Some(20), 100));
+        let endpoint = cache
+            .resolve_live_instance(&tuple, Some(20), |instance_id| instance_id == 100)
+            .expect("authorization generation");
+
+        assert!(cache.rebind_established(30, endpoint));
+        assert!(cache.take(10).is_none());
+        assert!(cache.take(11).is_none());
+        assert!(cache
+            .take(30)
+            .is_some_and(|candidate| candidate == endpoint));
+    }
+
+    #[test]
+    fn established_handle_cannot_replace_another_generation() {
+        let mut cache = TcpEndpointCache::new();
+        let tuple = key();
+        assert!(cache.associate_instance(10, tuple, Some(20), 100));
+        assert!(cache.associate_instance(30, tuple, Some(20), 101));
+        let endpoint = cache
+            .resolve_live_instance(&tuple, Some(20), |instance_id| instance_id == 100)
+            .expect("first generation");
+
+        assert!(!cache.rebind_established(30, endpoint));
+        assert!(cache
+            .take(10)
+            .is_some_and(|candidate| candidate == endpoint));
+        assert_eq!(
+            cache.take(30).expect("conflicting generation").instance_id,
+            101
+        );
+    }
+
+    #[test]
+    fn zero_endpoint_or_instance_is_never_associated() {
+        let mut cache = TcpEndpointCache::new();
+        let tuple = key();
+
+        assert!(!cache.associate_instance(0, tuple, Some(20), 100));
+        assert!(!cache.associate_instance(10, tuple, Some(20), 0));
+        assert!(cache
+            .resolve_live_instance(&tuple, Some(20), |_| true)
+            .is_none());
+        assert!(!cache.rebind_established(
+            0,
+            super::TcpEndpointConnection {
+                key: tuple,
+                parent_endpoint_handle: Some(20),
+                instance_id: 100,
+            }
+        ));
     }
 }

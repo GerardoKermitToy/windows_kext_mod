@@ -5,6 +5,7 @@ use wdk::filter_engine::layer;
 use wdk::filter_engine::net_buffer::{NetBufferList, NetBufferListClones, NetBufferListIter};
 use wdk::filter_engine::packet::InjectInfo;
 
+use crate::ale_policy::InjectionStatus;
 use crate::connection::{
     Connection, ConnectionV4, ConnectionV6, Direction, RedirectInfo, Verdict, PM_DNS_PORT,
     PM_SPLIT_TUN_PORT, PM_SPN_PORT,
@@ -243,14 +244,28 @@ fn ip_packet_layer(
         }
     }
 
-    // SAFETY: The WFP-owned layer data is still live. Querying injection metadata
-    // is synchronous and does not depend on the first net buffer's data offset.
-    let injection_origin = unsafe {
-        device
-            .injector
-            .network_packet_injection_origin(layer_data as _, ipv6)
+    // SAFETY: The WFP-owned layer data is still live. Querying both handles is
+    // synchronous and does not depend on the first net buffer's data offset. An
+    // ALE clone injected through the transport handle is reported as
+    // `InjectedByOther` relative to the network handle, so self-injection must have
+    // priority across both results.
+    let (network_injection_origin, transport_injection_origin) = unsafe {
+        (
+            device
+                .injector
+                .network_packet_injection_origin(layer_data as _, ipv6),
+            device
+                .injector
+                .transport_packet_injection_origin(layer_data as _),
+        )
     };
-    if injection_origin.is_self_injected() {
+    let injection_status = InjectionStatus::new(
+        network_injection_origin.is_self_injected(),
+        transport_injection_origin.is_self_injected(),
+        network_injection_origin.is_injected_by_other(),
+        transport_injection_origin.is_injected_by_other(),
+    );
+    if injection_status.is_self_injected() {
         data.action_permit();
         return;
     }
@@ -260,7 +275,7 @@ fn ip_packet_layer(
     // while the current process identifies the service that initiated that send.
     // Read it only on the outbound path; inbound processing can run in an
     // unrelated thread context.
-    let injected_by_other = injection_origin.is_injected_by_other();
+    let injected_by_other = injection_status.is_injected_by_other();
     let other_injector_process_id = if injected_by_other && !inbound {
         wdk::utils::current_process_id()
     } else {

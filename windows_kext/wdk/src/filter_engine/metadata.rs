@@ -11,8 +11,8 @@ use windows_sys::Win32::{
             FWPS_METADATA_FIELD_FLOW_HANDLE, FWPS_METADATA_FIELD_FRAGMENT_DATA,
             FWPS_METADATA_FIELD_IP_HEADER_SIZE, FWPS_METADATA_FIELD_PACKET_DIRECTION,
             FWPS_METADATA_FIELD_PARENT_ENDPOINT_HANDLE, FWPS_METADATA_FIELD_PROCESS_ID,
-            FWPS_METADATA_FIELD_PROCESS_PATH,
-            FWPS_METADATA_FIELD_REMOTE_SCOPE_ID, FWPS_METADATA_FIELD_TRANSPORT_CONTROL_DATA,
+            FWPS_METADATA_FIELD_PROCESS_PATH, FWPS_METADATA_FIELD_REMOTE_SCOPE_ID,
+            FWPS_METADATA_FIELD_TRANSPORT_CONTROL_DATA,
             FWPS_METADATA_FIELD_TRANSPORT_ENDPOINT_HANDLE,
             FWPS_METADATA_FIELD_TRANSPORT_HEADER_SIZE, FWP_BYTE_BLOB, FWP_DIRECTION,
             FWP_DIRECTION_INBOUND, FWP_DIRECTION_OUTBOUND,
@@ -355,10 +355,36 @@ const _: () = {
 
 #[cfg(test)]
 mod tests {
-    use super::PacketDirection;
+    use super::{FwpsIncomingMetadataValues, PacketDirection};
     use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
+        FWPS_METADATA_FIELD_PARENT_ENDPOINT_HANDLE, FWPS_METADATA_FIELD_TRANSPORT_ENDPOINT_HANDLE,
         FWP_DIRECTION_INBOUND, FWP_DIRECTION_MAX, FWP_DIRECTION_OUTBOUND,
     };
+
+    #[test]
+    fn endpoint_handles_require_their_individual_metadata_bits() {
+        // Every field in this native metadata mirror permits an all-zero
+        // representation; populate only the values exercised by this test.
+        let mut metadata: FwpsIncomingMetadataValues = unsafe { core::mem::zeroed() };
+        metadata.transport_endpoint_handle = 0x1111;
+        metadata.parent_endpoint_handle = 0x2222;
+
+        assert_eq!(metadata.get_transport_endpoint_handle(), None);
+        assert_eq!(metadata.get_parent_endpoint_handle(), None);
+
+        metadata.current_metadata_values = FWPS_METADATA_FIELD_TRANSPORT_ENDPOINT_HANDLE;
+        assert_eq!(metadata.get_transport_endpoint_handle(), Some(0x1111));
+        assert_eq!(metadata.get_parent_endpoint_handle(), None);
+
+        metadata.current_metadata_values = FWPS_METADATA_FIELD_PARENT_ENDPOINT_HANDLE;
+        assert_eq!(metadata.get_transport_endpoint_handle(), None);
+        assert_eq!(metadata.get_parent_endpoint_handle(), Some(0x2222));
+
+        metadata.current_metadata_values = FWPS_METADATA_FIELD_TRANSPORT_ENDPOINT_HANDLE
+            | FWPS_METADATA_FIELD_PARENT_ENDPOINT_HANDLE;
+        assert_eq!(metadata.get_transport_endpoint_handle(), Some(0x1111));
+        assert_eq!(metadata.get_parent_endpoint_handle(), Some(0x2222));
+    }
 
     #[test]
     fn packet_direction_accepts_only_native_inbound_and_outbound_values() {

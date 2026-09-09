@@ -88,7 +88,7 @@ ICMP, IGMP, and protocols without TCP/UDP connection state are normally treated 
 
 ### Fragments and injected packets
 
-Individual IP fragments are permitted until WFP presents the reassembled datagram, which has a complete transport header and can be keyed safely. Packets injected with this driver's own network or transport handle are detected and permitted to prevent reinjection loops; packets injected by another driver remain subject to policy as described above.
+Individual IP fragments are permitted until WFP presents the reassembled datagram, which has a complete transport header and can be keyed safely. Packets injected with this driver's own network or transport handle are detected and permitted to prevent reinjection loops; packets injected by another driver remain subject to policy as described above. The IP packet layer queries both driver handles and gives self-injection precedence across the pair: WFP reports an ALE clone injected through the transport handle as `InjectedByOther` when the same NBL is queried only against the network handle.
 
 ## Connection cache
 

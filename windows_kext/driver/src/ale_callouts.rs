@@ -1,5 +1,7 @@
 use crate::ale_policy::{
-    can_reuse_ended_tcp_policy, self_injected_packet_needs_tcp_accept_authorization,
+    can_reuse_ended_tcp_policy, classify_ale_injection, should_capture_ale_packet,
+    should_skip_cross_direction_ale_clone, should_skip_injected_outbound_flow,
+    AleInjectionAction, InjectionStatus,
 };
 use crate::connection::{Connection, ConnectionV4, ConnectionV6, Direction, Verdict};
 use crate::connection_map::Key;
@@ -359,39 +361,31 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
             )
         }
     };
-    let self_injected = network_injection_origin.is_self_injected()
-        || transport_injection_origin.is_self_injected();
-    if self_injected
-        && !self_injected_packet_needs_tcp_accept_authorization(
-            ale_data.protocol,
-            ale_data.loopback,
-            ale_data.connection_direction,
-            ale_data.packet_direction,
-        )
-    {
-        data.action_permit();
-        return;
-    }
-    // A packet-layer temporary verdict can network-send a loopback TCP SYN
-    // before the server side has reached ALE_AUTH_RECV_ACCEPT. If the indication
-    // reaching this point is self-injected, it is that incoming copy; bypassing it
-    // would also bypass the server's authorization and leave its child endpoint
-    // without a connection-cache identity. Process this one terminating
-    // receive/accept path normally. Registration happens before its verdict clone
-    // is injected, so that self-injected copy takes the cached permit path below
-    // rather than creating a reinjection loop.
-    let injected_by_other = network_injection_origin.is_injected_by_other()
-        || transport_injection_origin.is_injected_by_other();
-
-    // A foreign network injector can create a synthetic System-owned ALE flow and
-    // expose one shared raw endpoint handle for many unrelated TCP/UDP tuples. It
-    // is not a socket connection that can be correlated through our endpoint
-    // caches. Let the outbound IP-packet callout apply policy instead; there it can
-    // retain a live application's connection or, once that endpoint has closed,
-    // report a stateless packet with the user-space injector's current PID.
-    if injected_by_other && matches!(ale_data.packet_direction, Direction::Outbound) {
-        data.action_permit();
-        return;
+    let injection_action = classify_ale_injection(
+        InjectionStatus::new(
+            network_injection_origin.is_self_injected(),
+            transport_injection_origin.is_self_injected(),
+            network_injection_origin.is_injected_by_other(),
+            transport_injection_origin.is_injected_by_other(),
+        ),
+        ale_data.protocol,
+        ale_data.loopback,
+        ale_data.connection_direction,
+        ale_data.packet_direction,
+    );
+    match injection_action {
+        AleInjectionAction::PermitSelfInjected => {
+            data.action_permit();
+            return;
+        }
+        AleInjectionAction::PermitOtherInjectedOutbound => {
+            // A foreign network injector can create a synthetic System-owned ALE
+            // flow and expose one shared raw endpoint handle for many unrelated
+            // tuples. Let the outbound IP-packet callout apply policy instead.
+            data.action_permit();
+            return;
+        }
+        AleInjectionAction::Process => {}
     }
 
     let key = ale_data.as_key();
@@ -718,15 +712,14 @@ fn save_packet(
     pend: bool,
 ) -> Result<Packet, alloc::string::String> {
     let mut packet_list = None;
-    let mut save_packet_list = true;
-    if ale_data.protocol == IpProtocol::Tcp
-        && matches!(ale_data.packet_direction, Direction::Outbound)
-    {
-        // Initial outbound TCP authorization has no packet data. A later
-        // reauthorization may carry a transport-header NBL, so preserve it when
-        // WFP makes one available.
-        save_packet_list = ale_data.reauthorize;
-    }
+    // Initial outbound TCP authorization has no packet data. A later
+    // reauthorization may carry a transport-header NBL, so preserve it when WFP
+    // makes one available.
+    let save_packet_list = should_capture_ale_packet(
+        ale_data.protocol,
+        ale_data.packet_direction,
+        ale_data.reauthorize,
+    );
     if save_packet_list {
         packet_list = create_packet_list(device, callout_data, ale_data)?;
     }
@@ -753,10 +746,11 @@ fn create_packet_list(
     // so it cannot be converted into the IP-header NBL required by transport
     // receive injection. Absorb this indication without a clone; after the verdict
     // forces another reauthorization, the next packet is classified normally.
-    if ale_data.reauthorize
-        && matches!(ale_data.connection_direction, Direction::Outbound)
-        && matches!(ale_data.packet_direction, Direction::Inbound)
-    {
+    if should_skip_cross_direction_ale_clone(
+        ale_data.reauthorize,
+        ale_data.connection_direction,
+        ale_data.packet_direction,
+    ) {
         return Ok(None);
     }
 
@@ -1410,7 +1404,11 @@ fn is_injected_outbound_transport_flow(
                 .transport_packet_injection_origin(layer_data as _),
         )
     };
-    network_origin.is_injected() || transport_origin.is_injected()
+    should_skip_injected_outbound_flow(
+        true,
+        network_origin.is_injected(),
+        transport_origin.is_injected(),
+    )
 }
 
 /// Refreshes the owning process when a TCP or UDP ALE flow becomes active.
