@@ -28,7 +28,6 @@ mod device;
 mod entry;
 #[cfg(not(test))]
 mod icmp_echo_cache;
-#[cfg(not(test))]
 mod id_cache;
 mod ipv6_packet;
 #[cfg(not(test))]

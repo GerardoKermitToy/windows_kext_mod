@@ -1,17 +1,42 @@
 use core::mem;
 
 use alloc::{
-    collections::{BTreeMap, VecDeque},
+    collections::{btree_map::Entry as MapEntry, BTreeMap, VecDeque},
     vec::Vec,
 };
+#[cfg(not(test))]
 use protocol::info::Info;
+#[cfg(not(test))]
 use smoltcp::wire::{IpAddress, IpProtocol};
+#[cfg(not(test))]
 use wdk::rw_spin_lock::RwSpinLock;
 
-use crate::{
-    connection::Direction, connection_map::Key, device::Packet,
-    tcp_closure_cache::request_matches_tcp_endpoint,
-};
+#[cfg(not(test))]
+use crate::{connection::Direction, device::Packet};
+use crate::{connection_map::Key, tcp_closure_cache::request_matches_tcp_endpoint};
+
+#[cfg(test)]
+pub(crate) struct Packet(bool);
+
+#[cfg(test)]
+impl Packet {
+    fn survives_connection_end(&self, _key: &Key) -> bool {
+        self.0
+    }
+}
+
+#[cfg(test)]
+struct RwSpinLock;
+
+#[cfg(test)]
+impl RwSpinLock {
+    const fn default() -> Self {
+        Self
+    }
+
+    fn read_lock(&self) {}
+    fn write_lock(&self) {}
+}
 
 pub struct Entry<T> {
     pub value: T,
@@ -30,6 +55,78 @@ struct PendingIdentity {
     connection_instance_id: Option<u64>,
 }
 
+#[cfg(not(test))]
+#[derive(Clone, Copy)]
+struct PendingContext {
+    key: Key,
+    connection_instance_id: Option<u64>,
+    process_id: u64,
+    direction: Direction,
+    ale_layer: bool,
+}
+
+/// Request IDs still queued for one live connection generation. Most
+/// generations have only one undecided packet, so keep that ID inline and
+/// allocate a vector only while several requests overlap.
+enum PendingIds {
+    One(u64),
+    Multiple(Vec<u64>),
+}
+
+impl PendingIds {
+    fn len(&self) -> usize {
+        match self {
+            Self::One(_) => 1,
+            Self::Multiple(ids) => ids.len(),
+        }
+    }
+
+    fn extend(&self, target: &mut Vec<u64>) {
+        match self {
+            Self::One(id) => target.push(*id),
+            Self::Multiple(ids) => target.extend_from_slice(ids),
+        }
+    }
+
+    fn push(&mut self, id: u64) {
+        match self {
+            Self::One(previous) => {
+                let previous = *previous;
+                *self = Self::Multiple(alloc::vec![previous, id]);
+            }
+            Self::Multiple(ids) => ids.push(id),
+        }
+    }
+
+    /// Removes one claimed request and returns whether the bucket is empty.
+    fn remove(&mut self, id: u64) -> Option<bool> {
+        match self {
+            Self::One(existing) => (*existing == id).then_some(true),
+            Self::Multiple(ids) => {
+                let index = ids.binary_search(&id).ok()?;
+                ids.remove(index);
+                Some(ids.is_empty())
+            }
+        }
+    }
+
+    fn append_with_instance(self, instance_id: u64, target: &mut Vec<(u64, u64)>) {
+        match self {
+            Self::One(id) => target.push((id, instance_id)),
+            Self::Multiple(ids) => {
+                target.extend(ids.into_iter().map(|id| (id, instance_id)));
+            }
+        }
+    }
+
+    fn for_each(self, mut apply: impl FnMut(u64)) {
+        match self {
+            Self::One(id) => apply(id),
+            Self::Multiple(ids) => ids.into_iter().for_each(apply),
+        }
+    }
+}
+
 pub struct PendingPacket {
     pub key: Key,
     pub packet: Packet,
@@ -40,6 +137,10 @@ pub struct PendingPacket {
 
 pub struct IdCache {
     values: VecDeque<Entry<PendingPacket>>,
+    /// Reverse index for requests that have not yet been claimed by a verdict.
+    /// Active requests are tracked separately in `active` and cannot be retired
+    /// from this queue.
+    pending_by_instance: BTreeMap<u64, PendingIds>,
     active: BTreeMap<u64, PendingIdentity>,
     lock: RwSpinLock,
     next_id: u64,
@@ -49,12 +150,14 @@ impl IdCache {
     pub fn new() -> Self {
         Self {
             values: VecDeque::with_capacity(1000),
+            pending_by_instance: BTreeMap::new(),
             active: BTreeMap::new(),
             lock: RwSpinLock::default(),
             next_id: 1, // 0 is invalid id
         }
     }
 
+    #[cfg(not(test))]
     pub fn push(
         &mut self,
         value: (Key, Packet),
@@ -65,6 +168,13 @@ impl IdCache {
     ) -> Vec<(u64, Info)> {
         let _guard = self.lock.write_lock();
         let (key, packet) = value;
+        let context = PendingContext {
+            key,
+            connection_instance_id,
+            process_id,
+            direction,
+            ale_layer,
+        };
 
         // One outgoing WFP indication can contain several NET_BUFFER packets.
         // Userspace decides packets rather than indications, so give every clone
@@ -76,33 +186,26 @@ impl IdCache {
                 let mut queued = Vec::with_capacity(nbls.len());
                 for nbl in nbls {
                     let packet = Packet::Network(nbl, inject_info);
-                    if let Some(entry) = push_packet(
-                        &mut self.values,
-                        &mut self.next_id,
-                        key,
-                        packet,
-                        connection_instance_id,
-                        process_id,
-                        direction,
-                        ale_layer,
-                    ) {
+                    if let Some(entry) =
+                        push_packet(&mut self.values, &mut self.next_id, packet, context)
+                    {
+                        add_pending_request(
+                            &mut self.pending_by_instance,
+                            connection_instance_id,
+                            entry.0,
+                        );
                         queued.push(entry);
                     }
                 }
                 queued
             }
-            packet => push_packet(
-                &mut self.values,
-                &mut self.next_id,
-                key,
-                packet,
-                connection_instance_id,
-                process_id,
-                direction,
-                ale_layer,
-            )
-            .into_iter()
-            .collect(),
+            packet => {
+                let queued = push_packet(&mut self.values, &mut self.next_id, packet, context);
+                if let Some((id, _)) = &queued {
+                    add_pending_request(&mut self.pending_by_instance, connection_instance_id, *id);
+                }
+                queued.into_iter().collect()
+            }
         }
     }
 
@@ -110,6 +213,11 @@ impl IdCache {
         let _guard = self.lock.write_lock();
         if let Ok(index) = self.values.binary_search_by_key(&id, |val| val.id) {
             let entry = self.values.remove(index)?;
+            remove_pending_request(
+                &mut self.pending_by_instance,
+                entry.value.connection_instance_id,
+                id,
+            );
             self.active.insert(
                 id,
                 PendingIdentity {
@@ -143,13 +251,19 @@ impl IdCache {
         };
 
         let mut ids = Vec::new();
-        ids.extend(self.values.iter().filter_map(|entry| {
-            matches(PendingIdentity {
-                key: entry.value.key,
-                connection_instance_id: entry.value.connection_instance_id,
-            })
-            .then_some(entry.id)
-        }));
+        if key.is_loopback() {
+            // The server-side loopback request has a reversed tuple and a distinct
+            // connection generation, so it still needs the complete tuple scan.
+            ids.extend(self.values.iter().filter_map(|entry| {
+                matches(PendingIdentity {
+                    key: entry.value.key,
+                    connection_instance_id: entry.value.connection_instance_id,
+                })
+                .then_some(entry.id)
+            }));
+        } else if let Some(pending) = self.pending_by_instance.get(&instance_id) {
+            pending.extend(&mut ids);
+        }
         ids.extend(
             self.active
                 .iter()
@@ -170,6 +284,11 @@ impl IdCache {
     /// connection tuple. Every NET_BUFFER packet retains its own request ID; entries
     /// are never merged. Other packets are removed and returned for fail-closed
     /// completion after both the cache lock and its outer Device lock are released.
+    ///
+    /// The reverse index makes the ordinary one-endpoint path proportional to the
+    /// number of that endpoint's pending requests rather than the size of the global
+    /// queue. No replacement queue is allocated: surviving UDP entries are changed
+    /// in place and other entries are removed directly from the existing deque.
     pub fn retire_connection_instances(
         &mut self,
         sorted_instance_ids: &[u64],
@@ -179,27 +298,64 @@ impl IdCache {
         }
 
         let _guard = self.lock.write_lock();
-        let mut retained = VecDeque::with_capacity(self.values.len());
         let mut removed = VecDeque::new();
 
-        while let Some(mut entry) = self.values.pop_front() {
-            let belongs_to_closed_instance = entry
-                .value
-                .connection_instance_id
-                .map(|instance_id| sorted_instance_ids.binary_search(&instance_id).is_ok())
-                .unwrap_or(false);
-            if belongs_to_closed_instance
-                && entry.value.packet.survives_connection_end(&entry.value.key)
+        if sorted_instance_ids.len() == 1 {
+            let instance_id = sorted_instance_ids[0];
+            if let Some(ids) = self.pending_by_instance.remove(&instance_id) {
+                retire_pending_ids(&mut self.values, instance_id, ids, &mut removed);
+            }
+            return removed;
+        }
+
+        let mut previous_instance_id = None;
+        let pending_count = sorted_instance_ids
+            .iter()
+            .copied()
+            .filter(|instance_id| {
+                let unique = previous_instance_id != Some(*instance_id);
+                previous_instance_id = Some(*instance_id);
+                unique
+            })
+            .filter_map(|instance_id| self.pending_by_instance.get(&instance_id))
+            .map(PendingIds::len)
+            .sum();
+        if pending_count == 0 {
+            return removed;
+        }
+
+        // Avoid a temporary allocation when a batched lifecycle notification has
+        // only one queued request among all of its connection generations.
+        if pending_count == 1 {
+            if let Some(instance_id) = sorted_instance_ids
+                .iter()
+                .copied()
+                .find(|instance_id| self.pending_by_instance.contains_key(instance_id))
             {
-                entry.value.connection_instance_id = None;
-                retained.push_back(entry);
-            } else if belongs_to_closed_instance {
-                removed.push_back(entry);
-            } else {
-                retained.push_back(entry);
+                if let Some(ids) = self.pending_by_instance.remove(&instance_id) {
+                    retire_pending_ids(&mut self.values, instance_id, ids, &mut removed);
+                }
+            }
+            return removed;
+        }
+
+        // Requests from several instances can interleave in the global queue. Sort
+        // only the affected IDs so fail-closed completions retain their prior order.
+        let mut pending_ids = Vec::with_capacity(pending_count);
+        previous_instance_id = None;
+        for instance_id in sorted_instance_ids.iter().copied() {
+            if previous_instance_id == Some(instance_id) {
+                continue;
+            }
+            previous_instance_id = Some(instance_id);
+            if let Some(ids) = self.pending_by_instance.remove(&instance_id) {
+                ids.append_with_instance(instance_id, &mut pending_ids);
             }
         }
-        self.values = retained;
+        pending_ids.sort_unstable_by_key(|(id, _)| *id);
+        for (id, instance_id) in pending_ids {
+            retire_pending_id(&mut self.values, id, instance_id, &mut removed);
+        }
         removed
     }
 
@@ -213,28 +369,100 @@ impl IdCache {
         let mut values = VecDeque::with_capacity(1);
         let _guard = self.lock.write_lock();
         mem::swap(&mut self.values, &mut values);
+        self.pending_by_instance.clear();
 
         return values;
     }
 }
 
+fn add_pending_request(
+    pending_by_instance: &mut BTreeMap<u64, PendingIds>,
+    connection_instance_id: Option<u64>,
+    request_id: u64,
+) {
+    let Some(instance_id) = connection_instance_id.filter(|instance_id| *instance_id != 0) else {
+        return;
+    };
+
+    match pending_by_instance.entry(instance_id) {
+        MapEntry::Occupied(entry) => entry.into_mut().push(request_id),
+        MapEntry::Vacant(entry) => {
+            entry.insert(PendingIds::One(request_id));
+        }
+    }
+}
+
+fn remove_pending_request(
+    pending_by_instance: &mut BTreeMap<u64, PendingIds>,
+    connection_instance_id: Option<u64>,
+    request_id: u64,
+) {
+    let Some(instance_id) = connection_instance_id.filter(|instance_id| *instance_id != 0) else {
+        return;
+    };
+    let Some(ids) = pending_by_instance.get_mut(&instance_id) else {
+        return;
+    };
+    let remove_instance = ids.remove(request_id).unwrap_or(false);
+    if remove_instance {
+        pending_by_instance.remove(&instance_id);
+    }
+}
+
+fn retire_pending_ids(
+    values: &mut VecDeque<Entry<PendingPacket>>,
+    instance_id: u64,
+    ids: PendingIds,
+    removed: &mut VecDeque<Entry<PendingPacket>>,
+) {
+    ids.for_each(|id| retire_pending_id(values, id, instance_id, removed));
+}
+
+fn retire_pending_id(
+    values: &mut VecDeque<Entry<PendingPacket>>,
+    id: u64,
+    instance_id: u64,
+    removed: &mut VecDeque<Entry<PendingPacket>>,
+) {
+    let Ok(index) = values.binary_search_by_key(&id, |entry| entry.id) else {
+        return;
+    };
+    if values[index].value.connection_instance_id != Some(instance_id) {
+        return;
+    }
+
+    if values[index]
+        .value
+        .packet
+        .survives_connection_end(&values[index].value.key)
+    {
+        values[index].value.connection_instance_id = None;
+    } else if let Some(entry) = values.remove(index) {
+        removed.push_back(entry);
+    }
+}
+
+#[cfg(not(test))]
 fn push_packet(
     values: &mut VecDeque<Entry<PendingPacket>>,
     next_id: &mut u64,
-    key: Key,
     packet: Packet,
-    connection_instance_id: Option<u64>,
-    process_id: u64,
-    direction: Direction,
-    ale_layer: bool,
+    context: PendingContext,
 ) -> Option<(u64, Info)> {
     let id = *next_id;
-    let info = build_info(&key, id, process_id, direction, &packet, ale_layer)?;
+    let info = build_info(
+        &context.key,
+        id,
+        context.process_id,
+        context.direction,
+        &packet,
+        context.ale_layer,
+    )?;
     values.push_back(Entry {
         value: PendingPacket {
-            key,
+            key: context.key,
             packet,
-            connection_instance_id,
+            connection_instance_id: context.connection_instance_id,
         },
         id,
     });
@@ -242,6 +470,7 @@ fn push_packet(
     Some((id, info))
 }
 
+#[cfg(not(test))]
 fn get_payload(packet: &Packet) -> Option<&[u8]> {
     match packet {
         Packet::Network(nbl, _) => nbl.get_data(),
@@ -252,6 +481,7 @@ fn get_payload(packet: &Packet) -> Option<&[u8]> {
     }
 }
 
+#[cfg(not(test))]
 fn build_info(
     key: &Key,
     packet_id: u64,
@@ -306,5 +536,181 @@ fn build_info(
             ))
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{add_pending_request, Entry, IdCache, Packet, PendingPacket};
+    use crate::connection_map::Key;
+    use alloc::vec;
+    use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Address};
+
+    fn key(remote_port: u16) -> Key {
+        Key {
+            protocol: IpProtocol::Udp,
+            local_address: IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 1)),
+            local_port: 40_000,
+            remote_address: IpAddress::Ipv4(Ipv4Address::new(192, 0, 2, 1)),
+            remote_port,
+        }
+    }
+
+    fn tcp_key() -> Key {
+        let mut key = key(443);
+        key.protocol = IpProtocol::Tcp;
+        key
+    }
+
+    fn queue(
+        cache: &mut IdCache,
+        id: u64,
+        connection_instance_id: Option<u64>,
+        survives_connection_end: bool,
+    ) {
+        cache.values.push_back(Entry {
+            value: PendingPacket {
+                key: key(id as u16),
+                packet: Packet(survives_connection_end),
+                connection_instance_id,
+            },
+            id,
+        });
+        add_pending_request(&mut cache.pending_by_instance, connection_instance_id, id);
+    }
+
+    fn queued_ids(cache: &IdCache) -> alloc::vec::Vec<u64> {
+        cache.values.iter().map(Entry::id).collect()
+    }
+
+    #[test]
+    fn surviving_request_is_detached_in_place() {
+        let mut cache = IdCache::new();
+        queue(&mut cache, 1, Some(10), false);
+        queue(&mut cache, 2, Some(20), true);
+        queue(&mut cache, 3, Some(30), false);
+        let capacity = cache.values.capacity();
+
+        let removed = cache.retire_connection_instances(&[20]);
+
+        assert!(removed.is_empty());
+        assert_eq!(queued_ids(&cache), vec![1, 2, 3]);
+        assert_eq!(cache.values.capacity(), capacity);
+        assert_eq!(cache.values[1].value.connection_instance_id, None);
+        assert!(!cache.pending_by_instance.contains_key(&20));
+        assert!(cache.pending_by_instance.contains_key(&10));
+        assert!(cache.pending_by_instance.contains_key(&30));
+
+        let detached = cache.pop_id(2).expect("detached request remains claimable");
+        assert_eq!(detached.connection_instance_id, None);
+        assert_eq!(queued_ids(&cache), vec![1, 3]);
+    }
+
+    #[test]
+    fn batched_retirement_preserves_global_request_order() {
+        let mut cache = IdCache::new();
+        queue(&mut cache, 1, Some(10), false);
+        queue(&mut cache, 2, Some(20), false);
+        queue(&mut cache, 3, Some(30), true);
+        queue(&mut cache, 4, Some(20), false);
+        queue(&mut cache, 5, Some(40), false);
+
+        let removed = cache.retire_connection_instances(&[20, 30]);
+
+        assert_eq!(
+            removed
+                .iter()
+                .map(Entry::id)
+                .collect::<alloc::vec::Vec<_>>(),
+            vec![2, 4]
+        );
+        assert_eq!(queued_ids(&cache), vec![1, 3, 5]);
+        assert_eq!(cache.values[1].value.connection_instance_id, None);
+        assert!(!cache.pending_by_instance.contains_key(&20));
+        assert!(!cache.pending_by_instance.contains_key(&30));
+        assert!(cache.pending_by_instance.contains_key(&10));
+        assert!(cache.pending_by_instance.contains_key(&40));
+    }
+
+    #[test]
+    fn claiming_requests_keeps_reverse_index_exact() {
+        let mut cache = IdCache::new();
+        queue(&mut cache, 1, Some(10), false);
+        queue(&mut cache, 2, Some(10), false);
+        queue(&mut cache, 3, Some(20), false);
+
+        let claimed = cache.pop_id(1).expect("first request");
+        assert_eq!(claimed.connection_instance_id, Some(10));
+        assert_eq!(
+            cache.pending_by_instance.get(&10).map(|ids| ids.len()),
+            Some(1)
+        );
+        assert_eq!(cache.tcp_endpoint_request_ids(&tcp_key(), 10), vec![1, 2]);
+
+        let removed = cache.retire_connection_instances(&[10]);
+        assert_eq!(
+            removed
+                .iter()
+                .map(Entry::id)
+                .collect::<alloc::vec::Vec<_>>(),
+            vec![2]
+        );
+        assert_eq!(queued_ids(&cache), vec![3]);
+        assert!(cache.pending_by_instance.get(&10).is_none());
+        assert!(cache.active.contains_key(&1));
+    }
+
+    #[test]
+    fn unknown_instances_do_not_rotate_or_reallocate_queue() {
+        let mut cache = IdCache::new();
+        queue(&mut cache, 1, Some(10), false);
+        queue(&mut cache, 2, None, false);
+        queue(&mut cache, 3, Some(30), false);
+        let first = cache.values.front().map(|entry| entry as *const _);
+        let capacity = cache.values.capacity();
+
+        let removed = cache.retire_connection_instances(&[20]);
+
+        assert!(removed.is_empty());
+        assert_eq!(queued_ids(&cache), vec![1, 2, 3]);
+        assert_eq!(cache.values.front().map(|entry| entry as *const _), first);
+        assert_eq!(cache.values.capacity(), capacity);
+    }
+
+    #[test]
+    fn duplicate_instance_ids_are_retired_once() {
+        let mut cache = IdCache::new();
+        queue(&mut cache, 1, Some(10), false);
+        queue(&mut cache, 2, Some(20), false);
+
+        let removed = cache.retire_connection_instances(&[10, 10]);
+
+        assert_eq!(
+            removed
+                .iter()
+                .map(Entry::id)
+                .collect::<alloc::vec::Vec<_>>(),
+            vec![1]
+        );
+        assert_eq!(queued_ids(&cache), vec![2]);
+    }
+
+    #[test]
+    fn draining_pending_requests_clears_reverse_index() {
+        let mut cache = IdCache::new();
+        queue(&mut cache, 1, Some(10), false);
+        queue(&mut cache, 2, Some(20), false);
+
+        let drained = cache.pop_all();
+
+        assert_eq!(
+            drained
+                .iter()
+                .map(Entry::id)
+                .collect::<alloc::vec::Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(cache.values.is_empty());
+        assert!(cache.pending_by_instance.is_empty());
     }
 }
