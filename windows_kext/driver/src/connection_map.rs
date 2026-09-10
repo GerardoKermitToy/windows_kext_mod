@@ -2,7 +2,10 @@ use core::{fmt::Display, time::Duration};
 
 use crate::connection::{is_redirect_port, Connection, Direction};
 use alloc::{
-    collections::{btree_map::Entry, BTreeMap},
+    collections::{
+        btree_map::{Entry, Values, ValuesMut},
+        BTreeMap,
+    },
     vec::Vec,
 };
 use smoltcp::wire::{IpAddress, IpProtocol};
@@ -159,19 +162,212 @@ impl<T> ConnectionBucket<T> {
     }
 }
 
-type RemoteConnections<T> =
+impl<T: Connection> ConnectionBucket<T> {
+    /// Returns the remote endpoint shared by every generation in this bucket.
+    ///
+    /// A bucket only ever groups connections that compare equal as endpoints, so
+    /// the first generation carries the key. Deriving it here keeps the inline
+    /// `RemoteConnections::One` representation from storing a second copy.
+    ///
+    /// A bucket is never empty while it is reachable: `retain` reports emptiness
+    /// to its owner, which drops the bucket instead of keeping it.
+    #[inline]
+    fn endpoint(&self) -> RemoteEndpoint<T::RemoteAddressKey> {
+        let connection = self.iter().next().expect("non-empty connection bucket");
+        remote_endpoint_from_connection(connection)
+    }
+}
+
+/// A remote endpoint map is allocated only after one local endpoint has more
+/// than one distinct remote endpoint. Most ephemeral connections have one remote
+/// endpoint per `(protocol, local port)` group, so keeping that case inline avoids
+/// a B-tree allocation for every such group.
+type RemoteMap<T> =
     BTreeMap<RemoteEndpoint<<T as Connection>::RemoteAddressKey>, ConnectionBucket<T>>;
+
+enum RemoteConnections<T: Connection> {
+    Empty,
+    One(ConnectionBucket<T>),
+    Many(RemoteMap<T>),
+}
+
+enum RemoteConnectionsValues<'a, T: Connection> {
+    Empty,
+    One(Option<&'a ConnectionBucket<T>>),
+    Many(Values<'a, RemoteEndpoint<T::RemoteAddressKey>, ConnectionBucket<T>>),
+}
+
+impl<'a, T: Connection> Iterator for RemoteConnectionsValues<'a, T> {
+    type Item = &'a ConnectionBucket<T>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Empty => None,
+            Self::One(bucket) => bucket.take(),
+            Self::Many(values) => values.next(),
+        }
+    }
+}
+
+enum RemoteConnectionsValuesMut<'a, T: Connection> {
+    Empty,
+    One(Option<&'a mut ConnectionBucket<T>>),
+    Many(ValuesMut<'a, RemoteEndpoint<T::RemoteAddressKey>, ConnectionBucket<T>>),
+}
+
+impl<'a, T: Connection> Iterator for RemoteConnectionsValuesMut<'a, T> {
+    type Item = &'a mut ConnectionBucket<T>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Empty => None,
+            Self::One(bucket) => bucket.take(),
+            Self::Many(values) => values.next(),
+        }
+    }
+}
+
+impl<T: Connection> RemoteConnections<T> {
+    #[inline]
+    fn empty() -> Self {
+        Self::Empty
+    }
+
+    #[inline]
+    fn get(&self, endpoint: &RemoteEndpoint<T::RemoteAddressKey>) -> Option<&ConnectionBucket<T>> {
+        match self {
+            Self::Empty => None,
+            Self::One(bucket) => (bucket.endpoint() == *endpoint).then_some(bucket),
+            Self::Many(connections) => connections.get(endpoint),
+        }
+    }
+
+    #[inline]
+    fn get_mut(
+        &mut self,
+        endpoint: &RemoteEndpoint<T::RemoteAddressKey>,
+    ) -> Option<&mut ConnectionBucket<T>> {
+        match self {
+            Self::Empty => None,
+            Self::One(bucket) => (bucket.endpoint() == *endpoint).then_some(bucket),
+            Self::Many(connections) => connections.get_mut(endpoint),
+        }
+    }
+
+    #[inline]
+    fn values(&self) -> RemoteConnectionsValues<'_, T> {
+        match self {
+            Self::Empty => RemoteConnectionsValues::Empty,
+            Self::One(bucket) => RemoteConnectionsValues::One(Some(bucket)),
+            Self::Many(connections) => RemoteConnectionsValues::Many(connections.values()),
+        }
+    }
+
+    #[inline]
+    fn values_mut(&mut self) -> RemoteConnectionsValuesMut<'_, T> {
+        match self {
+            Self::Empty => RemoteConnectionsValuesMut::Empty,
+            Self::One(bucket) => RemoteConnectionsValuesMut::One(Some(bucket)),
+            Self::Many(connections) => RemoteConnectionsValuesMut::Many(connections.values_mut()),
+        }
+    }
+
+    #[inline]
+    fn insert_into_map(
+        connections: &mut RemoteMap<T>,
+        endpoint: RemoteEndpoint<T::RemoteAddressKey>,
+        connection: T,
+    ) {
+        match connections.entry(endpoint) {
+            Entry::Occupied(entry) => entry.into_mut().push(connection),
+            Entry::Vacant(entry) => {
+                entry.insert(ConnectionBucket::One(connection));
+            }
+        }
+    }
+
+    fn insert(&mut self, endpoint: RemoteEndpoint<T::RemoteAddressKey>, connection: T) {
+        // Keep tuple-reuse generations in the existing inline bucket. Only a
+        // second distinct remote endpoint needs the map representation.
+        if let Self::One(bucket) = self {
+            if bucket.endpoint() == endpoint {
+                bucket.push(connection);
+                return;
+            }
+        }
+
+        match core::mem::replace(self, Self::Empty) {
+            Self::Empty => {
+                *self = Self::One(ConnectionBucket::One(connection));
+            }
+            Self::One(stored_bucket) => {
+                let mut connections = BTreeMap::new();
+                connections.insert(stored_bucket.endpoint(), stored_bucket);
+                Self::insert_into_map(&mut connections, endpoint, connection);
+                *self = Self::Many(connections);
+            }
+            Self::Many(mut connections) => {
+                Self::insert_into_map(&mut connections, endpoint, connection);
+                *self = Self::Many(connections);
+            }
+        }
+    }
+
+    fn retain(&mut self, mut retain: impl FnMut(&T) -> bool) {
+        let current = core::mem::replace(self, Self::Empty);
+        *self = match current {
+            Self::Empty => Self::Empty,
+            Self::One(mut bucket) => {
+                if bucket.retain(&mut retain) {
+                    Self::One(bucket)
+                } else {
+                    Self::Empty
+                }
+            }
+            Self::Many(mut connections) => {
+                connections.retain(|_, bucket| bucket.retain(&mut retain));
+                match connections.len() {
+                    0 => Self::Empty,
+                    1 => {
+                        let (_, bucket) = connections
+                            .into_iter()
+                            .next()
+                            .expect("one retained remote endpoint");
+                        Self::One(bucket)
+                    }
+                    _ => Self::Many(connections),
+                }
+            }
+        };
+    }
+
+    #[cfg(test)]
+    #[inline]
+    fn endpoint_count(&self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::One(_) => 1,
+            Self::Many(connections) => connections.len(),
+        }
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        matches!(self, Self::Empty)
+    }
+}
 
 /// Connections grouped by `(protocol, local port)`, then by remote endpoint.
 ///
-/// Busy listeners retain many ended generations for late packets. Indexing each
-/// remote endpoint directly keeps unrelated insertion and lookup O(log n), while
-/// the inline bucket preserves insertion order among generations without paying for
-/// a second B-tree bound search on every packet.
+/// The first remote endpoint in each local-port group is stored inline. A B-tree
+/// is allocated only when that group acquires a second distinct remote endpoint.
+/// Busy listeners still get ordered O(log n) endpoint lookup, while the common
+/// one-endpoint case avoids a fixed-size B-tree leaf allocation entirely.
 ///
-/// The remote endpoint is deliberately not the complete tuple. Two local addresses
-/// can use the same port and remote endpoint, so exact operations still validate
-/// `Connection::remote_equals` within the normally single-element bucket.
+/// Ended generations remain retained for late packets and are kept in insertion
+/// order inside their endpoint bucket. The remote endpoint is deliberately not
+/// the complete tuple: two local addresses can use the same port and remote
+/// endpoint, so exact operations still validate `Connection::remote_equals`.
 pub struct ConnectionMap<T: Connection>(BTreeMap<(IpProtocol, u16), RemoteConnections<T>>);
 
 /// Returns the first live match and remembers the first ended match as a
@@ -268,12 +464,10 @@ impl<T: Connection + Clone> ConnectionMap<T> {
     fn add(&mut self, conn: T) {
         let key = conn.get_key().small();
         let endpoint = remote_endpoint_from_connection(&conn);
-        match self.0.entry(key).or_default().entry(endpoint) {
-            Entry::Occupied(entry) => entry.into_mut().push(conn),
-            Entry::Vacant(entry) => {
-                entry.insert(ConnectionBucket::One(conn));
-            }
-        }
+        self.0
+            .entry(key)
+            .or_insert_with(RemoteConnections::empty)
+            .insert(endpoint, conn);
     }
 
     #[cfg(test)]
@@ -297,26 +491,23 @@ impl<T: Connection + Clone> ConnectionMap<T> {
         let key = conn.get_key();
         let endpoint = remote_endpoint_from_connection(&conn);
         let instance_id = conn.get_instance_id();
-        let connections = self.0.entry(key.small()).or_default();
+        let connections = self
+            .0
+            .entry(key.small())
+            .or_insert_with(RemoteConnections::empty);
 
-        match connections.entry(endpoint) {
-            Entry::Occupied(entry) => {
-                let bucket = entry.into_mut();
-                if let Some(existing) = bucket
-                    .iter_mut()
-                    .find(|existing| existing.remote_equals(&key) && !existing.has_ended())
-                {
-                    let existing_id = existing.get_instance_id();
-                    update_existing(existing);
-                    return Err((conn, existing_id));
-                }
-                bucket.push(conn);
-            }
-            Entry::Vacant(entry) => {
-                entry.insert(ConnectionBucket::One(conn));
+        if let Some(bucket) = connections.get_mut(&endpoint) {
+            if let Some(existing) = bucket
+                .iter_mut()
+                .find(|existing| existing.remote_equals(&key) && !existing.has_ended())
+            {
+                let existing_id = existing.get_instance_id();
+                update_existing(existing);
+                return Err((conn, existing_id));
             }
         }
 
+        connections.insert(endpoint, conn);
         Ok(instance_id)
     }
 
@@ -725,10 +916,8 @@ impl<T: Connection + Clone> ConnectionMap<T> {
         let before_one_minute = now.saturating_sub(Duration::from_secs(60).as_millis() as u64);
 
         for connections in self.0.values_mut() {
-            connections.retain(|_, bucket| {
-                bucket.retain(|connection| {
-                    !connection.has_ended() || connection.get_end_time() >= before_one_minute
-                })
+            connections.retain(|connection| {
+                !connection.has_ended() || connection.get_end_time() >= before_one_minute
             });
         }
         self.0.retain(|_, connections| !connections.is_empty());
@@ -769,7 +958,10 @@ impl<T: Connection + Clone> ConnectionMap<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{remote_endpoint_from_key, ConnectionBucket, ConnectionMap, Key, RemoteEndpoint};
+    use super::{
+        remote_endpoint_from_key, ConnectionBucket, ConnectionMap, Key, RemoteConnections,
+        RemoteEndpoint,
+    };
     use crate::connection::{
         Connection, ConnectionV4, ConnectionV6, Direction, Verdict, PM_DNS_PORT,
     };
@@ -867,7 +1059,38 @@ mod tests {
     }
 
     #[test]
-    fn remote_endpoint_bucket_allocates_only_for_retained_generations() {
+    fn remote_connections_keep_single_endpoint_inline() {
+        let tuple = key([198, 51, 100, 12], 443);
+        let mut map = ConnectionMap::new();
+        map.add(live(&tuple, 10));
+
+        let connections = map.0.get(&tuple.small()).expect("local endpoint bucket");
+        assert!(matches!(connections, RemoteConnections::One(_)));
+        assert_eq!(connections.endpoint_count(), 1);
+    }
+
+    #[test]
+    fn remote_connections_promote_and_compact() {
+        let first = key([198, 51, 100, 13], 443);
+        let mut second = first;
+        second.remote_address = IpAddress::Ipv4(Ipv4Address::new(198, 51, 100, 14));
+        let mut map = ConnectionMap::new();
+        map.add(live(&first, 10));
+        map.add(ended(&second, 20));
+
+        let connections = map.0.get(&first.small()).expect("local endpoint bucket");
+        assert!(matches!(connections, RemoteConnections::Many(_)));
+        assert_eq!(connections.endpoint_count(), 2);
+
+        map.clean_ended_connections();
+
+        let connections = map.0.get(&first.small()).expect("local endpoint bucket");
+        assert!(matches!(connections, RemoteConnections::One(_)));
+        assert_eq!(connections.endpoint_count(), 1);
+    }
+
+    #[test]
+    fn remote_endpoint_bucket_keeps_reused_generations_inline() {
         let tuple = key([198, 51, 100, 9], 443);
         let endpoint = remote_endpoint_from_key::<ConnectionV4>(&tuple).expect("IPv4 endpoint");
         let mut map = ConnectionMap::new();
@@ -1234,12 +1457,13 @@ mod tests {
         }
         map.add(live(&live_tuple, 20));
         let bucket_key = live_tuple.small();
-        assert_eq!(map.0.get(&bucket_key).expect("connection bucket").len(), 65);
+        let connections = map.0.get(&bucket_key).expect("connection bucket");
+        assert_eq!(connections.endpoint_count(), 65);
 
         map.clean_ended_connections();
 
         let connections = map.0.get(&bucket_key).expect("live connection bucket");
-        assert_eq!(connections.len(), 1);
+        assert_eq!(connections.endpoint_count(), 1);
         assert_eq!(map.read(&live_tuple, read_process_id), Some(20));
     }
 
