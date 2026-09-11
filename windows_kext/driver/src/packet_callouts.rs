@@ -163,8 +163,9 @@ fn ip_packet_layer(
     sub_interface_index: u32,
     flags_index: usize,
 ) {
-    // Make the default path as drop.
-    data.block_and_absorb();
+    // Fail closed until a later path explicitly permits the indication. Do not
+    // make this provisional action hard: the callback still needs to replace it.
+    data.set_default_block_and_absorb();
 
     // Read indication-wide metadata and the layer-data pointer once. Every clone
     // receives the same routing context, and WFP keeps the NBL chain stable until

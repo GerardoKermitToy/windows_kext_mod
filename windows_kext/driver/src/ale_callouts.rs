@@ -322,8 +322,9 @@ fn track_endpoint_instance(
 }
 
 fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
-    // Make the default path as drop.
-    data.block_and_absorb();
+    // Fail closed until a later path explicitly permits the indication. Do not
+    // make this provisional action hard: the callback still needs to replace it.
+    data.set_default_block_and_absorb();
 
     let Some(device) = crate::entry::get_device() else {
         return;

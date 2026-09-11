@@ -167,6 +167,7 @@ pub struct CalloutData<'a> {
     classify_out: &'a mut ClassifyOut,
     classify_context: *const c_void,
     layer_data: *mut c_void,
+    provisional_block: bool,
 }
 
 impl<'a> CalloutData<'a> {
@@ -182,6 +183,7 @@ impl<'a> CalloutData<'a> {
             classify_out: parts.classify_out,
             classify_context: parts.classify_context,
             layer_data: parts.layer_data,
+            provisional_block: false,
         }
     }
 
@@ -411,11 +413,13 @@ impl<'a> CalloutData<'a> {
     }
 
     pub fn action_permit(&mut self) {
+        self.provisional_block = false;
         self.classify_out.action_permit();
         self.classify_out.clear_absorb_flag();
     }
 
     pub fn action_continue(&mut self) {
+        self.provisional_block = false;
         self.classify_out.action_continue();
         self.classify_out.clear_absorb_flag();
     }
@@ -423,6 +427,7 @@ impl<'a> CalloutData<'a> {
     // Block action and clear the write flag.
     // This will block the packet and prevent next filter in the chain to change the action.
     pub fn action_block_hard(&mut self) {
+        self.provisional_block = false;
         self.classify_out.action_block();
         self.classify_out.clear_absorb_flag();
         // Next filter in the chain will not change the action.
@@ -430,15 +435,32 @@ impl<'a> CalloutData<'a> {
     }
 
     pub fn action_none(&mut self) {
+        self.provisional_block = false;
         self.classify_out.set_none();
         self.classify_out.clear_absorb_flag();
     }
 
-    pub fn block_and_absorb(&mut self) {
+    /// Sets a fail-closed provisional action while the callback is still choosing
+    /// whether this indication should be permitted. Unlike `block_and_absorb`, it
+    /// does not clear the action-write right, so a later `action_permit` remains a
+    /// valid decision for this same callback.
+    pub fn set_default_block_and_absorb(&mut self) {
+        self.provisional_block = true;
         self.classify_out.action_block();
         self.classify_out.set_absorb();
     }
+
+    /// Blocks and absorbs the indication as a final decision. The write right must
+    /// be cleared for clone/drop/reinject and for every other hard block, otherwise
+    /// a lower-priority filter can replace this action with permit.
+    pub fn block_and_absorb(&mut self) {
+        self.provisional_block = false;
+        self.classify_out.action_block();
+        self.classify_out.set_absorb();
+        self.classify_out.clear_write_flag();
+    }
     pub fn clear_write_flag(&mut self) {
+        self.provisional_block = false;
         self.classify_out.clear_write_flag();
     }
 
@@ -454,5 +476,102 @@ impl<'a> CalloutData<'a> {
     /// bounds/type check is sufficient and neither case can look reassembled.
     pub fn is_reassembled(&self, flags_index: usize) -> bool {
         self.get_value_u32(flags_index) & FWP_CONDITION_FLAG_IS_REASSEMBLED != 0
+    }
+}
+
+impl Drop for CalloutData<'_> {
+    fn drop(&mut self) {
+        // A classify callback starts with a provisional fail-closed action. If
+        // control returns without an explicit final action, make that default
+        // block hard so an early error/return cannot let a lower filter permit it.
+        if self.provisional_block {
+            self.classify_out.clear_write_flag();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CalloutData, CalloutDataParts, ClassifyOut, FwpsIncomingMetadataValues, Layer};
+
+    fn empty_metadata() -> FwpsIncomingMetadataValues {
+        // The native metadata mirror consists only of integer fields, C unions and
+        // pointers; an all-zero value means that no optional metadata is present.
+        unsafe { core::mem::zeroed() }
+    }
+
+    fn callout_data<'a>(
+        classify_out: &'a mut ClassifyOut,
+        metadata: &'a FwpsIncomingMetadataValues,
+    ) -> CalloutData<'a> {
+        CalloutData::from_parts(CalloutDataParts {
+            layer: Layer::OutboundIppacketV4,
+            layer_id: 0,
+            callout_id: 0,
+            filter_id: 0,
+            flow_context: 0,
+            values: &[],
+            metadata,
+            classify_out,
+            classify_context: core::ptr::null(),
+            layer_data: core::ptr::null_mut(),
+        })
+    }
+
+    #[test]
+    fn final_non_absorb_block_is_hard_immediately() {
+        let metadata = empty_metadata();
+        let mut classify_out = ClassifyOut::test_writable();
+        {
+            let mut data = callout_data(&mut classify_out, &metadata);
+            data.action_block_hard();
+        }
+
+        assert!(classify_out.test_is_block());
+        assert!(!classify_out.test_absorbs());
+        assert!(!classify_out.can_set_action());
+    }
+
+    #[test]
+    fn final_absorb_block_is_hard_immediately() {
+        let metadata = empty_metadata();
+        let mut classify_out = ClassifyOut::test_writable();
+        {
+            let mut data = callout_data(&mut classify_out, &metadata);
+            data.block_and_absorb();
+        }
+
+        assert!(classify_out.test_is_block());
+        assert!(classify_out.test_absorbs());
+        assert!(!classify_out.can_set_action());
+    }
+
+    #[test]
+    fn unresolved_default_block_becomes_hard_on_return() {
+        let metadata = empty_metadata();
+        let mut classify_out = ClassifyOut::test_writable();
+        {
+            let mut data = callout_data(&mut classify_out, &metadata);
+            data.set_default_block_and_absorb();
+        }
+
+        assert!(classify_out.test_is_block());
+        assert!(classify_out.test_absorbs());
+        assert!(!classify_out.can_set_action());
+    }
+
+    #[test]
+    fn explicit_permit_replaces_default_without_becoming_hard() {
+        let metadata = empty_metadata();
+        let mut classify_out = ClassifyOut::test_writable();
+        {
+            let mut data = callout_data(&mut classify_out, &metadata);
+            data.set_default_block_and_absorb();
+            data.action_permit();
+        }
+
+        assert!(classify_out.test_is_permit());
+        assert!(!classify_out.test_absorbs());
+        assert!(classify_out.can_set_action());
     }
 }

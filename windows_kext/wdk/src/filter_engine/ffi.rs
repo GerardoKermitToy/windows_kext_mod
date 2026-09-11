@@ -8,8 +8,8 @@ use crate::utils::check_ntstatus;
 use alloc::string::String;
 use ntstatus::ntstatus::NtStatus;
 
-use core::{ffi::c_void, mem::MaybeUninit};
 use core::ptr;
+use core::{ffi::c_void, mem::MaybeUninit};
 use widestring::U16CString;
 
 use windows_sys::Win32::Foundation::{NTSTATUS, STATUS_SUCCESS};
@@ -17,8 +17,8 @@ use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
     FwpmCalloutAdd0, FwpmEngineClose0, FwpmEngineOpen0, FwpmFilterAdd0, FwpmFilterDeleteById0,
     FwpmSubLayerAdd0, FwpmSubLayerDeleteByKey0, FwpmTransactionAbort0, FwpmTransactionBegin0,
     FwpmTransactionCommit0, FWPM_CALLOUT0, FWPM_CALLOUT_FLAG_USES_PROVIDER_CONTEXT,
-    FWPM_DISPLAY_DATA0, FWPM_FILTER0, FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT, FWPM_SESSION0,
-    FWPM_SESSION_FLAG_DYNAMIC, FWPM_SUBLAYER0, FWP_UINT8,
+    FWPM_DISPLAY_DATA0, FWPM_FILTER0, FWPM_SESSION0, FWPM_SESSION_FLAG_DYNAMIC, FWPM_SUBLAYER0,
+    FWP_UINT8,
 };
 use windows_sys::Win32::System::Rpc::RPC_C_AUTHN_WINNT;
 use windows_sys::{
@@ -294,7 +294,11 @@ pub(crate) fn register_filter(
         filter.subLayerKey = GUID::from_u128(sublayer_guid);
         filter.weight.r#type = FWP_UINT8;
         filter.weight.Anonymous.uint8 = 15; // The weight of this filter within its sublayer
-        filter.flags = FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT;
+
+        // Ordinary permits remain overridable. Block helpers clear
+        // FWPS_RIGHT_ACTION_WRITE explicitly, and the narrow Portmaster-owner
+        // permit path does the same when it intentionally needs a hard permit.
+        filter.flags = 0;
         filter.numFilterConditions = 0; // If you specify 0, this filter invokes its callout for all traffic in its layer
         filter.layerKey = layer.get_guid(); // This layer must match the layer that ExampleCallout is registered to
         filter.action.Anonymous.calloutKey = GUID::from_u128(callout_guid);
