@@ -121,8 +121,7 @@ fn inspect_ipv4_packet(packet: &[u8], direction: Direction) -> PacketInspection 
     };
 
     let outbound = matches!(direction, Direction::Outbound);
-    let is_icmp_port_unreachable = outbound
-        && protocol == IpProtocol::Icmp
+    let is_icmp_port_unreachable = protocol == IpProtocol::Icmp
         && ip_packet.version() == 4
         && is_port_unreachable(
             packet,
@@ -179,8 +178,7 @@ fn inspect_ipv6_packet(packet: &[u8], direction: Direction) -> PacketInspection 
 
     let outbound = matches!(direction, Direction::Outbound);
     let total_len = IPV6_HEADER_LEN + ip_packet.payload_len() as usize;
-    let is_icmp_port_unreachable = outbound
-        && headers.protocol == IpProtocol::Icmpv6
+    let is_icmp_port_unreachable = headers.protocol == IpProtocol::Icmpv6
         && ip_packet.version() == 6
         && is_port_unreachable(packet, headers.transport_offset, total_len, true);
     let is_tcp_reset = outbound
@@ -386,6 +384,11 @@ mod tests {
             .expect("ICMP unreachable metadata");
         assert!(metadata.icmp_echo.is_none());
         assert!(metadata.is_icmp_port_unreachable);
+
+        let inbound = inspect_packet(&packet, false, Direction::Inbound)
+            .metadata
+            .expect("inbound ICMP unreachable metadata");
+        assert!(inbound.is_icmp_port_unreachable);
     }
 
     #[test]
@@ -465,7 +468,7 @@ mod tests {
         let inbound = inspect_packet(&packet, true, Direction::Inbound)
             .metadata
             .expect("inbound ICMPv6 metadata");
-        assert!(!inbound.is_icmp_port_unreachable);
+        assert!(inbound.is_icmp_port_unreachable);
     }
 
     #[test]

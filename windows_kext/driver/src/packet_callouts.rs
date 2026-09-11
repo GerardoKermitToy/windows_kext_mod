@@ -235,8 +235,8 @@ fn ip_packet_layer(
         return;
     };
 
-    // Portmaster's own local redirect traffic and automatic port-unreachable
-    // responses are unconditional permits. Their already parsed first packet does
+    // Portmaster's own local redirect traffic and ICMP Port Unreachable responses
+    // in either direction are unconditional permits. Their already parsed first packet does
     // not need the comparatively expensive WFP injection-state query.
     if let Some(metadata) = first_inspection.and_then(|inspection| inspection.metadata.ok()) {
         if fast_track_pm_packets(&metadata.key) || metadata.is_icmp_port_unreachable {
