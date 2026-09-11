@@ -134,6 +134,10 @@ impl IcmpEchoCache {
         remote_address: IpAddress,
         identifier: u16,
     ) -> Option<u64> {
+        // Expiry is checked on read as well as on insert: an entry can sit here
+        // long after its TTL if no insert forced a cleanup in between.
+        let now = wdk::utils::get_monotonic_timestamp_ms();
+
         let key = EchoKey {
             remote_address,
             identifier,
@@ -142,9 +146,6 @@ impl IcmpEchoCache {
         let _guard = self.lock.write_lock();
         let entry = self.entries.remove(&key)?;
 
-        // Expiry is checked on read as well as on insert: an entry can sit here
-        // long after its TTL if no insert forced a cleanup in between.
-        let now = wdk::utils::get_monotonic_timestamp_ms();
         if now.saturating_sub(entry.inserted_at_ms) > ENTRY_TTL_MS {
             return None;
         }
