@@ -246,15 +246,17 @@ fn track_tcp_endpoint_instance(
         return;
     };
 
+    let now = wdk::utils::get_monotonic_timestamp_ms();
     let mut endpoint_cache = device.tcp_endpoint_cache.write_lock();
     let associated = device
         .connection_cache
         .with_live_connection_instance(&key, instance_id, |_| {
-            Some(endpoint_cache.associate_instance(
+            Some(endpoint_cache.associate_instance_at(
                 endpoint_handle,
                 key,
                 parent_endpoint_handle,
                 instance_id,
+                now,
             ))
         });
     if matches!(associated, Some(false)) {
@@ -374,8 +376,41 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
         ale_data.connection_direction,
         ale_data.packet_direction,
     );
+    let key = ale_data.as_key();
+
+    // Self-injected loopback packets travelling outbound are synthetic network
+    // reinjections. WFP exposes a shared endpoint handle for them, so associating
+    // that handle with each application tuple would make the next connection look
+    // like a handle collision. WFP does not set its loopback flag when traffic is
+    // routed to the same local non-loopback address (for example,
+    // 192.168.219.16 -> 192.168.219.16), so treat that case the same way. Inbound
+    // self-injected packets and non-local packets can still carry the native
+    // endpoint identity needed by closure.
+    let endpoint_handle = transport_endpoint_handle(&data);
+    let parent_endpoint_handle = if matches!(ale_data.protocol, IpProtocol::Tcp) {
+        parent_endpoint_handle(&data)
+    } else {
+        None
+    };
+    let self_injected_outbound_local =
+        matches!(ale_data.packet_direction, Direction::Outbound) && key.is_loopback_like();
+    let track_self_injected_endpoint = !self_injected_outbound_local;
+
     match injection_action {
         AleInjectionAction::PermitSelfInjected => {
+            if track_self_injected_endpoint {
+                if let Some(connection_instance_id) =
+                    device.connection_cache.get_connection_instance_id(&key)
+                {
+                    track_endpoint_instance(
+                        device,
+                        endpoint_handle,
+                        parent_endpoint_handle,
+                        key,
+                        connection_instance_id,
+                    );
+                }
+            }
             data.action_permit();
             return;
         }
@@ -389,19 +424,11 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
         AleInjectionAction::Process => {}
     }
 
-    let key = ale_data.as_key();
-
     // Keep the WFP endpoint identity now, but associate it only after this
     // authorization has selected a concrete live connection-cache generation.
     // Reauthorization of an already cached TCP connection may omit this metadata;
     // in that case the association saved by the initial indication remains valid.
-    let endpoint_handle = transport_endpoint_handle(&data);
-    let parent_endpoint_handle = if matches!(ale_data.protocol, IpProtocol::Tcp) {
-        parent_endpoint_handle(&data)
-    } else {
-        None
-    };
-
+    // The handles were read above so the self-injection fast path records them too.
     // Outbound UDP is decided at the IP packet layer, not here.
     //
     // Holding a datagram at this layer corrupts the send status seen by the
@@ -1240,6 +1267,43 @@ pub(crate) fn expire_inactive_untracked_connections(device: &Device) {
     }
     for conn in ended_v6 {
         emit_connection_end_v6(device, conn, 0);
+    }
+}
+
+const TCP_UNESTABLISHED_TIMEOUT_MS: u64 = 10_000;
+
+/// Ends local TCP authorization generations that never reached FLOW_ESTABLISHED.
+///
+/// A process can terminate while a local self-address connect is still in SYN-SENT.
+/// Windows may then omit the endpoint-closure indication for that provisional
+/// endpoint. Once its bounded grace period expires, the authorization handle is no
+/// longer useful: there is no established flow identity to preserve, and retaining
+/// it would make the endpoint cache grow for every abrupt process termination.
+/// Established flows are marked by `rebind_established` and are never selected.
+pub(crate) fn expire_unestablished_tcp_connections(device: &Device) {
+    let now = wdk::utils::get_monotonic_timestamp_ms();
+    let cutoff = now.saturating_sub(TCP_UNESTABLISHED_TIMEOUT_MS);
+    let expired = {
+        let mut endpoint_cache = device.tcp_endpoint_cache.write_lock();
+        endpoint_cache.take_unestablished_before(cutoff, |endpoint| {
+            endpoint.key.is_loopback_like()
+                && !matches!(
+                    device
+                        .connection_cache
+                        .is_outbound_connection_instance(&endpoint.key, endpoint.instance_id),
+                    Some(false)
+                )
+        })
+    };
+
+    for endpoint in expired {
+        crate::warn!(
+            "TCP endpoint timeout t={} i={} {}",
+            now,
+            endpoint.instance_id,
+            endpoint.key
+        );
+        end_tcp_connection(device, endpoint, 0);
     }
 }
 

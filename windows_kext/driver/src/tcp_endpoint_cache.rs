@@ -5,7 +5,7 @@
 //! at `ALE_FLOW_ESTABLISHED`. The parent endpoint and tuple correlate those stages;
 //! endpoint closure then consumes the established handle and exact instance ID.
 
-use alloc::collections::BTreeMap;
+use alloc::{collections::BTreeMap, vec::Vec};
 
 use crate::connection_map::Key;
 
@@ -16,8 +16,15 @@ pub struct TcpEndpointConnection {
     pub instance_id: u64,
 }
 
+#[derive(Clone, Copy)]
+struct TcpEndpointRecord {
+    endpoint: TcpEndpointConnection,
+    established: bool,
+    associated_at_ms: u64,
+}
+
 pub struct TcpEndpointCache {
-    endpoints: BTreeMap<u64, TcpEndpointConnection>,
+    endpoints: BTreeMap<u64, TcpEndpointRecord>,
 }
 
 impl TcpEndpointCache {
@@ -27,16 +34,9 @@ impl TcpEndpointCache {
         }
     }
 
-    /// Associates one exact live connection-cache instance with its WFP endpoint.
-    ///
-    /// Reauthorization can repeat the same association while omitting optional
-    /// parent-endpoint metadata. Returns `true` when the mapping was inserted or
-    /// still identifies the same connection instance. A newly supplied parent is
-    /// retained, but two different concrete parents remain a conflict.
-    ///
-    /// A different connection for an already tracked handle is rejected: WFP
-    /// defines the handle as unique for the endpoint lifetime, so replacing it
-    /// could let an old closure consume a newer connection generation.
+    /// Associates an endpoint without a timeout timestamp. This is retained for
+    /// callers and tests that do not need stale-unestablished cleanup metadata.
+    #[allow(dead_code)]
     pub fn associate_instance(
         &mut self,
         endpoint_handle: u64,
@@ -44,29 +44,62 @@ impl TcpEndpointCache {
         parent_endpoint_handle: Option<u64>,
         instance_id: u64,
     ) -> bool {
+        self.associate_instance_at(endpoint_handle, key, parent_endpoint_handle, instance_id, 0)
+    }
+
+    /// Associates one exact live connection-cache generation with its WFP endpoint
+    /// and records when its authorization identity appeared.
+    ///
+    /// Reauthorization can repeat the same association while omitting optional
+    /// parent-endpoint metadata. A different connection for an already tracked
+    /// handle is rejected: replacing it could let an old closure consume a newer
+    /// connection generation.
+    pub fn associate_instance_at(
+        &mut self,
+        endpoint_handle: u64,
+        key: Key,
+        parent_endpoint_handle: Option<u64>,
+        instance_id: u64,
+        associated_at_ms: u64,
+    ) -> bool {
         if endpoint_handle == 0 || instance_id == 0 {
             return false;
         }
 
         if let Some(existing) = self.endpoints.get_mut(&endpoint_handle) {
-            if existing.key != key || existing.instance_id != instance_id {
+            if existing.endpoint.key != key || existing.endpoint.instance_id != instance_id {
                 return false;
             }
 
-            match (existing.parent_endpoint_handle, parent_endpoint_handle) {
+            match (
+                existing.endpoint.parent_endpoint_handle,
+                parent_endpoint_handle,
+            ) {
                 (Some(existing_parent), Some(parent)) => return existing_parent == parent,
-                (None, Some(parent)) => existing.parent_endpoint_handle = Some(parent),
+                (None, Some(parent)) => existing.endpoint.parent_endpoint_handle = Some(parent),
                 _ => {}
             }
             return true;
         }
 
+        let endpoint = TcpEndpointConnection {
+            key,
+            parent_endpoint_handle,
+            instance_id,
+        };
+        // A post-establishment reauthorization may expose a new alias. If any
+        // existing alias already represents the established flow, preserve that
+        // state so cleanup cannot mistake the alias for a pending connection.
+        let established = self
+            .endpoints
+            .values()
+            .any(|record| record.endpoint == endpoint && record.established);
         self.endpoints.insert(
             endpoint_handle,
-            TcpEndpointConnection {
-                key,
-                parent_endpoint_handle,
-                instance_id,
+            TcpEndpointRecord {
+                endpoint,
+                established,
+                associated_at_ms,
             },
         );
         true
@@ -81,10 +114,11 @@ impl TcpEndpointCache {
         parent_endpoint_handle: Option<u64>,
         mut is_live: impl FnMut(u64) -> bool,
     ) -> Option<TcpEndpointConnection> {
-        self.endpoints.values().copied().find(|endpoint| {
-            endpoint.key == *key
-                && endpoint.parent_endpoint_handle == parent_endpoint_handle
-                && is_live(endpoint.instance_id)
+        self.endpoints.values().find_map(|record| {
+            (record.endpoint.key == *key
+                && record.endpoint.parent_endpoint_handle == parent_endpoint_handle
+                && is_live(record.endpoint.instance_id))
+                .then_some(record.endpoint)
         })
     }
 
@@ -101,14 +135,52 @@ impl TcpEndpointCache {
         if self
             .endpoints
             .get(&endpoint_handle)
-            .is_some_and(|existing| *existing != endpoint)
+            .is_some_and(|existing| existing.endpoint != endpoint)
         {
             return false;
         }
 
-        self.endpoints.retain(|_, candidate| *candidate != endpoint);
-        self.endpoints.insert(endpoint_handle, endpoint);
+        self.endpoints
+            .retain(|_, candidate| candidate.endpoint != endpoint);
+        self.endpoints.insert(
+            endpoint_handle,
+            TcpEndpointRecord {
+                endpoint,
+                established: true,
+                associated_at_ms: 0,
+            },
+        );
         true
+    }
+
+    /// Removes unestablished endpoint generations that have exceeded `cutoff_ms`.
+    /// All aliases of an expired generation are removed together, so a later
+    /// closure cannot retain a provisional handle after the connection is retired.
+    pub fn take_unestablished_before(
+        &mut self,
+        cutoff_ms: u64,
+        mut should_expire: impl FnMut(&TcpEndpointConnection) -> bool,
+    ) -> Vec<TcpEndpointConnection> {
+        let mut expired = Vec::new();
+        for record in self.endpoints.values() {
+            if !record.established
+                && record.associated_at_ms != 0
+                && record.associated_at_ms <= cutoff_ms
+                && should_expire(&record.endpoint)
+                && !expired.iter().any(|candidate| *candidate == record.endpoint)
+            {
+                expired.push(record.endpoint);
+            }
+        }
+
+        if !expired.is_empty() {
+            self.endpoints.retain(|_, record| {
+                !expired
+                    .iter()
+                    .any(|candidate| *candidate == record.endpoint)
+            });
+        }
+        expired
     }
 
     /// Consumes the exact connection identity assigned to the closing endpoint.
@@ -118,8 +190,9 @@ impl TcpEndpointCache {
             return None;
         }
 
-        let endpoint = self.endpoints.remove(&endpoint_handle)?;
-        self.endpoints.retain(|_, candidate| *candidate != endpoint);
+        let endpoint = self.endpoints.remove(&endpoint_handle)?.endpoint;
+        self.endpoints
+            .retain(|_, candidate| candidate.endpoint != endpoint);
         Some(endpoint)
     }
 
@@ -332,6 +405,56 @@ mod tests {
         assert!(cache
             .take(30)
             .is_some_and(|candidate| candidate == endpoint));
+    }
+
+    #[test]
+    fn timeout_removes_all_provisional_aliases_for_one_generation() {
+        let mut cache = TcpEndpointCache::new();
+        let tuple = key();
+
+        assert!(cache.associate_instance_at(10, tuple, Some(20), 100, 10));
+        assert!(cache.associate_instance_at(11, tuple, Some(20), 100, 10));
+        assert!(cache
+            .take_unestablished_before(20, |_| true)
+            .iter()
+            .any(|endpoint| endpoint.instance_id == 100));
+        assert_eq!(cache.get_entries_count(), 0);
+    }
+
+    #[test]
+    fn timeout_does_not_remove_rebound_established_generation() {
+        let mut cache = TcpEndpointCache::new();
+        let tuple = key();
+
+        assert!(cache.associate_instance_at(10, tuple, Some(20), 100, 10));
+        let endpoint = cache
+            .resolve_live_instance(&tuple, Some(20), |_| true)
+            .expect("provisional endpoint");
+        assert!(cache.rebind_established(30, endpoint));
+
+        assert!(cache
+            .take_unestablished_before(20, |_| true)
+            .is_empty());
+        assert!(cache.take(30).is_some());
+    }
+
+    #[test]
+    fn established_alias_is_not_expired_with_a_provisional_alias() {
+        let mut cache = TcpEndpointCache::new();
+        let tuple = key();
+
+        assert!(cache.associate_instance_at(10, tuple, Some(20), 100, 10));
+        let endpoint = cache
+            .resolve_live_instance(&tuple, Some(20), |_| true)
+            .expect("provisional endpoint");
+        assert!(cache.rebind_established(30, endpoint));
+        assert!(cache.associate_instance_at(31, tuple, Some(20), 100, 10));
+
+        assert!(cache
+            .take_unestablished_before(20, |_| true)
+            .is_empty());
+        assert!(cache.take(30).is_some());
+        assert!(cache.take(31).is_none());
     }
 
     #[test]

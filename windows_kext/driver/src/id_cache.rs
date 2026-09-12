@@ -237,8 +237,9 @@ impl IdCache {
     }
 
     /// Snapshots packet decisions already queued or being applied for one closing
-    /// TCP endpoint. A loopback peer's packet-layer tuple is reversed, so include
-    /// that side as well as requests bound directly to this connection generation.
+    /// TCP endpoint. A loopback-like peer's packet-layer tuple is reversed, so
+    /// include that side as well as requests bound directly to this connection
+    /// generation.
     pub fn tcp_endpoint_request_ids(&self, key: &Key, instance_id: u64) -> Vec<u64> {
         let _guard = self.lock.read_lock();
         let matches = |identity: PendingIdentity| {
@@ -251,9 +252,10 @@ impl IdCache {
         };
 
         let mut ids = Vec::new();
-        if key.is_loopback() {
-            // The server-side loopback request has a reversed tuple and a distinct
-            // connection generation, so it still needs the complete tuple scan.
+        if key.is_loopback_like() {
+            // The server-side loopback-like request has a reversed tuple and a
+            // distinct connection generation, so it still needs the complete
+            // tuple scan.
             ids.extend(self.values.iter().filter_map(|entry| {
                 matches(PendingIdentity {
                     key: entry.value.key,

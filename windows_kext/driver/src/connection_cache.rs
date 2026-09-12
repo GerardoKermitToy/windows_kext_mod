@@ -63,6 +63,24 @@ fn merge_process_id(stored: &mut u64, incoming: u64) -> bool {
     false
 }
 
+fn connection_instance_is_outbound_v4(
+    connection: &ConnectionV4,
+) -> Option<(u64, bool)> {
+    Some((
+        connection.get_instance_id(),
+        matches!(connection.get_direction(), Direction::Outbound),
+    ))
+}
+
+fn connection_instance_is_outbound_v6(
+    connection: &ConnectionV6,
+) -> Option<(u64, bool)> {
+    Some((
+        connection.get_instance_id(),
+        matches!(connection.get_direction(), Direction::Outbound),
+    ))
+}
+
 impl ConnectionCache {
     pub fn new() -> Self {
         Self {
@@ -259,10 +277,25 @@ impl ConnectionCache {
     /// Returns the instance ID of the current live entry.
     pub fn get_connection_instance_id(&self, key: &Key) -> Option<u64> {
         if key.is_ipv6() {
-            self.read_connection_v6(key, |conn| Some(conn.get_instance_id()))
+            self.read_connection_v6(key, |connection| Some(connection.get_instance_id()))
         } else {
-            self.read_connection_v4(key, |conn| Some(conn.get_instance_id()))
+            self.read_connection_v4(key, |connection| Some(connection.get_instance_id()))
         }
+    }
+
+    /// Returns whether the exact live connection belongs to the outbound side.
+    /// A missing generation is treated as no direction by returning `None`.
+    pub fn is_outbound_connection_instance(&self, key: &Key, instance_id: u64) -> Option<bool> {
+        if instance_id == 0 {
+            return None;
+        }
+
+        let current = if key.is_ipv6() {
+            self.read_connection_v6(key, connection_instance_is_outbound_v6)
+        } else {
+            self.read_connection_v4(key, connection_instance_is_outbound_v4)
+        }?;
+        (current.0 == instance_id).then_some(current.1)
     }
 
     /// Returns an exact live entry that still lacks native lifecycle identity.

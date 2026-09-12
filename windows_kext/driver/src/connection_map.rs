@@ -55,6 +55,13 @@ impl Key {
         }
     }
 
+    /// Returns true for actual loopback traffic and for a local address routed
+    /// back to itself. WFP can expose the latter with the same reversed-packet
+    /// behavior while leaving the IP address outside the loopback range.
+    pub fn is_loopback_like(&self) -> bool {
+        self.is_loopback() || self.local_address == self.remote_address
+    }
+
     /// Returns a new key with the local and remote addresses and ports reversed.
     #[allow(dead_code)]
     pub fn reverse(&self) -> Key {

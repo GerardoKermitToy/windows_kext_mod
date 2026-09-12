@@ -650,6 +650,10 @@ impl Device {
                 }
             }
             CommandType::PrintMemoryStats => {
+                // Run the bounded TCP maintenance before taking the snapshot so
+                // memory statistics also reveal the post-timeout state. This is
+                // intentionally limited to local unestablished generations.
+                crate::ale_callouts::expire_unestablished_tcp_connections(self);
                 // Snapshot each cache independently. All spin-lock guards must be
                 // released before crate::err! allocates the userspace log records.
                 let packet_cache_entries = {
@@ -724,6 +728,7 @@ impl Device {
                 // one inactive minute and emit the same lifecycle event as native WFP
                 // teardown. Tracked and inbound connections remain exempt.
                 crate::ale_callouts::expire_inactive_untracked_connections(self);
+                crate::ale_callouts::expire_unestablished_tcp_connections(self);
                 // Reconcile endpoint and flow bookkeeping for connection instances
                 // that native lifecycle callbacks have already ended. Removing a WFP
                 // callout context does not close the UDP socket or flow; it merely asks

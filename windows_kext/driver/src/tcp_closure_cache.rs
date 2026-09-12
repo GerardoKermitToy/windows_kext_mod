@@ -18,7 +18,7 @@ pub(crate) fn request_matches_tcp_endpoint(
     request_instance_id: Option<u64>,
 ) -> bool {
     request_instance_id == Some(endpoint_instance_id)
-        || (endpoint_key.is_loopback() && *request_key == endpoint_key.reverse())
+        || (endpoint_key.is_loopback_like() && *request_key == endpoint_key.reverse())
 }
 
 pub struct PendingTcpClosure {
@@ -178,6 +178,20 @@ mod tests {
     #[test]
     fn loopback_closure_tracks_reverse_tuple_requests() {
         let mut endpoint = endpoint(true, 100);
+        endpoint.key.remote_address = endpoint.key.local_address;
+        let mut cache = TcpClosureCache::new();
+        assert!(cache
+            .insert(PendingTcpClosure::new(endpoint, 10, (), vec![7]))
+            .is_ok());
+
+        cache.add_request(8, &endpoint.key.reverse(), Some(200));
+        assert!(cache.finish_request(7).is_empty());
+        assert!(cache.finish_request(8) == vec![endpoint]);
+    }
+
+    #[test]
+    fn same_local_address_closure_tracks_reverse_tuple_requests() {
+        let mut endpoint = endpoint(false, 100);
         endpoint.key.remote_address = endpoint.key.local_address;
         let mut cache = TcpClosureCache::new();
         assert!(cache
