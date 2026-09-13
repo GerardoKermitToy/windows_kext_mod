@@ -54,6 +54,13 @@ impl TcpEndpointCache {
     /// parent-endpoint metadata. A different connection for an already tracked
     /// handle is rejected: replacing it could let an old closure consume a newer
     /// connection generation.
+    ///
+    /// # Parameters
+    /// * `associated_at_ms` - Timestamp in milliseconds when the endpoint was associated.
+    ///   **Special value 0** marks the entry as exempt from timeout-based cleanup;
+    ///   such entries are retained until explicitly removed via `take()` or `clear()`.
+    ///   Established connections typically use 0 since they should only be removed
+    ///   on explicit closure events, not by timeout.
     pub fn associate_instance_at(
         &mut self,
         endpoint_handle: u64,
