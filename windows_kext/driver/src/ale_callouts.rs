@@ -281,6 +281,7 @@ fn track_udp_endpoint_instance(
         return;
     };
 
+    let now = wdk::utils::get_monotonic_timestamp_ms();
     // Endpoint closure takes the same outer lock before ending connection state.
     // Revalidate the instance while that lock is held, so closure cannot pass an
     // empty endpoint cache and let a stale association be inserted afterwards.
@@ -289,7 +290,7 @@ fn track_udp_endpoint_instance(
         device
             .connection_cache
             .with_live_connection_instance(&key, instance_id, |_| {
-                let _ = endpoint_cache.associate_instance(endpoint_handle, key, instance_id);
+                let _ = endpoint_cache.associate_instance_at(endpoint_handle, key, instance_id, now);
                 Some(())
             })
             .is_some()

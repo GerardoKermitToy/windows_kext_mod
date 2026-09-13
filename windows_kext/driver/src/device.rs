@@ -789,6 +789,7 @@ impl Device {
     /// live connections. Any association created concurrently is therefore visible
     /// in the later live snapshot or remains untouched until the next pass.
     fn clean_udp_lifecycle_state(&self) {
+        let now = wdk::utils::get_monotonic_timestamp_ms();
         let endpoint_instances = self.udp_endpoint_cache.write_lock().instance_ids();
         let flow_candidates = self.udp_flow_cache.removal_candidates();
         let live_instances = self.connection_cache.live_udp_instance_ids();
@@ -799,7 +800,7 @@ impl Device {
             .collect();
         {
             let mut endpoint_cache = self.udp_endpoint_cache.write_lock();
-            let _ = endpoint_cache.remove_instances(stale_endpoint_instances);
+            let _ = endpoint_cache.remove_instances(stale_endpoint_instances, now);
         }
 
         for (flow_context, connection_instance_id) in flow_candidates {

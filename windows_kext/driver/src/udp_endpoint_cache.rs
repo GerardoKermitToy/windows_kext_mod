@@ -30,6 +30,7 @@ use crate::connection_map::Key;
 pub struct UdpEndpointPeer {
     pub key: Key,
     pub instance_id: u64,
+    pub associated_at_ms: u64,
 }
 
 pub struct UdpEndpointCache {
@@ -51,7 +52,30 @@ impl UdpEndpointCache {
     /// expose a context to WFP can use the result to roll back their own insertion
     /// if `FwpsFlowAssociateContext0` fails without removing an association that
     /// was already tracking the connection independently.
+    ///
+    /// This version marks the association with `associated_at_ms = 0`, making it
+    /// exempt from timeout-based cleanup. For time-aware cleanup, use
+    /// `associate_instance_at` instead.
+    #[allow(dead_code)]
     pub fn associate_instance(&mut self, endpoint_handle: u64, key: Key, instance_id: u64) -> bool {
+        self.associate_instance_at(endpoint_handle, key, instance_id, 0)
+    }
+
+    /// Associates one concrete connection-cache instance with its endpoint and
+    /// records when the association was created.
+    ///
+    /// Returns true only when this call inserted a new association. Callers that
+    /// expose a context to WFP can use the result to roll back their own insertion
+    /// if `FwpsFlowAssociateContext0` fails without removing an association that
+    /// was already tracking the connection independently.
+    ///
+    /// # Parameters
+    /// * `associated_at_ms` - Timestamp in milliseconds when the association was created.
+    ///   **Special value 0** marks the entry as exempt from timeout-based cleanup;
+    ///   such entries are retained until explicitly removed. Non-zero values enable
+    ///   protection against race conditions during periodic cleanup by preventing
+    ///   removal of recently created associations.
+    pub fn associate_instance_at(&mut self, endpoint_handle: u64, key: Key, instance_id: u64, associated_at_ms: u64) -> bool {
         if endpoint_handle == 0 || instance_id == 0 {
             return false;
         }
@@ -64,13 +88,13 @@ impl UdpEndpointCache {
             {
                 return false;
             }
-            peers.push(UdpEndpointPeer { key, instance_id });
+            peers.push(UdpEndpointPeer { key, instance_id, associated_at_ms });
             return true;
         }
 
         self.endpoints.insert(
             endpoint_handle,
-            alloc::vec![UdpEndpointPeer { key, instance_id }],
+            alloc::vec![UdpEndpointPeer { key, instance_id, associated_at_ms }],
         );
         true
     }
@@ -147,7 +171,13 @@ impl UdpEndpointCache {
     ///
     /// Empty endpoint entries are removed together with their peer buffers. The
     /// input is consumed so sorting it does not require another allocation.
-    pub fn remove_instances(&mut self, mut instance_ids: Vec<u64>) -> usize {
+    ///
+    /// # Parameters
+    /// * `instance_ids` - List of dead instance IDs to remove
+    /// * `current_time_ms` - Current timestamp in milliseconds. Associations created
+    ///   within the grace period (1000ms) are not removed to avoid race conditions
+    ///   during the window between cache association and connection_map insertion.
+    pub fn remove_instances(&mut self, mut instance_ids: Vec<u64>, current_time_ms: u64) -> usize {
         if instance_ids.is_empty() {
             return 0;
         }
@@ -156,9 +186,22 @@ impl UdpEndpointCache {
 
         let _guard = self.lock.write_lock();
         let mut removed = 0;
+        const GRACE_PERIOD_MS: u64 = 1000;
         self.endpoints.retain(|_, peers| {
             let previous_len = peers.len();
-            peers.retain(|peer| instance_ids.binary_search(&peer.instance_id).is_err());
+            peers.retain(|peer| {
+                // Protect entries marked as exempt (associated_at_ms == 0)
+                if peer.associated_at_ms == 0 {
+                    return true;
+                }
+                // Protect recently created entries (within grace period)
+                if current_time_ms >= peer.associated_at_ms
+                    && current_time_ms - peer.associated_at_ms < GRACE_PERIOD_MS {
+                    return true;
+                }
+                // Remove if instance_id is in the dead list
+                instance_ids.binary_search(&peer.instance_id).is_err()
+            });
             let removed_from_endpoint = previous_len - peers.len();
             removed += removed_from_endpoint;
             if removed_from_endpoint != 0 && !peers.is_empty() {
@@ -328,12 +371,42 @@ mod tests {
         assert!(cache.associate_instance(10, key(1001), 101));
         assert!(cache.associate_instance(20, key(2000), 200));
 
-        assert_eq!(cache.remove_instances(alloc::vec![200, 100, 200]), 2);
+        assert_eq!(cache.remove_instances(alloc::vec![200, 100, 200], 0), 2);
         assert_eq!(cache.instance_ids(), alloc::vec![101]);
 
         let first = cache.take(10).expect("first endpoint was removed");
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].instance_id, 101);
         assert!(cache.take(20).is_none());
+    }
+
+    #[test]
+    fn cleanup_protects_recently_associated_instances() {
+        let mut cache = UdpEndpointCache::new();
+        // Associate with timestamp 1000ms
+        assert!(cache.associate_instance_at(10, key(1000), 100, 1000));
+        // Associate with timestamp 2000ms
+        assert!(cache.associate_instance_at(10, key(1001), 101, 2000));
+
+        // Try to remove at 2500ms - first is old (1500ms ago), second is recent (500ms ago)
+        assert_eq!(cache.remove_instances(alloc::vec![100, 101], 2500), 1);
+
+        // Only the old one should be removed
+        assert_eq!(cache.instance_ids(), alloc::vec![101]);
+    }
+
+    #[test]
+    fn cleanup_protects_exempt_instances() {
+        let mut cache = UdpEndpointCache::new();
+        // Associate with associated_at_ms=0 (exempt from cleanup)
+        assert!(cache.associate_instance_at(10, key(1000), 100, 0));
+        // Associate with timestamp
+        assert!(cache.associate_instance_at(10, key(1001), 101, 1000));
+
+        // Try to remove both at a much later time
+        assert_eq!(cache.remove_instances(alloc::vec![100, 101], 10000), 1);
+
+        // Only the timestamped one should be removed, exempt one stays
+        assert_eq!(cache.instance_ids(), alloc::vec![100]);
     }
 }
