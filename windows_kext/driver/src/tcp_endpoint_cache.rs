@@ -5,11 +5,11 @@
 //! at `ALE_FLOW_ESTABLISHED`. The parent endpoint and tuple correlate those stages;
 //! endpoint closure then consumes the established handle and exact instance ID.
 
-use alloc::{collections::BTreeMap, vec::Vec};
+use alloc::{collections::{BTreeMap, BTreeSet}, vec::Vec};
 
 use crate::connection_map::Key;
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
 pub struct TcpEndpointConnection {
     pub key: Key,
     pub parent_endpoint_handle: Option<u64>,
@@ -161,26 +161,23 @@ impl TcpEndpointCache {
         cutoff_ms: u64,
         mut should_expire: impl FnMut(&TcpEndpointConnection) -> bool,
     ) -> Vec<TcpEndpointConnection> {
-        let mut expired = Vec::new();
+        let mut expired_set = BTreeSet::new();
         for record in self.endpoints.values() {
             if !record.established
                 && record.associated_at_ms != 0
                 && record.associated_at_ms <= cutoff_ms
                 && should_expire(&record.endpoint)
-                && !expired.iter().any(|candidate| *candidate == record.endpoint)
             {
-                expired.push(record.endpoint);
+                expired_set.insert(record.endpoint);
             }
         }
 
-        if !expired.is_empty() {
+        if !expired_set.is_empty() {
             self.endpoints.retain(|_, record| {
-                !expired
-                    .iter()
-                    .any(|candidate| *candidate == record.endpoint)
+                !expired_set.contains(&record.endpoint)
             });
         }
-        expired
+        expired_set.into_iter().collect()
     }
 
     /// Consumes the exact connection identity assigned to the closing endpoint.
