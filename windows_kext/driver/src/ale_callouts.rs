@@ -1,7 +1,7 @@
 use crate::ale_policy::{
-    can_reuse_ended_tcp_policy, classify_ale_injection, should_capture_ale_packet,
-    should_skip_cross_direction_ale_clone, should_skip_injected_outbound_flow,
-    AleInjectionAction, InjectionStatus,
+    can_reuse_ended_tcp_policy, classify_ale_injection, self_injected_endpoint_identifies_socket,
+    should_capture_ale_packet, should_skip_cross_direction_ale_clone,
+    should_skip_injected_outbound_flow, AleInjectionAction, InjectionStatus,
 };
 use crate::connection::{Connection, ConnectionV4, ConnectionV6, Direction, Verdict};
 use crate::connection_map::Key;
@@ -379,27 +379,24 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
     );
     let key = ale_data.as_key();
 
-    // Self-injected loopback packets travelling outbound are synthetic network
-    // reinjections. WFP exposes a shared endpoint handle for them, so associating
-    // that handle with each application tuple would make the next connection look
-    // like a handle collision. WFP does not set its loopback flag when traffic is
-    // routed to the same local non-loopback address (for example,
-    // 192.168.219.16 -> 192.168.219.16), so treat that case the same way. Inbound
-    // self-injected packets and non-local packets can still carry the native
-    // endpoint identity needed by closure.
+    // An outbound self-injected indication has no application send context, so its
+    // transport endpoint handle belongs to the injector and is shared by every
+    // packet it reinjects - runtime capture showed one handle offered for dozens of
+    // unrelated tuples with different remote addresses. Borrowing it would both
+    // report a false handle collision for each following connection and leave the
+    // shared handle cached as an alias of whichever tuple claimed it first. Inbound
+    // self-injected packets are delivered to a concrete receiving endpoint and keep
+    // the native identity that closure needs.
     let endpoint_handle = transport_endpoint_handle(&data);
     let parent_endpoint_handle = if matches!(ale_data.protocol, IpProtocol::Tcp) {
         parent_endpoint_handle(&data)
     } else {
         None
     };
-    let self_injected_outbound_local =
-        matches!(ale_data.packet_direction, Direction::Outbound) && key.is_loopback_like();
-    let track_self_injected_endpoint = !self_injected_outbound_local;
 
     match injection_action {
         AleInjectionAction::PermitSelfInjected => {
-            if track_self_injected_endpoint {
+            if self_injected_endpoint_identifies_socket(ale_data.packet_direction) {
                 if let Some(connection_instance_id) =
                     device.connection_cache.get_connection_instance_id(&key)
                 {

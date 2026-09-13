@@ -104,6 +104,24 @@ pub(crate) fn should_skip_cross_direction_ale_clone(
         && matches!(packet_direction, Direction::Inbound)
 }
 
+/// Returns whether the transport endpoint handle of a self-injected ALE
+/// indication identifies the application's own socket.
+///
+/// Reinjection re-indicates a packet without any application send context, so WFP
+/// reports one shared raw endpoint for everything the injector emits. Runtime
+/// capture showed a single outbound handle offered for dozens of unrelated
+/// connections, including different remote addresses, which made each following
+/// connection look like a handle collision and left the borrowed handle in the
+/// cache as an alias of the first tuple that claimed it.
+///
+/// Nothing is lost by ignoring it: the genuine authorization that created the
+/// pended request already associated the real endpoint, and `ALE_FLOW_ESTABLISHED`
+/// rebinds the established child handle. An inbound self-injected packet is
+/// returned to a concrete receiving endpoint and keeps native identity.
+pub(crate) fn self_injected_endpoint_identifies_socket(packet_direction: Direction) -> bool {
+    matches!(packet_direction, Direction::Inbound)
+}
+
 /// Returns whether a self-injected ALE indication must still run the server-side
 /// TCP/UDP receive/accept authorization path.
 ///
@@ -126,12 +144,23 @@ pub(crate) fn self_injected_packet_needs_accept_authorization(
 mod tests {
     use super::{
         can_reuse_ended_tcp_policy, classify_ale_injection,
-        self_injected_packet_needs_accept_authorization, should_capture_ale_packet,
-        should_skip_cross_direction_ale_clone, should_skip_injected_outbound_flow,
-        AleInjectionAction, InjectionStatus,
+        self_injected_endpoint_identifies_socket, self_injected_packet_needs_accept_authorization,
+        should_capture_ale_packet, should_skip_cross_direction_ale_clone,
+        should_skip_injected_outbound_flow, AleInjectionAction, InjectionStatus,
     };
     use crate::connection::Direction;
     use smoltcp::wire::IpProtocol;
+
+    #[test]
+    fn only_inbound_self_injected_endpoint_identifies_a_socket() {
+        // An outbound reinjection carries the injector's shared raw endpoint for
+        // every tuple it emits, so it must never be associated regardless of
+        // whether the traffic happens to be local.
+        assert!(!self_injected_endpoint_identifies_socket(
+            Direction::Outbound
+        ));
+        assert!(self_injected_endpoint_identifies_socket(Direction::Inbound));
+    }
 
     #[test]
     fn ended_policy_is_used_only_for_tcp_reauthorization() {
