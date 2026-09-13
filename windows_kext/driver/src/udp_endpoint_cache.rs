@@ -367,11 +367,11 @@ mod tests {
     #[test]
     fn cleanup_removes_stale_instances_and_empty_endpoints() {
         let mut cache = UdpEndpointCache::new();
-        assert!(cache.associate_instance(10, key(1000), 100));
-        assert!(cache.associate_instance(10, key(1001), 101));
-        assert!(cache.associate_instance(20, key(2000), 200));
+        assert!(cache.associate_instance_at(10, key(1000), 100, 1000));
+        assert!(cache.associate_instance_at(10, key(1001), 101, 1000));
+        assert!(cache.associate_instance_at(20, key(2000), 200, 1000));
 
-        assert_eq!(cache.remove_instances(alloc::vec![200, 100, 200], 0), 2);
+        assert_eq!(cache.remove_instances(alloc::vec![200, 100, 200], 3000), 2);
         assert_eq!(cache.instance_ids(), alloc::vec![101]);
 
         let first = cache.take(10).expect("first endpoint was removed");

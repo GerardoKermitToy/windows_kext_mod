@@ -808,6 +808,36 @@ impl<T: Connection + Clone> ConnectionMap<T> {
         Some(conn.clone())
     }
 
+    /// Ends several exact connection generations while holding one map write lock.
+    ///
+    /// Endpoint closure commonly retires every remote peer of one UDP socket. The
+    /// per-instance operation is still useful for single callbacks, but taking the
+    /// lock and reading the clock once for a batch avoids repeating that overhead.
+    pub fn end_instances(&mut self, instances: &[(Key, u64)]) -> Vec<T> {
+        if instances.is_empty() {
+            return Vec::new();
+        }
+
+        let timestamp = get_monotonic_timestamp_ms();
+        let mut ended = Vec::with_capacity(instances.len());
+        for &(key, instance_id) in instances {
+            if instance_id == 0 {
+                continue;
+            }
+            if let Some(conn) = self.bucket_mut(&key).and_then(|bucket| {
+                bucket.iter_mut().find(|conn| {
+                    conn.remote_equals(&key)
+                        && conn.get_instance_id() == instance_id
+                        && !conn.has_ended()
+                })
+            }) {
+                conn.end(timestamp);
+                ended.push(conn.clone());
+            }
+        }
+        ended
+    }
+
     /// Ends live connections for one local endpoint and returns copies of them.
     ///
     /// The map is grouped by protocol and local port, but that grouping is not a
@@ -852,14 +882,10 @@ impl<T: Connection + Clone> ConnectionMap<T> {
         untracked_only: bool,
     ) -> Option<Vec<T>> {
         if let Some(connections) = self.0.get_mut(&key) {
-            let count = connections
-                .values()
-                .flat_map(ConnectionBucket::iter)
-                .filter(|connection| {
-                    matches_endpoint(*connection, local_address, process_id, untracked_only)
-                })
-                .count();
-            let mut vec = Vec::with_capacity(count);
+            // Do not run the endpoint predicate in a separate counting pass.
+            // `Vec::new` keeps the no-match case allocation-free and grows only
+            // when a closure actually finds connections to return.
+            let mut vec = Vec::new();
             let timestamp = get_monotonic_timestamp_ms();
             for conn in connections
                 .values_mut()
@@ -1030,6 +1056,29 @@ mod tests {
 
     fn read_process_id_v6(conn: &ConnectionV6) -> Option<u64> {
         Some(conn.process_id)
+    }
+
+    #[test]
+    fn batch_end_matches_instances_and_preserves_replacements() {
+        let first = key([198, 51, 100, 20], 443);
+        let second = key([198, 51, 100, 21], 443);
+        let mut map = ConnectionMap::new();
+        let first_connection = live(&first, 10);
+        let first_instance_id = first_connection.get_instance_id();
+        let second_connection = live(&second, 20);
+        let second_instance_id = second_connection.get_instance_id();
+        map.add(first_connection);
+        map.add(second_connection);
+
+        let ended = map.end_instances(&[
+            (first, first_instance_id),
+            (second, second_instance_id.wrapping_add(1)),
+        ]);
+
+        assert_eq!(ended.len(), 1);
+        assert_eq!(ended[0].get_instance_id(), first_instance_id);
+        assert!(map.read(&first, read_process_id).is_none());
+        assert_eq!(map.read(&second, read_process_id), Some(20));
     }
 
     #[test]

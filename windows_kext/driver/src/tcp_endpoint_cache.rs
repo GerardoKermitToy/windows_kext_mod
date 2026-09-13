@@ -5,7 +5,10 @@
 //! at `ALE_FLOW_ESTABLISHED`. The parent endpoint and tuple correlate those stages;
 //! endpoint closure then consumes the established handle and exact instance ID.
 
-use alloc::{collections::{BTreeMap, BTreeSet}, vec::Vec};
+use alloc::{
+    collections::{BTreeMap, BTreeSet},
+    vec::Vec,
+};
 
 use crate::connection_map::Key;
 
@@ -14,6 +17,90 @@ pub struct TcpEndpointConnection {
     pub key: Key,
     pub parent_endpoint_handle: Option<u64>,
     pub instance_id: u64,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+struct TcpEndpointLookupKey {
+    key: Key,
+    parent_endpoint_handle: Option<u64>,
+}
+
+fn lookup_key(endpoint: &TcpEndpointConnection) -> TcpEndpointLookupKey {
+    TcpEndpointLookupKey {
+        key: endpoint.key,
+        parent_endpoint_handle: endpoint.parent_endpoint_handle,
+    }
+}
+
+/// Most authorization tuples have only one endpoint handle. Keep it inline so
+/// indexing a new TCP connection does not also allocate a vector.
+enum TcpEndpointHandles {
+    One(u64),
+    Multiple(Vec<u64>),
+}
+
+impl TcpEndpointHandles {
+    fn iter(&self) -> core::slice::Iter<'_, u64> {
+        match self {
+            Self::One(handle) => core::slice::from_ref(handle).iter(),
+            Self::Multiple(handles) => handles.iter(),
+        }
+    }
+
+    fn insert(&mut self, handle: u64) {
+        match self {
+            Self::One(existing) if *existing == handle => {}
+            Self::One(existing) => {
+                let previous = *existing;
+                *self = Self::Multiple(if previous < handle {
+                    alloc::vec![previous, handle]
+                } else {
+                    alloc::vec![handle, previous]
+                });
+            }
+            Self::Multiple(handles) => {
+                if let Err(index) = handles.binary_search(&handle) {
+                    handles.insert(index, handle);
+                }
+            }
+        }
+    }
+
+    /// Returns whether the bucket became empty.
+    fn remove(&mut self, handle: u64) -> bool {
+        match self {
+            Self::One(existing) => *existing == handle,
+            Self::Multiple(handles) => {
+                if let Ok(index) = handles.binary_search(&handle) {
+                    handles.remove(index);
+                }
+                match handles.as_slice() {
+                    [] => true,
+                    [remaining] => {
+                        let remaining = *remaining;
+                        *self = Self::One(remaining);
+                        false
+                    }
+                    _ => false,
+                }
+            }
+        }
+    }
+
+    /// Keeps selected handles while preserving the inline one-handle case.
+    fn retain(self, mut keep: impl FnMut(u64) -> bool) -> Option<Self> {
+        match self {
+            Self::One(handle) => keep(handle).then_some(Self::One(handle)),
+            Self::Multiple(mut handles) => {
+                handles.retain(|handle| keep(*handle));
+                match handles.as_slice() {
+                    [] => None,
+                    [handle] => Some(Self::One(*handle)),
+                    _ => Some(Self::Multiple(handles)),
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -25,12 +112,82 @@ struct TcpEndpointRecord {
 
 pub struct TcpEndpointCache {
     endpoints: BTreeMap<u64, TcpEndpointRecord>,
+    /// Endpoint handles ordered by authorization tuple and parent listener.
+    ///
+    /// FLOW_ESTABLISHED normally resolves one of these small buckets. Keeping
+    /// this reverse index avoids walking every endpoint belonging to unrelated
+    /// connections while the cache is write-locked.
+    lookup: BTreeMap<TcpEndpointLookupKey, TcpEndpointHandles>,
 }
 
 impl TcpEndpointCache {
     pub fn new() -> Self {
         Self {
             endpoints: BTreeMap::new(),
+            lookup: BTreeMap::new(),
+        }
+    }
+
+    fn add_lookup_handle(&mut self, key: TcpEndpointLookupKey, endpoint_handle: u64) {
+        match self.lookup.entry(key) {
+            alloc::collections::btree_map::Entry::Occupied(entry) => {
+                entry.into_mut().insert(endpoint_handle);
+            }
+            alloc::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(TcpEndpointHandles::One(endpoint_handle));
+            }
+        }
+    }
+
+    fn remove_lookup_handle(&mut self, key: TcpEndpointLookupKey, endpoint_handle: u64) {
+        let remove_key = self
+            .lookup
+            .get_mut(&key)
+            .is_some_and(|handles| handles.remove(endpoint_handle));
+        if remove_key {
+            self.lookup.remove(&key);
+        }
+    }
+
+    /// Removes every alias for one exact connection generation without scanning
+    /// endpoint handles belonging to other tuples.
+    fn remove_endpoint_aliases(&mut self, endpoint: TcpEndpointConnection) {
+        let key = lookup_key(&endpoint);
+        let Some(handles) = self.lookup.remove(&key) else {
+            return;
+        };
+
+        let remaining = handles.retain(|endpoint_handle| {
+            let remove = self
+                .endpoints
+                .get(&endpoint_handle)
+                .is_some_and(|record| record.endpoint == endpoint);
+            if remove {
+                self.endpoints.remove(&endpoint_handle);
+            }
+            !remove
+        });
+        if let Some(handles) = remaining {
+            self.lookup.insert(key, handles);
+        }
+    }
+
+    fn rebuild_lookup(&mut self) {
+        let endpoints = &self.endpoints;
+        let lookup = &mut self.lookup;
+        lookup.clear();
+        // `endpoints` is a BTreeMap, so handles arrive in the same order used by
+        // the old full-cache scan. This also keeps resolution deterministic when
+        // more than one generation shares a tuple and parent listener.
+        for (&endpoint_handle, record) in endpoints {
+            match lookup.entry(lookup_key(&record.endpoint)) {
+                alloc::collections::btree_map::Entry::Occupied(entry) => {
+                    entry.into_mut().insert(endpoint_handle);
+                }
+                alloc::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(TcpEndpointHandles::One(endpoint_handle));
+                }
+            }
         }
     }
 
@@ -73,34 +230,51 @@ impl TcpEndpointCache {
             return false;
         }
 
-        if let Some(existing) = self.endpoints.get_mut(&endpoint_handle) {
-            if existing.endpoint.key != key || existing.endpoint.instance_id != instance_id {
-                return false;
-            }
+        let existing_update = match self.endpoints.get_mut(&endpoint_handle) {
+            Some(existing) => {
+                if existing.endpoint.key != key || existing.endpoint.instance_id != instance_id {
+                    return false;
+                }
 
-            match (
-                existing.endpoint.parent_endpoint_handle,
-                parent_endpoint_handle,
-            ) {
-                (Some(existing_parent), Some(parent)) => return existing_parent == parent,
-                (None, Some(parent)) => existing.endpoint.parent_endpoint_handle = Some(parent),
-                _ => {}
+                let move_lookup = match (
+                    existing.endpoint.parent_endpoint_handle,
+                    parent_endpoint_handle,
+                ) {
+                    (Some(existing_parent), Some(parent)) => return existing_parent == parent,
+                    (None, Some(parent)) => {
+                        let old_key = lookup_key(&existing.endpoint);
+                        existing.endpoint.parent_endpoint_handle = Some(parent);
+                        Some((old_key, lookup_key(&existing.endpoint)))
+                    }
+                    _ => None,
+                };
+                Some(move_lookup)
+            }
+            None => None,
+        };
+        if let Some(move_lookup) = existing_update {
+            if let Some((old_key, new_key)) = move_lookup {
+                self.remove_lookup_handle(old_key, endpoint_handle);
+                self.add_lookup_handle(new_key, endpoint_handle);
             }
             return true;
         }
-
         let endpoint = TcpEndpointConnection {
             key,
             parent_endpoint_handle,
             instance_id,
         };
+        let lookup_key = lookup_key(&endpoint);
         // A post-establishment reauthorization may expose a new alias. If any
         // existing alias already represents the established flow, preserve that
         // state so cleanup cannot mistake the alias for a pending connection.
-        let established = self
-            .endpoints
-            .values()
-            .any(|record| record.endpoint == endpoint && record.established);
+        let established = self.lookup.get(&lookup_key).is_some_and(|handles| {
+            handles.iter().any(|handle| {
+                self.endpoints
+                    .get(handle)
+                    .is_some_and(|record| record.endpoint == endpoint && record.established)
+            })
+        });
         self.endpoints.insert(
             endpoint_handle,
             TcpEndpointRecord {
@@ -109,6 +283,7 @@ impl TcpEndpointCache {
                 associated_at_ms,
             },
         );
+        self.add_lookup_handle(lookup_key, endpoint_handle);
         true
     }
 
@@ -121,11 +296,14 @@ impl TcpEndpointCache {
         parent_endpoint_handle: Option<u64>,
         mut is_live: impl FnMut(u64) -> bool,
     ) -> Option<TcpEndpointConnection> {
-        self.endpoints.values().find_map(|record| {
-            (record.endpoint.key == *key
-                && record.endpoint.parent_endpoint_handle == parent_endpoint_handle
-                && is_live(record.endpoint.instance_id))
-                .then_some(record.endpoint)
+        let lookup_key = TcpEndpointLookupKey {
+            key: *key,
+            parent_endpoint_handle,
+        };
+        self.lookup.get(&lookup_key)?.iter().find_map(|handle| {
+            self.endpoints
+                .get(handle)
+                .and_then(|record| is_live(record.endpoint.instance_id).then_some(record.endpoint))
         })
     }
 
@@ -147,8 +325,7 @@ impl TcpEndpointCache {
             return false;
         }
 
-        self.endpoints
-            .retain(|_, candidate| candidate.endpoint != endpoint);
+        self.remove_endpoint_aliases(endpoint);
         self.endpoints.insert(
             endpoint_handle,
             TcpEndpointRecord {
@@ -157,6 +334,7 @@ impl TcpEndpointCache {
                 associated_at_ms: 0,
             },
         );
+        self.add_lookup_handle(lookup_key(&endpoint), endpoint_handle);
         true
     }
 
@@ -180,9 +358,9 @@ impl TcpEndpointCache {
         }
 
         if !expired_set.is_empty() {
-            self.endpoints.retain(|_, record| {
-                !expired_set.contains(&record.endpoint)
-            });
+            self.endpoints
+                .retain(|_, record| !expired_set.contains(&record.endpoint));
+            self.rebuild_lookup();
         }
         expired_set.into_iter().collect()
     }
@@ -194,9 +372,8 @@ impl TcpEndpointCache {
             return None;
         }
 
-        let endpoint = self.endpoints.remove(&endpoint_handle)?.endpoint;
-        self.endpoints
-            .retain(|_, candidate| candidate.endpoint != endpoint);
+        let endpoint = self.endpoints.get(&endpoint_handle)?.endpoint;
+        self.remove_endpoint_aliases(endpoint);
         Some(endpoint)
     }
 
@@ -207,6 +384,26 @@ impl TcpEndpointCache {
 
     pub fn clear(&mut self) {
         self.endpoints.clear();
+        self.lookup.clear();
+    }
+}
+
+#[cfg(test)]
+impl TcpEndpointCache {
+    fn lookup_is_consistent(&self) -> bool {
+        let indexed_handles: usize = self
+            .lookup
+            .values()
+            .map(|handles| handles.iter().len())
+            .sum();
+        indexed_handles == self.endpoints.len()
+            && self.lookup.iter().all(|(key, handles)| {
+                handles.iter().all(|handle| {
+                    self.endpoints
+                        .get(handle)
+                        .is_some_and(|record| lookup_key(&record.endpoint) == *key)
+                })
+            })
     }
 }
 
@@ -245,6 +442,7 @@ mod tests {
             .expect("authorization generation");
         assert!(cache.rebind_established(30, endpoint));
 
+        assert!(cache.lookup_is_consistent());
         assert!(cache.take(10).is_none());
         assert_eq!(
             cache.take(30).expect("established endpoint").instance_id,
@@ -275,6 +473,7 @@ mod tests {
 
         assert!(cache.associate_instance(10, tuple, None, 100));
         assert!(cache.associate_instance(10, tuple, Some(20), 100));
+        assert!(cache.lookup_is_consistent());
         assert!(!cache.associate_instance(10, tuple, Some(21), 100));
         assert!(!cache.associate_instance(10, tuple, None, 101));
         let mut other_tuple = tuple;
@@ -404,6 +603,7 @@ mod tests {
             .expect("authorization generation");
 
         assert!(cache.rebind_established(30, endpoint));
+        assert!(cache.lookup_is_consistent());
         assert!(cache.take(10).is_none());
         assert!(cache.take(11).is_none());
         assert!(cache
@@ -422,6 +622,7 @@ mod tests {
             .take_unestablished_before(20, |_| true)
             .iter()
             .any(|endpoint| endpoint.instance_id == 100));
+        assert!(cache.lookup_is_consistent());
         assert_eq!(cache.get_entries_count(), 0);
     }
 

@@ -1052,8 +1052,8 @@ impl Device {
             let inserted = closure_cache.insert(closure);
             drop(closure_cache);
             match inserted {
-                Ok(()) => Ok(true),
-                Err(duplicate) => {
+                None => Ok(true),
+                Some(duplicate) => {
                     duplicate.classify.complete();
                     Err(alloc::format!(
                         "duplicate TCP endpoint closure for connection instance {}",

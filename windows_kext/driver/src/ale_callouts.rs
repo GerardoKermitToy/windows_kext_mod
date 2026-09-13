@@ -348,30 +348,43 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
     // Keep foreign injection distinct: it is handled below at the packet layer
     // without binding the injector's shared raw endpoint to an application flow.
     let layer_data = data.get_layer_data();
-    // SAFETY: A non-null ALE layer-data value is a WFP-owned NBL that remains
-    // live for this classify callback. Both injection-state queries are
-    // synchronous and do not retain it.
-    let (network_injection_origin, transport_injection_origin) = if layer_data.is_null() {
-        (PacketInjectionOrigin::Unknown, PacketInjectionOrigin::Unknown)
+    let network_injection_origin = if layer_data.is_null() {
+        PacketInjectionOrigin::Unknown
     } else {
+        // SAFETY: A non-null ALE layer-data value is a WFP-owned NBL that remains
+        // live for this classify callback. The synchronous query does not retain it.
         unsafe {
-            (
-                device
-                    .injector
-                    .network_packet_injection_origin(layer_data as _, ale_data.is_ipv6),
-                device
-                    .injector
-                    .transport_packet_injection_origin(layer_data as _),
-            )
+            device
+                .injector
+                .network_packet_injection_origin(layer_data as _, ale_data.is_ipv6)
         }
     };
-    let injection_action = classify_ale_injection(
+    // A network self-injection is already sufficient to classify the indication as
+    // ours. Avoid the second WFP query on the common network-reinjection path; the
+    // transport origin cannot change either the self-injection decision or the
+    // loopback receive exception.
+    let injection_status = if network_injection_origin.is_self_injected() {
+        InjectionStatus::new(true, false, false, false)
+    } else {
+        let transport_injection_origin = if layer_data.is_null() {
+            PacketInjectionOrigin::Unknown
+        } else {
+            // SAFETY: The same WFP-owned NBL remains live for this synchronous query.
+            unsafe {
+                device
+                    .injector
+                    .transport_packet_injection_origin(layer_data as _)
+            }
+        };
         InjectionStatus::new(
-            network_injection_origin.is_self_injected(),
+            false,
             transport_injection_origin.is_self_injected(),
             network_injection_origin.is_injected_by_other(),
             transport_injection_origin.is_injected_by_other(),
-        ),
+        )
+    };
+    let injection_action = classify_ale_injection(
+        injection_status,
         ale_data.protocol,
         ale_data.loopback,
         ale_data.connection_direction,
@@ -1152,24 +1165,54 @@ fn end_udp_endpoint(device: &Device, endpoint_handle: u64, process_id: u64) -> b
         return false;
     };
 
-    let mut ended_v4 = Vec::new();
-    let mut ended_v6 = Vec::new();
-    for peer in endpoint {
-        let key = peer.key;
-        if key.is_ipv6() {
+    // Keep the common one-peer socket closure allocation-free. The batch path
+    // below is for sockets that accumulated several remote tuples.
+    if let [peer] = endpoint.as_slice() {
+        if peer.key.is_ipv6() {
             if let Some(conn) = device
                 .connection_cache
-                .end_connection_instance_v6(key, peer.instance_id)
+                .end_connection_instance_v6(peer.key, peer.instance_id)
             {
-                ended_v6.push(conn);
+                retire_pending_connections(device, core::slice::from_ref(&conn));
+                emit_connection_end_v6(device, conn, process_id);
             }
         } else if let Some(conn) = device
             .connection_cache
-            .end_connection_instance_v4(key, peer.instance_id)
+            .end_connection_instance_v4(peer.key, peer.instance_id)
         {
-            ended_v4.push(conn);
+            retire_pending_connections(device, core::slice::from_ref(&conn));
+            emit_connection_end_v4(device, conn, process_id);
+        }
+        return true;
+    }
+
+    let mut peers_v4 = Vec::new();
+    let mut peers_v6 = Vec::new();
+    for peer in endpoint {
+        if peer.key.is_ipv6() {
+            peers_v6.push((peer.key, peer.instance_id));
+        } else {
+            peers_v4.push((peer.key, peer.instance_id));
         }
     }
+
+    // A UDP socket can own many remote peers. End them in family batches so the
+    // connection cache takes its write lock once per family rather than once per
+    // peer.
+    let ended_v4 = if peers_v4.is_empty() {
+        Vec::new()
+    } else {
+        device
+            .connection_cache
+            .end_connection_instances_v4(&peers_v4)
+    };
+    let ended_v6 = if peers_v6.is_empty() {
+        Vec::new()
+    } else {
+        device
+            .connection_cache
+            .end_connection_instances_v6(&peers_v6)
+    };
 
     retire_pending_connections(device, &ended_v4);
     retire_pending_connections(device, &ended_v6);
@@ -1457,21 +1500,23 @@ fn is_injected_outbound_transport_flow(
 
     // SAFETY: FLOW_ESTABLISHED supplies this NBL for the duration of the classify
     // callback. The synchronous injection-state queries do not retain it.
-    let (network_origin, transport_origin) = unsafe {
-        (
-            device
-                .injector
-                .network_packet_injection_origin(layer_data as _, is_ipv6),
-            device
-                .injector
-                .transport_packet_injection_origin(layer_data as _),
-        )
+    let network_origin = unsafe {
+        device
+            .injector
+            .network_packet_injection_origin(layer_data as _, is_ipv6)
     };
-    should_skip_injected_outbound_flow(
-        true,
-        network_origin.is_injected(),
-        transport_origin.is_injected(),
-    )
+    // Either injection handle is sufficient to identify a synthetic outbound
+    // flow. Skip the transport query when the network handle already says so.
+    if network_origin.is_injected() {
+        return true;
+    }
+
+    let transport_origin = unsafe {
+        device
+            .injector
+            .transport_packet_injection_origin(layer_data as _)
+    };
+    should_skip_injected_outbound_flow(true, false, transport_origin.is_injected())
 }
 
 /// Refreshes the owning process when a TCP or UDP ALE flow becomes active.

@@ -1,7 +1,10 @@
 //! Holds TCP endpoint-closure classifications while already-published packet
 //! decisions are completed.
 
-use alloc::{collections::BTreeMap, vec::Vec};
+use alloc::{
+    collections::{btree_map::Entry, BTreeMap},
+    vec::Vec,
+};
 
 #[cfg(not(test))]
 use wdk::filter_engine::callout_data::ClassifyPend;
@@ -76,13 +79,15 @@ impl TcpClosureCache {
 
     /// Inserts one closure keyed by its globally unique connection generation.
     /// Returns the supplied value when that generation is already closing.
-    pub fn insert(&mut self, closure: PendingTcpClosure) -> Result<(), PendingTcpClosure> {
+    pub fn insert(&mut self, closure: PendingTcpClosure) -> Option<PendingTcpClosure> {
         let instance_id = closure.endpoint.instance_id;
-        if self.closures.contains_key(&instance_id) {
-            return Err(closure);
+        match self.closures.entry(instance_id) {
+            Entry::Occupied(_) => Some(closure),
+            Entry::Vacant(entry) => {
+                entry.insert(closure);
+                None
+            }
         }
-        self.closures.insert(instance_id, closure);
-        Ok(())
     }
 
     /// Adds a request published while a matching closure is already pended.
@@ -165,7 +170,7 @@ mod tests {
         let mut cache = TcpClosureCache::new();
         assert!(cache
             .insert(PendingTcpClosure::new(endpoint, 10, (), vec![7, 9, 7]))
-            .is_ok());
+            .is_none());
 
         let unrelated_key = endpoint.key.reverse();
         cache.add_request(8, &unrelated_key, Some(100));
@@ -176,13 +181,31 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_insert_returns_unstored_closure() {
+        let endpoint = endpoint(false, 100);
+        let mut cache = TcpClosureCache::new();
+        assert!(cache
+            .insert(PendingTcpClosure::new(endpoint, 10, (), vec![7]))
+            .is_none());
+
+        let duplicate = cache
+            .insert(PendingTcpClosure::new(endpoint, 20, (), vec![8]))
+            .expect("duplicate closure");
+
+        assert_eq!(duplicate.process_id, 20);
+        assert_eq!(cache.get_entries_count(), 1);
+        assert!(cache.finish_request(8).is_empty());
+        assert!(cache.finish_request(7) == vec![endpoint]);
+    }
+
+    #[test]
     fn loopback_closure_tracks_reverse_tuple_requests() {
         let mut endpoint = endpoint(true, 100);
         endpoint.key.remote_address = endpoint.key.local_address;
         let mut cache = TcpClosureCache::new();
         assert!(cache
             .insert(PendingTcpClosure::new(endpoint, 10, (), vec![7]))
-            .is_ok());
+            .is_none());
 
         cache.add_request(8, &endpoint.key.reverse(), Some(200));
         assert!(cache.finish_request(7).is_empty());
@@ -196,7 +219,7 @@ mod tests {
         let mut cache = TcpClosureCache::new();
         assert!(cache
             .insert(PendingTcpClosure::new(endpoint, 10, (), vec![7]))
-            .is_ok());
+            .is_none());
 
         cache.add_request(8, &endpoint.key.reverse(), Some(200));
         assert!(cache.finish_request(7).is_empty());
@@ -209,7 +232,7 @@ mod tests {
         let mut cache = TcpClosureCache::new();
         assert!(cache
             .insert(PendingTcpClosure::new(endpoint, 10, (), vec![7]))
-            .is_ok());
+            .is_none());
 
         cache.add_request(8, &endpoint.key.reverse(), Some(200));
         assert!(cache.finish_request(7) == vec![endpoint]);

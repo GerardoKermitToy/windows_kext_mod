@@ -437,6 +437,18 @@ impl ConnectionCache {
         connections.read_for_packet(key, packet_direction, process_connection)
     }
 
+    /// Ends several exact IPv4 connection generations under one map write lock.
+    pub fn end_connection_instances_v4(&self, instances: &[(Key, u64)]) -> Vec<ConnectionV4> {
+        let mut connections = self.connections_v4.write_lock();
+        connections.end_instances(instances)
+    }
+
+    /// Ends several exact IPv6 connection generations under one map write lock.
+    pub fn end_connection_instances_v6(&self, instances: &[(Key, u64)]) -> Vec<ConnectionV6> {
+        let mut connections = self.connections_v6.write_lock();
+        connections.end_instances(instances)
+    }
+
     pub fn end_connection_instance_v4(&self, key: Key, instance_id: u64) -> Option<ConnectionV4> {
         let mut connections = self.connections_v4.write_lock();
         connections.end_instance(key, instance_id)
