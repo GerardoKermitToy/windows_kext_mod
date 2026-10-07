@@ -319,6 +319,13 @@ fn ip_packet_layer(
         };
         let key = packet_metadata.key;
 
+        // Resets terminate TCP state, including after endpoint closure. Permit
+        // them in either direction without a cache lookup or userspace verdict.
+        if packet_metadata.is_tcp_reset {
+            data.action_permit();
+            return;
+        }
+
         if fast_track_pm_packets(&key) || packet_metadata.is_icmp_port_unreachable {
             data.action_permit();
             return;
@@ -328,8 +335,7 @@ fn ip_packet_layer(
             key.protocol,
             smoltcp::wire::IpProtocol::Tcp | smoltcp::wire::IpProtocol::Udp
         );
-        // Read connection state once. Cached TCP resets previously acquired and
-        // searched the same spin-locked map here and then again below.
+        // Read connection state once for packets that still need policy.
         let connection_info = if transport_protocol {
             get_connection_info(
                 &device.connection_cache,
@@ -341,17 +347,6 @@ fn ip_packet_layer(
         } else {
             None
         };
-
-        // A TCP reset emitted by the local stack in response to a packet for
-        // which no socket is listening has no user-space connection behind it.
-        // There is no ALE record or process to attribute, so do not manufacture
-        // a PID-0 connection and do not send a request that cannot be meaningfully
-        // decided. Existing cached connections are deliberately handled below so
-        // their configured policy still applies.
-        if packet_metadata.is_tcp_reset && connection_info.is_none() {
-            data.action_permit();
-            return;
-        }
 
         let mut send_request_to_portmaster = true;
         let mut process_id = 0;

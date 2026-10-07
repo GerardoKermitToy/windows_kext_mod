@@ -120,7 +120,6 @@ fn inspect_ipv4_packet(packet: &[u8], direction: Direction) -> PacketInspection 
         None
     };
 
-    let outbound = matches!(direction, Direction::Outbound);
     let is_icmp_port_unreachable = protocol == IpProtocol::Icmp
         && ip_packet.version() == 4
         && is_port_unreachable(
@@ -129,8 +128,7 @@ fn inspect_ipv4_packet(packet: &[u8], direction: Direction) -> PacketInspection 
             usize::from(ip_packet.total_len()),
             false,
         );
-    let is_tcp_reset = outbound
-        && protocol == IpProtocol::Tcp
+    let is_tcp_reset = protocol == IpProtocol::Tcp
         && (IPV4_HEADER_LEN..=IPV4_MAX_HEADER_LEN).contains(&raw_transport_offset)
         && has_tcp_reset(packet, raw_transport_offset);
 
@@ -176,14 +174,12 @@ fn inspect_ipv6_packet(packet: &[u8], direction: Direction) -> PacketInspection 
         None
     };
 
-    let outbound = matches!(direction, Direction::Outbound);
     let total_len = IPV6_HEADER_LEN + ip_packet.payload_len() as usize;
     let is_icmp_port_unreachable = headers.protocol == IpProtocol::Icmpv6
         && ip_packet.version() == 6
         && is_port_unreachable(packet, headers.transport_offset, total_len, true);
-    let is_tcp_reset = outbound
-        && headers.protocol == IpProtocol::Tcp
-        && has_tcp_reset(packet, headers.transport_offset);
+    let is_tcp_reset =
+        headers.protocol == IpProtocol::Tcp && has_tcp_reset(packet, headers.transport_offset);
 
     PacketInspection {
         is_fragment: headers.is_fragment,
@@ -343,6 +339,18 @@ mod tests {
             IpAddress::Ipv4(Ipv4Address::new(192, 0, 2, 1))
         );
         assert!(metadata.is_tcp_reset);
+        for direction in [Direction::Outbound, Direction::Inbound] {
+            for (flags, is_reset) in [(0x04, true), (0x14, true), (0x02, false), (0x11, false)] {
+                packet[73] = flags;
+                let metadata = inspect_packet(&packet, false, direction).metadata.unwrap();
+                assert_eq!(metadata.is_tcp_reset, is_reset);
+            }
+            packet[73] = TCP_RST_FLAG;
+            let truncated = inspect_packet(&packet[..73], false, direction)
+                .metadata
+                .unwrap();
+            assert!(!truncated.is_tcp_reset);
+        }
     }
 
     #[test]
@@ -430,6 +438,45 @@ mod tests {
         assert_eq!(metadata.key.remote_port, 443);
         assert_eq!(metadata.key.remote_address, IpAddress::Ipv6(remote));
         assert!(metadata.is_tcp_reset);
+        for direction in [Direction::Outbound, Direction::Inbound] {
+            for (flags, is_reset) in [(0x04, true), (0x14, true), (0x10, false), (0x11, false)] {
+                packet[TRANSPORT_OFFSET + TCP_FLAGS_OFFSET] = flags;
+                let metadata = inspect_packet(&packet, true, direction).metadata.unwrap();
+                assert_eq!(metadata.is_tcp_reset, is_reset);
+            }
+            packet[TRANSPORT_OFFSET + TCP_FLAGS_OFFSET] = TCP_RST_FLAG;
+            let truncated = inspect_packet(
+                &packet[..TRANSPORT_OFFSET + TCP_FLAGS_OFFSET],
+                true,
+                direction,
+            )
+            .metadata
+            .unwrap();
+            assert!(!truncated.is_tcp_reset);
+        }
+    }
+
+    #[test]
+    fn udp_payload_bit_is_not_a_tcp_reset() {
+        for ipv6 in [false, true] {
+            let mut packet = [0u8; IPV6_HEADER_LEN + 20];
+            let transport_offset = if ipv6 {
+                packet[0] = 0x60;
+                packet[4..6].copy_from_slice(&20u16.to_be_bytes());
+                packet[6] = u8::from(IpProtocol::Udp);
+                IPV6_HEADER_LEN
+            } else {
+                packet[0] = 0x45;
+                packet[2..4].copy_from_slice(&40u16.to_be_bytes());
+                packet[9] = u8::from(IpProtocol::Udp);
+                IPV4_HEADER_LEN
+            };
+            packet[transport_offset + TCP_FLAGS_OFFSET] = TCP_RST_FLAG;
+            for direction in [Direction::Outbound, Direction::Inbound] {
+                let metadata = inspect_packet(&packet, ipv6, direction).metadata.unwrap();
+                assert!(!metadata.is_tcp_reset);
+            }
+        }
     }
 
     #[test]
