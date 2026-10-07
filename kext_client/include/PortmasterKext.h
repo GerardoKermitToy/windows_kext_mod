@@ -80,6 +80,7 @@ const char* DirectionToString(uint8_t dir);
 
 std::string FormatIpv4(const uint8_t ip[4]);
 std::string FormatIpv6(const uint8_t ip[16]);
+bool NormalizeIpAddress(const std::wstring& literal, std::string& normalized);
 
 // ---------------------------------------------------------------- event types
 

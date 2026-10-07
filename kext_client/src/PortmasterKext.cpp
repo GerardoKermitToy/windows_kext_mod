@@ -1,4 +1,8 @@
 #include "PortmasterKext.h"
+
+#include <winsock2.h>
+#include <ws2tcpip.h>
+
 #include "duplex_pipe/duplex_pipe_server.h"
 
 #include <windows.h>
@@ -135,6 +139,19 @@ std::string FormatIpv6(const uint8_t ip[16]) {
                   ip[0], ip[1], ip[2], ip[3], ip[4], ip[5], ip[6], ip[7],
                   ip[8], ip[9], ip[10], ip[11], ip[12], ip[13], ip[14], ip[15]);
     return buf;
+}
+
+bool NormalizeIpAddress(const std::wstring& literal, std::string& normalized) {
+    uint8_t ip[16] = {};
+    if (InetPtonW(AF_INET, literal.c_str(), ip) == 1) {
+        normalized = FormatIpv4(ip);
+        return true;
+    }
+    if (InetPtonW(AF_INET6, literal.c_str(), ip) == 1) {
+        normalized = FormatIpv6(ip);
+        return true;
+    }
+    return false;
 }
 
 std::string Connection::LocalIpString() const {

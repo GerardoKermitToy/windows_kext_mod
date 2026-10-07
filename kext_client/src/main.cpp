@@ -63,7 +63,7 @@ struct Options {
     bool has_alt = false;
     bool has_match = false;
     bool has_match_port = false;
-    std::string alt_match_ip;      // presentation form, matched as a string
+    std::string alt_match_ip;      // normalized with the event address formatter
     uint16_t alt_match_port = 0;
 
     // --filter-ip: display only records involving this IP (connections, ends,
@@ -375,17 +375,9 @@ bool ParseArgs(int argc, wchar_t** argv, Options& opt) {
                 return false;
             }
 
-            // Narrow explicitly rather than via iterators: an IP literal is ASCII,
-            // but an implicit wchar_t->char conversion is lossy in general and the
-            // compiler is right to warn about it.
-            opt.alt_match_ip.clear();
-            opt.alt_match_ip.reserve(ip.size());
-            for (const wchar_t ch : ip) {
-                if (ch > 0x7F) {
-                    std::printf("ERROR: --match IP must be ASCII\n");
-                    return false;
-                }
-                opt.alt_match_ip.push_back(static_cast<char>(ch));
+            if (!pmkext::NormalizeIpAddress(ip, opt.alt_match_ip)) {
+                std::printf("ERROR: --match IP must be a valid IPv4 or IPv6 address\n");
+                return false;
             }
 
             if (!port.empty()) {
@@ -468,14 +460,9 @@ bool ParseArgs(int argc, wchar_t** argv, Options& opt) {
                 return false;
             }
 
-            opt.filter_ip.clear();
-            opt.filter_ip.reserve(ip.size());
-            for (const wchar_t ch : ip) {
-                if (ch > 0x7F) {
-                    std::printf("ERROR: --filter-ip IP must be ASCII\n");
-                    return false;
-                }
-                opt.filter_ip.push_back(static_cast<char>(ch));
+            if (!pmkext::NormalizeIpAddress(ip, opt.filter_ip)) {
+                std::printf("ERROR: --filter-ip IP must be a valid IPv4 or IPv6 address\n");
+                return false;
             }
 
             if (!port.empty()) {

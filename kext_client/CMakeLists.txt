@@ -24,8 +24,8 @@ target_include_directories(pmkext
     PRIVATE "${WINRPC_SOURCE_DIR}"
 )
 
-# Advapi32 provides the service-control (SCM) functions.
-target_link_libraries(pmkext PUBLIC advapi32)
+# Advapi32 provides SCM functions; Ws2_32 provides IP literal parsing.
+target_link_libraries(pmkext PUBLIC advapi32 ws2_32)
 
 if(MSVC)
     target_compile_options(pmkext PRIVATE /W4 /permissive-)
@@ -73,4 +73,11 @@ if(MSVC)
     set_target_properties(kext_monitor PROPERTIES
         LINK_FLAGS "/ENTRY:wmainCRTStartup /MANIFESTUAC:\"level='requireAdministrator' uiAccess='false'\""
     )
+endif()
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(ip_address_tests tests/ip_address_tests.cpp)
+    target_link_libraries(ip_address_tests PRIVATE pmkext)
+    add_test(NAME ip_address_tests COMMAND ip_address_tests)
 endif()
