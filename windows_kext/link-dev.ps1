@@ -17,7 +17,7 @@ link.exe /OUT:portmaster-kext.sys `
 "driver\target\x86_64-pc-windows-msvc\release\driver.lib" `
 /RELEASE /INTEGRITYCHECK /VERSION:"10.0" /DEBUG /MACHINE:X64 /ENTRY:"FxDriverEntry" /OPT:REF /INCREMENTAL:NO /SUBSYSTEM:NATIVE",6.01" /OPT:ICF /ERRORREPORT:PROMPT /MERGE:"_TEXT=.text;_PAGE=PAGE" /NOLOGO /NODEFAULTLIB /SECTION:"INIT,d"
 
-signtool sign /v /s My /n "MyCompany Code Signing" /tr http://timestamp.digicert.com /td SHA256 /fd SHA256 portmaster-kext.sys
+signtool sign /fd sha256 /td SHA256 /ac .\localhost-root-ca.der /f .\localhost-km.pfx /p 1 /n "Localhost Kernel Mode Driver Certificate" /tr http://timestamp.digicert.com portmaster-kext.sys
 
 
 if(!$?) {
