@@ -21,7 +21,9 @@ use windows_sys::{
         },
     },
     Win32::{
-        Foundation::{BOOLEAN, INVALID_HANDLE_VALUE, NTSTATUS, STATUS_SUCCESS},
+        Foundation::{
+            BOOLEAN, INVALID_HANDLE_VALUE, NTSTATUS, STATUS_PROTOCOL_UNREACHABLE, STATUS_SUCCESS,
+        },
         Networking::WinSock::{AF_INET, AF_INET6, AF_UNSPEC, SCOPE_ID, SCOPE_ID_0},
         System::Kernel::{COMPARTMENT_ID, UNSPECIFIED_COMPARTMENT_ID},
     },
@@ -233,6 +235,23 @@ unsafe impl Send for TransportPacketList {}
 struct NetworkInjectionContext {
     net_buffer_list: NetBufferList,
     completion: InjectionCompletion,
+    /// Our ALE callout saved another copy and intentionally absorbed this NBL.
+    recaptured: AtomicBool,
+}
+
+fn has_live_network_injection_context(
+    state: FWPS_PACKET_INJECTION_STATE,
+    context: *mut c_void,
+) -> bool {
+    state == FWPS_PACKET_INJECTION_STATE::FWPS_PACKET_INJECTED_BY_SELF && !context.is_null()
+}
+
+fn is_recaptured_network_completion(
+    path: InjectionPath,
+    status: NTSTATUS,
+    recaptured: bool,
+) -> bool {
+    path == InjectionPath::NetworkSend && status == STATUS_PROTOCOL_UNREACHABLE && recaptured
 }
 
 /// One admission reference held from transport-injection submission until the
@@ -756,6 +775,7 @@ impl Injector {
         // Escape the stack, so both packet ownership and completion-reporting
         // metadata remain valid until WFP invokes free_packet.
         let packet_boxed = Box::new(NetworkInjectionContext {
+            recaptured: AtomicBool::new(false),
             net_buffer_list,
             completion: InjectionCompletion {
                 path,
@@ -772,7 +792,7 @@ impl Injector {
             unsafe {
                 FwpsInjectNetworkReceiveAsync0(
                     inject_handle,
-                    core::ptr::null_mut(),
+                    packet_pointer.cast(),
                     0,
                     compartment_id,
                     inject_info.interface_index,
@@ -787,7 +807,7 @@ impl Injector {
             unsafe {
                 FwpsInjectNetworkSendAsync0(
                     inject_handle,
-                    core::ptr::null_mut(),
+                    packet_pointer.cast(),
                     0,
                     compartment_id,
                     nbl,
@@ -807,6 +827,45 @@ impl Injector {
         }
 
         return Ok(());
+    }
+
+    /// Marks an active network injection whose packet was saved again at ALE.
+    ///
+    /// Additional inbound loopback UDP packets are cloned and absorbed while
+    /// receive authorization is pending. WFP completes the original network-send
+    /// injection with STATUS_PROTOCOL_UNREACHABLE, but the saved copy still owns
+    /// delivery. Only that completion status is expected after this handoff.
+    ///
+    /// # Safety
+    ///
+    /// `nbl` must be a live WFP NBL in the current classify callback. A current
+    /// self-injection keeps the context supplied by `inject_net_buffer_list` live
+    /// until classification returns. A previously injected NBL does not provide
+    /// that lifetime guarantee and must never be used to dereference its context.
+    pub unsafe fn mark_network_packet_recaptured(
+        &self,
+        nbl: *const NET_BUFFER_LIST,
+        ipv6: bool,
+    ) {
+        let handle = if ipv6 {
+            self.packet_inject_handle_v6.load(Ordering::Acquire)
+        } else {
+            self.packet_inject_handle_v4.load(Ordering::Acquire)
+        };
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE || nbl.is_null() {
+            return;
+        }
+
+        let mut context = core::ptr::null_mut();
+        let state = unsafe { FwpsQueryPacketInjectionState0(handle, nbl, &mut context) };
+        if !has_live_network_injection_context(state, context) {
+            return;
+        }
+
+        // SAFETY: This handle injects only NetworkInjectionContext values, and
+        // the current self-injection cannot complete until this classify returns.
+        let context = unsafe { &*(context as *const NetworkInjectionContext) };
+        context.recaptured.store(true, Ordering::Release);
     }
 
     /// Returns the origin WFP reports for a network-layer NBL.
@@ -996,7 +1055,17 @@ unsafe extern "system" fn free_packet(
         Some(unsafe { (*(context as *mut NetworkInjectionContext)).completion })
     };
     if let (Some(completion), Some(status)) = (completion, status) {
-        completion.report_if_failed(status);
+        // Most completions succeed and need no atomic read. Do not hide errors
+        // from other filters, or even this status unless our ALE clone owns it.
+        let recaptured = status == STATUS_PROTOCOL_UNREACHABLE
+            && unsafe {
+                (*(context as *const NetworkInjectionContext))
+                    .recaptured
+                    .load(Ordering::Acquire)
+            };
+        if !is_recaptured_network_completion(completion.path, status, recaptured) {
+            completion.report_if_failed(status);
+        }
     }
 
     if !context.is_null() {
@@ -1039,7 +1108,8 @@ unsafe extern "system" fn free_transport_packet(
 #[cfg(test)]
 mod tests {
     use super::{
-        packet_injection_origin, reclaim_immediate_injection_failure, resolve_compartment_id,
+        has_live_network_injection_context, is_recaptured_network_completion, packet_injection_origin,
+        reclaim_immediate_injection_failure, resolve_compartment_id,
         InjectionCompletion, InjectionPath, PacketInjectionOrigin, TransportProtocol,
         UNSPECIFIED_COMPARTMENT_ID,
     };
@@ -1091,6 +1161,48 @@ mod tests {
             FAILURE_CALLBACK_STATUS.load(Ordering::Acquire),
             STATUS_DATA_NOT_ACCEPTED
         );
+    }
+
+    #[test]
+    fn only_current_self_injection_can_expose_a_live_context() {
+        let context = core::ptr::NonNull::<u8>::dangling().as_ptr().cast();
+        for state in [
+            FWPS_PACKET_INJECTION_STATE::FWPS_PACKET_NOT_INJECTED,
+            FWPS_PACKET_INJECTION_STATE::FWPS_PACKET_INJECTED_BY_SELF,
+            FWPS_PACKET_INJECTION_STATE::FWPS_PACKET_PREVIOUSLY_INJECTED_BY_SELF,
+            FWPS_PACKET_INJECTION_STATE::FWPS_PACKET_INJECTED_BY_OTHER,
+            FWPS_PACKET_INJECTION_STATE::FWPS_PACKET_INJECTION_STATE_MAX,
+        ] {
+            assert!(!has_live_network_injection_context(state, core::ptr::null_mut()));
+            assert_eq!(
+                has_live_network_injection_context(state, context),
+                state == FWPS_PACKET_INJECTION_STATE::FWPS_PACKET_INJECTED_BY_SELF,
+            );
+        }
+    }
+
+    #[test]
+    fn only_recaptured_network_send_has_an_expected_protocol_completion() {
+        for path in [
+            InjectionPath::NetworkReceive,
+            InjectionPath::NetworkSend,
+            InjectionPath::TransportReceive,
+            InjectionPath::TransportSend,
+        ] {
+            for recaptured in [false, true] {
+                assert_eq!(
+                    is_recaptured_network_completion(
+                        path,
+                        super::STATUS_PROTOCOL_UNREACHABLE,
+                        recaptured,
+                    ),
+                    path == InjectionPath::NetworkSend && recaptured,
+                );
+                for status in [0, 1, 0xc000_021bu32 as i32, 0xc000_009au32 as i32] {
+                    assert!(!is_recaptured_network_completion(path, status, recaptured));
+                }
+            }
+        }
     }
 
     #[test]

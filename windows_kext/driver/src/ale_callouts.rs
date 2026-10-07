@@ -765,14 +765,33 @@ fn save_packet(
     if pend && matches!(ale_data.packet_direction, Direction::Inbound) && packet_list.is_none() {
         return Err("ALE receive/accept indication has no packet data".into());
     }
-    if pend && matches!(ale_data.protocol, IpProtocol::Tcp | IpProtocol::Udp) {
+    let captured = packet_list.is_some();
+    let packet = if pend && matches!(ale_data.protocol, IpProtocol::Tcp | IpProtocol::Udp) {
         match callout_data.pend_operation(packet_list) {
-            Ok(classify_defer) => Ok(Packet::AleLayer(classify_defer)),
-            Err(err) => Err(alloc::format!("failed to defer connection: {}", err)),
+            Ok(classify_defer) => Packet::AleLayer(classify_defer),
+            Err(err) => return Err(alloc::format!("failed to defer connection: {}", err)),
         }
     } else {
-        Ok(Packet::AleLayer(callout_data.pend_filter_rest(packet_list)))
+        Packet::AleLayer(callout_data.pend_filter_rest(packet_list))
+    };
+
+    if captured
+        && !pend
+        && ale_data.loopback
+        && ale_data.protocol == IpProtocol::Udp
+        && matches!(ale_data.packet_direction, Direction::Inbound)
+    {
+        // This additional packet is absorbed while receive authorization is
+        // pending. Our saved clone, not the original injection, now owns delivery.
+        // SAFETY: The WFP-owned NBL remains live through this classify callback.
+        unsafe {
+            device.injector.mark_network_packet_recaptured(
+                callout_data.get_layer_data() as _,
+                ale_data.is_ipv6,
+            );
+        }
     }
+    Ok(packet)
 }
 
 fn create_packet_list(
