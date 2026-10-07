@@ -10,6 +10,9 @@ name = "driver"
 path = "src/lib.rs"
 crate-type = ["staticlib"]
 
+[features]
+udp-lifecycle-diagnostics = []
+
 [dependencies]
 wdk = { path = "../wdk" }
 protocol = { path = "../protocol" }

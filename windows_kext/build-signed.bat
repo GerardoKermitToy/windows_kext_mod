@@ -16,7 +16,7 @@ cd /d "%~dp0"
 
 echo === cargo build --release ===
 pushd driver
-cargo build --release
+cargo build --release %*
 if errorlevel 1 (
     popd
     exit /b 1

@@ -339,6 +339,48 @@ mod tests {
     }
 
     #[test]
+    fn mismatched_callback_does_not_consume_context_or_start_rundown() {
+        let cache = UdpFlowCache::new();
+        assert!(cache.register(100, registration(1)));
+        assert!(cache.mark_associated(100, 1_001));
+
+        assert_eq!(cache.begin_callback(100, 49, 7), None);
+        assert_eq!(cache.begin_callback(100, 48, 8), None);
+        assert_eq!(cache.get_entries_counts(), (1, 0));
+        assert_eq!(cache.removal_candidates(), alloc::vec![(100, 1_001)]);
+
+        assert_eq!(cache.begin_callback(100, 48, 7), Some(false));
+        assert_eq!(cache.get_entries_counts(), (0, 1));
+        cache.finish_callback();
+        assert!(cache.is_drained());
+    }
+
+    #[test]
+    fn periodic_snapshots_do_not_retire_native_flows_before_callback() {
+        let cache = UdpFlowCache::new();
+        assert!(cache.register(100, registration(1)));
+        assert!(cache.register(200, registration(2)));
+        assert!(cache.mark_associated(100, 1_001));
+        assert!(cache.mark_associated(200, 1_002));
+
+        for _ in 0..3 {
+            assert_eq!(
+                cache.removal_candidates(),
+                alloc::vec![(100, 1_001), (200, 1_002)]
+            );
+            assert_eq!(cache.get_entries_counts(), (2, 0));
+        }
+
+        assert_eq!(cache.begin_callback(100, 48, 7), Some(false));
+        cache.finish_callback();
+        assert_eq!(cache.removal_candidates(), alloc::vec![(200, 1_002)]);
+        assert_eq!(cache.get_entries_counts(), (1, 0));
+        assert_eq!(cache.begin_callback(200, 48, 7), Some(false));
+        cache.finish_callback();
+        assert!(cache.is_drained());
+    }
+
+    #[test]
     fn periodic_removal_is_claimed_once_and_can_be_retried() {
         let cache = UdpFlowCache::new();
         assert!(cache.register(100, registration(1)));

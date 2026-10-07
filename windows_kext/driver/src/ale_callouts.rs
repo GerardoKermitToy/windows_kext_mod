@@ -1005,10 +1005,24 @@ fn associate_udp_flow_context(
 
     // From this point WFP owns the context. flowDeleteFn may already have claimed
     // it while FwpsFlowAssociateContext0 was returning.
-    if device
+    let associated = device
         .udp_flow_cache
-        .mark_associated(flow_context, connection_instance_id)
-    {
+        .mark_associated(flow_context, connection_instance_id);
+    #[cfg(feature = "udp-lifecycle-diagnostics")]
+    crate::err!(
+        "UDP idle associate t={} f={} l={} c={} ctx={} i={} ep={:?} pid={} associated={} {}",
+        wdk::utils::get_monotonic_timestamp_ms(),
+        flow_id,
+        data.get_layer_id(),
+        data.get_callout_id(),
+        flow_context,
+        connection_instance_id,
+        endpoint_handle,
+        process_id,
+        associated,
+        key
+    );
+    if associated {
         // This WFP-owned context now provides an exact flowDeleteFn lifetime even
         // when authorization omitted the transport endpoint handle. Promote only
         // the same live cache generation; a reused tuple cannot inherit it.
@@ -1018,9 +1032,11 @@ fn associate_udp_flow_context(
     }
 }
 
-/// WFP invokes this after a UDP ALE flow reaches its native idle timeout or its
-/// socket closes.  The context is driver-owned again on entry; the normal path
-/// claims and frees it while the callback barrier keeps Device alive.
+/// WFP invokes this when it deletes a UDP ALE flow or removes our association.
+/// Native idle expiry can be deferred until later remote-peer table maintenance;
+/// reaching the nominal idle timeout alone does not guarantee this callback.
+/// The context is driver-owned again on entry; the normal path claims and frees
+/// it while the callback barrier keeps Device alive.
 pub(crate) unsafe extern "system" fn udp_flow_delete(
     layer_id: u16,
     callout_id: u32,
@@ -1056,17 +1072,37 @@ pub(crate) unsafe extern "system" fn udp_flow_delete(
         return;
     };
 
+    #[cfg(feature = "udp-lifecycle-diagnostics")]
+    crate::err!(
+        "UDP idle delete entry t={} l={} c={} ctx={}",
+        wdk::utils::get_monotonic_timestamp_ms(),
+        layer_id,
+        callout_id,
+        flow_context
+    );
     let Some(reclaim_only) =
         device
             .udp_flow_cache
             .begin_callback(flow_context, layer_id, callout_id)
     else {
+        #[cfg(feature = "udp-lifecycle-diagnostics")]
+        crate::err!("UDP idle delete rejected ctx={}", flow_context);
         // A duplicate, mismatched, or already-reclaimed callback has no
         // ownership left to release. In particular, never reconstruct a Box for
         // an unknown ID or for a reused address belonging to another callout.
         return;
     };
     let context = unsafe { Box::from_raw(flow_context as *mut UdpFlowContext) };
+    #[cfg(feature = "udp-lifecycle-diagnostics")]
+    crate::err!(
+        "UDP idle delete accepted ctx={} i={} ep={:?} pid={} reclaim={} {}",
+        flow_context,
+        context.connection_instance_id,
+        context.endpoint_handle,
+        context.process_id,
+        reclaim_only,
+        context.key
+    );
 
     // Periodic cleanup and unload have already retired (or are discarding) the
     // corresponding cache state.  Their callbacks only reclaim the WFP
