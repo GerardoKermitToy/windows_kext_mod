@@ -42,6 +42,35 @@ impl InjectionStatus {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PacketInjectionAction {
+    PermitSelfInjected,
+    Process { injected_by_other: bool },
+}
+
+/// Packet layers always permit self-injection. Unlike ALE's inbound loopback
+/// authorization, they need no other-handle state once local ownership is proven.
+#[inline]
+pub(crate) fn classify_packet_injection(
+    network_self_injected: bool,
+    network_injected_by_other: bool,
+    query_transport: impl FnOnce() -> (bool, bool),
+) -> PacketInjectionAction {
+    if network_self_injected {
+        return PacketInjectionAction::PermitSelfInjected;
+    }
+
+    // "Other" relative to the network handle can still be our transport clone.
+    let (transport_self_injected, transport_injected_by_other) = query_transport();
+    if transport_self_injected {
+        PacketInjectionAction::PermitSelfInjected
+    } else {
+        PacketInjectionAction::Process {
+            injected_by_other: network_injected_by_other || transport_injected_by_other,
+        }
+    }
+}
+
 /// Returns whether an ALE indication has the signature of a final TCP
 /// reauthorization racing endpoint closure.
 pub(crate) fn can_reuse_ended_tcp_policy(reauthorize: bool, protocol: IpProtocol) -> bool {
@@ -143,13 +172,62 @@ pub(crate) fn self_injected_packet_needs_accept_authorization(
 #[cfg(test)]
 mod tests {
     use super::{
-        can_reuse_ended_tcp_policy, classify_ale_injection,
+        can_reuse_ended_tcp_policy, classify_ale_injection, classify_packet_injection,
         self_injected_endpoint_identifies_socket, self_injected_packet_needs_accept_authorization,
         should_capture_ale_packet, should_skip_cross_direction_ale_clone,
         should_skip_injected_outbound_flow, AleInjectionAction, InjectionStatus,
+        PacketInjectionAction,
     };
     use crate::connection::Direction;
     use smoltcp::wire::IpProtocol;
+
+    #[test]
+    fn packet_injection_short_circuits_only_proven_network_self() {
+        // NotInjected, Injected/PreviouslyInjectedBySelf, InjectedByOther, Unknown.
+        // Include all boolean combinations too so ownership always has priority.
+        for network_self in [false, true] {
+            for network_other in [false, true] {
+                for transport_self in [false, true] {
+                    for transport_other in [false, true] {
+                        let mut calls = 0;
+                        let actual = classify_packet_injection(network_self, network_other, || {
+                            calls += 1;
+                            (transport_self, transport_other)
+                        });
+                        let eager = InjectionStatus::new(
+                            network_self,
+                            transport_self,
+                            network_other,
+                            transport_other,
+                        );
+                        let expected = if eager.is_self_injected() {
+                            PacketInjectionAction::PermitSelfInjected
+                        } else {
+                            PacketInjectionAction::Process {
+                                injected_by_other: eager.is_injected_by_other(),
+                            }
+                        };
+                        assert_eq!(actual, expected);
+                        assert_eq!(calls, usize::from(!network_self));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn network_other_still_queries_the_own_transport_handle() {
+        assert_eq!(
+            classify_packet_injection(false, true, || (true, false)),
+            PacketInjectionAction::PermitSelfInjected,
+        );
+        assert_eq!(
+            classify_packet_injection(false, false, || (false, true)),
+            PacketInjectionAction::Process {
+                injected_by_other: true,
+            },
+        );
+    }
 
     #[test]
     fn only_inbound_self_injected_endpoint_identifies_a_socket() {

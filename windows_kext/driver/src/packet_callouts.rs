@@ -5,7 +5,7 @@ use wdk::filter_engine::layer;
 use wdk::filter_engine::net_buffer::{NetBufferList, NetBufferListClones, NetBufferListIter};
 use wdk::filter_engine::packet::InjectInfo;
 
-use crate::ale_policy::InjectionStatus;
+use crate::ale_policy::{classify_packet_injection, PacketInjectionAction};
 use crate::connection::{
     Connection, ConnectionV4, ConnectionV6, Direction, RedirectInfo, Verdict, PM_DNS_PORT,
     PM_SPLIT_TUN_PORT, PM_SPN_PORT,
@@ -15,63 +15,66 @@ use crate::connection_map::Key;
 use crate::device::{Device, Packet};
 use crate::packet_util::{inspect_packet, recalc_header_checksums, Redirect};
 
+struct PacketLayerFields {
+    interface_index: usize,
+    sub_interface_index: usize,
+    flags: usize,
+}
+
 // IP packet layers
 pub fn ip_packet_layer_outbound_v4(data: CalloutData) {
     type Fields = layer::FieldsOutboundIppacketV4;
-    let interface_index = data.get_value_u32(Fields::InterfaceIndex as usize);
-    let sub_interface_index = data.get_value_u32(Fields::SubInterfaceIndex as usize);
-
     ip_packet_layer(
         data,
         false,
         Direction::Outbound,
-        interface_index,
-        sub_interface_index,
-        Fields::Flags as usize,
+        PacketLayerFields {
+            interface_index: Fields::InterfaceIndex as usize,
+            sub_interface_index: Fields::SubInterfaceIndex as usize,
+            flags: Fields::Flags as usize,
+        },
     );
 }
 
 pub fn ip_packet_layer_inbound_v4(data: CalloutData) {
     type Fields = layer::FieldsInboundIppacketV4;
-    let interface_index = data.get_value_u32(Fields::InterfaceIndex as usize);
-    let sub_interface_index = data.get_value_u32(Fields::SubInterfaceIndex as usize);
     ip_packet_layer(
         data,
         false,
         Direction::Inbound,
-        interface_index,
-        sub_interface_index,
-        Fields::Flags as usize,
+        PacketLayerFields {
+            interface_index: Fields::InterfaceIndex as usize,
+            sub_interface_index: Fields::SubInterfaceIndex as usize,
+            flags: Fields::Flags as usize,
+        },
     );
 }
 
 pub fn ip_packet_layer_outbound_v6(data: CalloutData) {
     type Fields = layer::FieldsOutboundIppacketV6;
-    let interface_index = data.get_value_u32(Fields::InterfaceIndex as usize);
-    let sub_interface_index = data.get_value_u32(Fields::SubInterfaceIndex as usize);
-
     ip_packet_layer(
         data,
         true,
         Direction::Outbound,
-        interface_index,
-        sub_interface_index,
-        Fields::Flags as usize,
+        PacketLayerFields {
+            interface_index: Fields::InterfaceIndex as usize,
+            sub_interface_index: Fields::SubInterfaceIndex as usize,
+            flags: Fields::Flags as usize,
+        },
     );
 }
 
 pub fn ip_packet_layer_inbound_v6(data: CalloutData) {
     type Fields = layer::FieldsInboundIppacketV6;
-    let interface_index = data.get_value_u32(Fields::InterfaceIndex as usize);
-    let sub_interface_index = data.get_value_u32(Fields::SubInterfaceIndex as usize);
-
     ip_packet_layer(
         data,
         true,
         Direction::Inbound,
-        interface_index,
-        sub_interface_index,
-        Fields::Flags as usize,
+        PacketLayerFields {
+            interface_index: Fields::InterfaceIndex as usize,
+            sub_interface_index: Fields::SubInterfaceIndex as usize,
+            flags: Fields::Flags as usize,
+        },
     );
 }
 
@@ -159,20 +162,12 @@ fn ip_packet_layer(
     mut data: CalloutData,
     ipv6: bool,
     direction: Direction,
-    interface_index: u32,
-    sub_interface_index: u32,
-    flags_index: usize,
+    fields: PacketLayerFields,
 ) {
     // Fail closed until a later path explicitly permits the indication. Do not
     // make this provisional action hard: the callback still needs to replace it.
     data.set_default_block_and_absorb();
 
-    // Read indication-wide metadata and the layer-data pointer once. Every clone
-    // receives the same routing context, and WFP keeps the NBL chain stable until
-    // this callback returns.
-    let wfp_ip_header_size = data.get_ip_header_size();
-    let compartment_id = data.get_compartment_id();
-    let reassembled = data.is_reassembled(flags_index);
     let layer_data = data.get_layer_data();
     let inbound = matches!(direction, Direction::Inbound);
 
@@ -183,6 +178,15 @@ fn ip_packet_layer(
     let Some(mut first_nbl) = nbls.next() else {
         return;
     };
+
+    // Only inbound buffers need the IP-header size. Routing metadata is read
+    // lazily below, once per indication, if any packet actually needs a clone.
+    let wfp_ip_header_size = if inbound {
+        data.get_ip_header_size()
+    } else {
+        None
+    };
+    let reassembled = data.is_reassembled(fields.flags);
 
     // A fragmented datagram is indicated twice at this layer: once per individual
     // fragment, and once more as the reassembled whole (verified on Windows 11:
@@ -245,43 +249,37 @@ fn ip_packet_layer(
         }
     }
 
-    // SAFETY: The WFP-owned layer data is still live. Querying both handles is
-    // synchronous and does not depend on the first net buffer's data offset. An
-    // ALE clone injected through the transport handle is reported as
-    // `InjectedByOther` relative to the network handle, so self-injection must have
-    // priority across both results.
-    let (network_injection_origin, transport_injection_origin) = unsafe {
-        (
-            device
-                .injector
-                .network_packet_injection_origin(layer_data as _, ipv6),
-            device
-                .injector
-                .transport_packet_injection_origin(layer_data as _),
-        )
+    // SAFETY: The WFP-owned layer data is still live. The synchronous query
+    // does not depend on the first net buffer's data offset.
+    let network_injection_origin = unsafe {
+        device
+            .injector
+            .network_packet_injection_origin(layer_data as _, ipv6)
     };
-    let injection_status = InjectionStatus::new(
+    let injection_action = classify_packet_injection(
         network_injection_origin.is_self_injected(),
-        transport_injection_origin.is_self_injected(),
         network_injection_origin.is_injected_by_other(),
-        transport_injection_origin.is_injected_by_other(),
+        || {
+            // SAFETY: The same WFP-owned NBL is still live. A transport clone can
+            // be "other" relative to the network handle, so query this handle unless
+            // the network result already proved local ownership.
+            let origin = unsafe {
+                device
+                    .injector
+                    .transport_packet_injection_origin(layer_data as _)
+            };
+            (origin.is_self_injected(), origin.is_injected_by_other())
+        },
     );
-    if injection_status.is_self_injected() {
-        data.action_permit();
-        return;
-    }
-
-    // WinDivert-style tools submit outbound packets synchronously from their
-    // user-space service. WFP identifies the NBL as injected by another handle,
-    // while the current process identifies the service that initiated that send.
-    // Read it only on the outbound path; inbound processing can run in an
-    // unrelated thread context.
-    let injected_by_other = injection_status.is_injected_by_other();
-    let other_injector_process_id = if injected_by_other && !inbound {
-        wdk::utils::current_process_id()
-    } else {
-        0
+    let injected_by_other = match injection_action {
+        PacketInjectionAction::PermitSelfInjected => {
+            data.action_permit();
+            return;
+        }
+        PacketInjectionAction::Process { injected_by_other } => injected_by_other,
     };
+    let mut routing_info = None;
+    let mut other_injector_process_id = None;
 
     let mut first = true;
     for mut nbl in core::iter::once(first_nbl).chain(nbls) {
@@ -353,7 +351,6 @@ fn ip_packet_layer(
             return;
         }
 
-        let mut send_request_to_portmaster = true;
         let mut process_id = 0;
         let mut connection_instance_id = None;
 
@@ -484,16 +481,16 @@ fn ip_packet_layer(
                 match conn_info.verdict {
                     Verdict::Undecided | Verdict::Accept | Verdict::Block | Verdict::Drop => {}
                     Verdict::PermanentAccept => {
-                        send_request_to_portmaster = false;
                         data.action_permit();
+                        continue;
                     }
                     Verdict::PermanentBlock => {
-                        send_request_to_portmaster = false;
                         data.action_block_hard();
+                        continue;
                     }
                     Verdict::Undeterminable | Verdict::PermanentDrop | Verdict::Failed => {
-                        send_request_to_portmaster = false;
                         data.block_and_absorb();
+                        continue;
                     }
                     Verdict::RedirectNameServer
                     | Verdict::RedirectTunnel
@@ -503,12 +500,12 @@ fn ip_packet_layer(
                                 device,
                                 nbl,
                                 packet_inject_info(
+                                    &data,
+                                    &fields,
+                                    &mut routing_info,
                                     effective_direction,
                                     ipv6,
                                     key.is_loopback(),
-                                    compartment_id,
-                                    interface_index,
-                                    sub_interface_index,
                                 ),
                                 CloneChecksum::RedirectWillRecalculate,
                             ) {
@@ -552,7 +549,8 @@ fn ip_packet_layer(
                 // later application connection that reuses the tuple. The current
                 // process is the user-space injector that synchronously submitted
                 // this outbound packet.
-                process_id = other_injector_process_id;
+                process_id =
+                    *other_injector_process_id.get_or_insert_with(wdk::utils::current_process_id);
                 crate::dbg!(
                     "packet layer handling externally injected packet: {} PID: {}",
                     key,
@@ -590,45 +588,43 @@ fn ip_packet_layer(
             }
         }
 
-        // Clone packet and send to Portmaster.
-        if send_request_to_portmaster {
-            let packet = match clone_packet(
-                device,
-                nbl,
-                packet_inject_info(
-                    effective_direction,
-                    ipv6,
-                    key.is_loopback(),
-                    compartment_id,
-                    interface_index,
-                    sub_interface_index,
-                ),
-                CloneChecksum::Recalculate,
-            ) {
-                Ok(p) => p,
-                Err(err) => {
-                    crate::err!("failed to clone packet: {}", err);
-                    return;
-                }
-            };
-
-            if let Some(pending) = device.publish_pending_packet(
-                (key, packet),
-                connection_instance_id,
-                process_id,
+        // Only temporary/stateless decisions reach the pending-packet path.
+        let packet = match clone_packet(
+            device,
+            nbl,
+            packet_inject_info(
+                &data,
+                &fields,
+                &mut routing_info,
                 effective_direction,
-                false,
-            ) {
-                crate::dbg!(
-                    "discarding packet queued after its connection ended: {}",
-                    key
-                );
-                if let Err(err) = device.inject_packet(pending.packet, true) {
-                    crate::err!("failed to discard stale pending packet: {}", err);
-                }
+                ipv6,
+                key.is_loopback(),
+            ),
+            CloneChecksum::Recalculate,
+        ) {
+            Ok(p) => p,
+            Err(err) => {
+                crate::err!("failed to clone packet: {}", err);
+                return;
             }
-            data.block_and_absorb();
+        };
+
+        if let Some(pending) = device.publish_pending_packet(
+            (key, packet),
+            connection_instance_id,
+            process_id,
+            effective_direction,
+            false,
+        ) {
+            crate::dbg!(
+                "discarding packet queued after its connection ended: {}",
+                key
+            );
+            if let Err(err) = device.inject_packet(pending.packet, true) {
+                crate::err!("failed to discard stale pending packet: {}", err);
+            }
         }
+        data.block_and_absorb();
     }
 }
 
@@ -637,22 +633,35 @@ enum CloneChecksum {
     RedirectWillRecalculate,
 }
 
-#[inline]
-fn packet_inject_info(
-    direction: Direction,
-    ipv6: bool,
-    loopback: bool,
+struct PacketRoutingInfo {
     compartment_id: Option<u32>,
     interface_index: u32,
     sub_interface_index: u32,
+}
+
+#[inline]
+fn packet_inject_info(
+    data: &CalloutData,
+    fields: &PacketLayerFields,
+    routing_info: &mut Option<PacketRoutingInfo>,
+    direction: Direction,
+    ipv6: bool,
+    loopback: bool,
 ) -> InjectInfo {
+    // WFP keeps indication-wide routing values stable for the whole callback.
+    // Permit/block/drop paths need none of them; cloned NBLs share one snapshot.
+    let routing_info = routing_info.get_or_insert_with(|| PacketRoutingInfo {
+        compartment_id: data.get_compartment_id(),
+        interface_index: data.get_value_u32(fields.interface_index),
+        sub_interface_index: data.get_value_u32(fields.sub_interface_index),
+    });
     InjectInfo {
         ipv6,
         inbound: matches!(direction, Direction::Inbound),
         loopback,
-        compartment_id,
-        interface_index,
-        sub_interface_index,
+        compartment_id: routing_info.compartment_id,
+        interface_index: routing_info.interface_index,
+        sub_interface_index: routing_info.sub_interface_index,
     }
 }
 

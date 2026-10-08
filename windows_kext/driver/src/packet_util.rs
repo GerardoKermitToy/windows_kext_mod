@@ -292,9 +292,12 @@ pub(crate) fn inspect_packet(
     } else {
         IPV4_FALLBACK_LEN
     };
-    let mut packet = [0u8; MAX_PACKET_INSPECT_LEN];
-    match nbl.read_bytes_up_to(&mut packet, fallback_length) {
-        Ok(length) => inspect_packet_bytes(&packet[..length], ipv6, direction),
-        Err(()) => PacketInspection::unreadable(),
+    // SAFETY: The live, synchronized NBL is borrowed for this call. The callback
+    // only parses bytes into owned metadata; it cannot mutate or release the packet.
+    unsafe {
+        nbl.inspect_bytes_up_to::<MAX_PACKET_INSPECT_LEN, _>(fallback_length, |packet| {
+            inspect_packet_bytes(packet, ipv6, direction)
+        })
     }
+    .unwrap_or_else(|()| PacketInspection::unreadable())
 }

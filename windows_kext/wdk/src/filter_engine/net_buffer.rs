@@ -38,6 +38,49 @@ pub enum NetBufferListClones {
 // mutable Rust access to it between those phases.
 unsafe impl Send for NetBufferList {}
 
+// Testable counterpart of NdisGetDataBuffer's prefix/materialization contract.
+//
+// SAFETY: A non-null reader result must contain `length` initialized bytes valid
+// until `inspect` returns. A null result may leave storage partially initialized.
+// The reader must not retain storage or mutate/free the returned bytes during inspection.
+#[inline]
+unsafe fn inspect_prefix<const N: usize, R>(
+    data_length: usize,
+    fallback_length: usize,
+    mut read: impl FnMut(usize, *mut u8) -> *mut u8,
+    inspect: impl for<'bytes> FnOnce(&'bytes [u8]) -> R,
+) -> Result<R, ()> {
+    const { assert!(N <= 128, "packet inspection must fit the kernel stack") };
+    if N == 0 {
+        return Ok(inspect(&[]));
+    }
+    let length = core::cmp::min(data_length, N);
+    if length == 0 {
+        return Err(());
+    }
+
+    let mut storage = MaybeUninit::<[u8; N]>::uninit();
+    let storage = storage.as_mut_ptr().cast::<u8>();
+    let ptr = read(length, storage);
+    if !ptr.is_null() {
+        // SAFETY: The reader contract initialized the complete successful prefix.
+        return Ok(inspect(unsafe { core::slice::from_raw_parts(ptr, length) }));
+    }
+
+    let fallback_length = core::cmp::min(length, fallback_length);
+    if fallback_length == 0 || fallback_length == length {
+        return Err(());
+    }
+    let ptr = read(fallback_length, storage);
+    if ptr.is_null() {
+        return Err(());
+    }
+    // SAFETY: Only the successful shorter read is exposed, never the failed tail.
+    Ok(inspect(unsafe {
+        core::slice::from_raw_parts(ptr, fallback_length)
+    }))
+}
+
 impl NetBufferList {
     /// Wraps a native net-buffer list without taking ownership of it.
     ///
@@ -145,6 +188,44 @@ impl NetBufferList {
                     .copy_from_slice(core::slice::from_raw_parts(ptr, fallback_length));
             }
             Ok(fallback_length)
+        }
+    }
+
+    /// Inspects a bounded prefix without copying an already contiguous NDIS buffer.
+    /// For a split MDL, NDIS fills the temporary storage instead. The prefix cannot
+    /// escape `inspect`, and only the successful read's initialized bytes are exposed.
+    ///
+    /// # Safety
+    ///
+    /// The inspected packet bytes must remain unmodified until `inspect` returns.
+    /// In particular, the callback must not mutate an alias of caller-owned backing
+    /// storage, retreat/advance the native buffer, free it, or submit it for injection.
+    pub unsafe fn inspect_bytes_up_to<const N: usize, R>(
+        &self,
+        fallback_length: usize,
+        inspect: impl for<'bytes> FnOnce(&'bytes [u8]) -> R,
+    ) -> Result<R, ()> {
+        const { assert!(N <= 128, "packet inspection must fit the kernel stack") };
+        if N == 0 {
+            return Ok(inspect(&[]));
+        }
+
+        // SAFETY: The wrapper's construction contract keeps this NBL and its MDLs
+        // live and synchronized. NDIS either returns a native contiguous prefix or
+        // initializes the requested bytes in `storage`; a null result is never read.
+        unsafe {
+            let Some(nbl) = self.nbl.as_ref() else {
+                return Err(());
+            };
+            let Some(nb) = nbl.Header.first_net_buffer.as_ref() else {
+                return Err(());
+            };
+            inspect_prefix::<N, _>(
+                nb.nbSize.DataLength as usize,
+                fallback_length,
+                |length, storage| NdisGetDataBuffer(nb, length as u32, storage, 1, 0),
+                inspect,
+            )
         }
     }
 
@@ -571,5 +652,171 @@ impl Drop for NetworkAllocator {
                 NdisFreeNetBufferListPool(self.pool_handle);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::inspect_prefix;
+
+    #[test]
+    fn contiguous_prefix_is_inspected_in_place_once() {
+        let mut native = [0x5au8; 200];
+        let native_ptr = native.as_mut_ptr();
+        let mut calls = 0;
+        // SAFETY: The native array covers every requested prefix and outlives inspection.
+        let result = unsafe {
+            inspect_prefix::<128, _>(
+                native.len(),
+                34,
+                |length, _storage| {
+                    calls += 1;
+                    assert_eq!(length, 128);
+                    native_ptr
+                },
+                |bytes| {
+                    assert_eq!(bytes.as_ptr(), native_ptr);
+                    assert_eq!(bytes, &[0x5a; 128]);
+                    bytes.len()
+                },
+            )
+        };
+        assert_eq!(result, Ok(128));
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn materialized_prefix_exposes_only_the_first_buffer_length() {
+        let mut calls = 0;
+        // SAFETY: The reader initializes exactly the requested bytes in supplied storage.
+        let result = unsafe {
+            inspect_prefix::<128, _>(
+                28,
+                34,
+                |length, storage| {
+                    calls += 1;
+                    assert_eq!(length, 28);
+                    core::ptr::write_bytes(storage, 0x37, length);
+                    storage
+                },
+                |bytes| {
+                    assert_eq!(bytes, &[0x37; 28]);
+                    bytes.len()
+                },
+            )
+        };
+        assert_eq!(result, Ok(28));
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn failed_full_read_retries_the_same_storage_and_hides_the_tail() {
+        for fallback in [34, 40] {
+            let mut lengths = Vec::new();
+            let mut first_storage = core::ptr::null_mut();
+            let mut inspections = 0;
+            // SAFETY: A failed read's partial storage is never read; the retry fully
+            // initializes its shorter successful prefix and returns that storage.
+            let result = unsafe {
+                inspect_prefix::<128, _>(
+                    200,
+                    fallback,
+                    |length, storage| {
+                        lengths.push(length);
+                        if lengths.len() == 1 {
+                            first_storage = storage;
+                            core::ptr::write_bytes(storage, 0xaa, 8);
+                            core::ptr::null_mut()
+                        } else {
+                            assert_eq!(storage, first_storage);
+                            core::ptr::write_bytes(storage, 0x19, length);
+                            storage
+                        }
+                    },
+                    |bytes| {
+                        inspections += 1;
+                        assert_eq!(bytes.len(), fallback);
+                        assert!(bytes.iter().all(|byte| *byte == 0x19));
+                    },
+                )
+            };
+            assert_eq!(result, Ok(()));
+            assert_eq!(lengths, [128, fallback]);
+            assert_eq!(inspections, 1);
+        }
+    }
+
+    #[test]
+    fn fallback_can_return_a_native_prefix_without_copying() {
+        let mut native = [0x42; 40];
+        let native_ptr = native.as_mut_ptr();
+        let mut lengths = Vec::new();
+        // SAFETY: The failed full read returns null; the successful fallback returns
+        // a live array covering all 40 requested bytes.
+        let result = unsafe {
+            inspect_prefix::<128, _>(
+                128,
+                40,
+                |length, _storage| {
+                    lengths.push(length);
+                    if length == 40 {
+                        native_ptr
+                    } else {
+                        core::ptr::null_mut()
+                    }
+                },
+                |bytes| {
+                    assert_eq!(bytes.as_ptr(), native_ptr);
+                    assert_eq!(bytes, &[0x42; 40]);
+                },
+            )
+        };
+        assert_eq!(result, Ok(()));
+        assert_eq!(lengths, [128, 40]);
+    }
+
+    #[test]
+    fn failed_reads_never_invoke_the_inspector() {
+        for (data_length, fallback, expected_calls) in [
+            (0, 34, 0),
+            (200, 0, 1),
+            (200, 128, 1),
+            (200, 256, 1),
+            (20, 34, 1),
+            (200, 34, 2),
+        ] {
+            let mut calls = 0;
+            // SAFETY: Null reader results make no bytes available for inspection.
+            let result = unsafe {
+                inspect_prefix::<128, _>(
+                    data_length,
+                    fallback,
+                    |_length, _storage| {
+                        calls += 1;
+                        core::ptr::null_mut()
+                    },
+                    |_| -> () { panic!("failed prefix must not be inspected") },
+                )
+            };
+            assert_eq!(result, Err(()));
+            assert_eq!(calls, expected_calls);
+        }
+    }
+
+    #[test]
+    fn zero_capacity_invokes_the_inspector_without_reading() {
+        // SAFETY: A zero-capacity inspection never invokes the reader.
+        let result = unsafe {
+            inspect_prefix::<0, _>(
+                200,
+                34,
+                |_, _| panic!("zero-capacity read"),
+                |bytes| {
+                    assert!(bytes.is_empty());
+                    7
+                },
+            )
+        };
+        assert_eq!(result, Ok(7));
     }
 }
