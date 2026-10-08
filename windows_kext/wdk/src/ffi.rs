@@ -603,4 +603,7 @@ extern "system" {
     /// Returns the process identifier of the current process.
     /// This is safe to call from IRP_MJ_CREATE handlers, which always execute in the context of the initiating user-space process.
     pub(crate) fn PsGetCurrentProcessId() -> HANDLE;
+
+    /// Returns the thread identifier of the currently executing thread.
+    pub(crate) fn PsGetCurrentThreadId() -> HANDLE;
 }

@@ -248,6 +248,7 @@ pub struct ConnectionV4 {
     pub(crate) remote_port: u16,
     pub(crate) verdict: Verdict,
     pub(crate) process_id: u64,
+    pub(crate) thread_id: u64,
     pub(crate) instance_id: u64,
     pub(crate) last_accessed_timestamp: AtomicU64,
     pub(crate) extra: ConnectionExtra,
@@ -261,6 +262,7 @@ pub struct ConnectionV6 {
     pub(crate) remote_port: u16,
     pub(crate) verdict: Verdict,
     pub(crate) process_id: u64,
+    pub(crate) thread_id: u64,
     pub(crate) instance_id: u64,
     pub(crate) last_accessed_timestamp: AtomicU64,
     pub(crate) extra: ConnectionExtra,
@@ -314,6 +316,7 @@ impl ConnectionV4 {
             remote_port: key.remote_port,
             verdict: Verdict::Undecided,
             process_id,
+            thread_id: 0,
             instance_id: next_connection_instance_id(),
             last_accessed_timestamp: AtomicU64::new(timestamp),
             extra: ConnectionExtra {
@@ -475,6 +478,7 @@ impl Clone for ConnectionV4 {
             remote_port: self.remote_port,
             verdict: self.verdict,
             process_id: self.process_id,
+            thread_id: self.thread_id,
             instance_id: self.instance_id,
             last_accessed_timestamp: AtomicU64::new(
                 self.last_accessed_timestamp.load(Ordering::Relaxed),
@@ -521,6 +525,7 @@ impl ConnectionV6 {
             remote_port: key.remote_port,
             verdict: Verdict::Undecided,
             process_id,
+            thread_id: 0,
             instance_id: next_connection_instance_id(),
             last_accessed_timestamp: AtomicU64::new(timestamp),
             extra: ConnectionExtra {
@@ -681,6 +686,7 @@ impl Clone for ConnectionV6 {
             remote_port: self.remote_port,
             verdict: self.verdict,
             process_id: self.process_id,
+            thread_id: self.thread_id,
             instance_id: self.instance_id,
             last_accessed_timestamp: AtomicU64::new(
                 self.last_accessed_timestamp.load(Ordering::Relaxed),

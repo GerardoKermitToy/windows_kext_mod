@@ -46,6 +46,18 @@ struct AleLayerData {
 }
 
 impl AleLayerData {
+    #[inline]
+    fn get_thread_id(&self, device: &Device) -> u64 {
+        if matches!(self.connection_direction, Direction::Outbound)
+            && !matches!(self.process_id, 0 | 4)
+            && !device.is_owner_pid(self.process_id as u32)
+        {
+            wdk::utils::current_thread_id()
+        } else {
+            0
+        }
+    }
+
     fn as_key(&self) -> Key {
         let mut local_port = 0;
         let mut remote_port = 0;
@@ -467,9 +479,10 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
         // instance only after it has installed the identity needed by closure. If
         // WFP omitted that metadata, the cached verdict remains usable but periodic
         // cleanup gives the otherwise unbounded fallback state an idle lifetime.
-        match device.connection_cache.register_untracked_connection(
+        match device.connection_cache.register_ale_connection(
             &key,
             ale_data.process_id,
+            ale_data.get_thread_id(device),
             ale_data.connection_direction,
         ) {
             Ok(registration) => {
@@ -679,19 +692,12 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
         // lookup and insertion under one write guard, so a concurrent classify
         // callback cannot create another live entry for this tuple. UDP starts
         // untracked and is promoted only after endpoint association succeeds.
-        let registration_result = if matches!(ale_data.protocol, IpProtocol::Udp) {
-            device.connection_cache.register_untracked_connection(
-                &key,
-                ale_data.process_id,
-                ale_data.connection_direction,
-            )
-        } else {
-            device.connection_cache.register_connection(
-                &key,
-                ale_data.process_id,
-                ale_data.connection_direction,
-            )
-        };
+        let registration_result = device.connection_cache.register_ale_connection(
+            &key,
+            ale_data.process_id,
+            ale_data.get_thread_id(device),
+            ale_data.connection_direction,
+        );
         let registration = match registration_result {
             Ok(registration) => {
                 if registration.inserted {

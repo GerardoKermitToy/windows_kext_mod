@@ -63,3 +63,9 @@ pub fn sleep_ms(milliseconds: u64) {
 pub fn current_process_id() -> u64 {
     unsafe { ffi::PsGetCurrentProcessId() as u64 }
 }
+
+/// ID of the currently executing thread, not a WFP flow handle.
+/// Safe at IRQL <= DISPATCH_LEVEL.
+pub fn current_thread_id() -> u64 {
+    unsafe { ffi::PsGetCurrentThreadId() as u64 }
+}

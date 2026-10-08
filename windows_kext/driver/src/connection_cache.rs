@@ -52,11 +52,19 @@ pub struct ConnectionUpdate {
 
 /// Merges process attribution using the same precedence for registration and
 /// later flow-established updates.
-fn merge_process_id(stored: &mut u64, incoming: u64) -> bool {
+fn merge_process_id(
+    stored: &mut u64,
+    stored_thread: &mut u64,
+    incoming: u64,
+    thread_id: u64,
+) -> bool {
     // PID 0 carries no attribution. PID 4 (System) can fill an unknown entry but
     // must not replace a concrete application PID. Any other concrete PID is the
     // most useful attribution currently available.
     if incoming != 0 && (*stored == 0 || incoming != 4) {
+        if *stored != incoming || thread_id != 0 {
+            *stored_thread = thread_id;
+        }
         *stored = incoming;
         return true;
     }
@@ -100,13 +108,14 @@ impl ConnectionCache {
     /// The returned instance ID belongs to the entry selected under that same map
     /// guard. Callers must carry it into endpoint and pending-packet state rather
     /// than looking the tuple up again after the guard has been released.
+    #[cfg(test)]
     pub fn register_connection(
         &self,
         key: &Key,
         process_id: u64,
         direction: Direction,
     ) -> Result<ConnectionRegistration, String> {
-        self.register_connection_with_lifecycle(key, process_id, direction, true)
+        self.register_connection_with_lifecycle(key, process_id, direction, true, 0)
     }
 
     /// Registers a fallback connection for which WFP exposed no endpoint identity.
@@ -119,7 +128,25 @@ impl ConnectionCache {
         process_id: u64,
         direction: Direction,
     ) -> Result<ConnectionRegistration, String> {
-        self.register_connection_with_lifecycle(key, process_id, direction, false)
+        self.register_connection_with_lifecycle(key, process_id, direction, false, 0)
+    }
+
+    /// Registers PID and TID together under the existing connection-map lock.
+    /// UDP is promoted to native lifecycle only after endpoint association.
+    pub fn register_ale_connection(
+        &self,
+        key: &Key,
+        process_id: u64,
+        thread_id: u64,
+        direction: Direction,
+    ) -> Result<ConnectionRegistration, String> {
+        self.register_connection_with_lifecycle(
+            key,
+            process_id,
+            direction,
+            key.protocol != IpProtocol::Udp,
+            thread_id,
+        )
     }
 
     fn register_connection_with_lifecycle(
@@ -128,30 +155,39 @@ impl ConnectionCache {
         process_id: u64,
         direction: Direction,
         native_lifecycle: bool,
+        thread_id: u64,
     ) -> Result<ConnectionRegistration, String> {
         if key.is_ipv6() {
-            let connection = if native_lifecycle {
+            let mut connection = if native_lifecycle {
                 ConnectionV6::from_key(key, process_id, direction)?
             } else {
                 ConnectionV6::from_untracked_key(key, process_id, direction)?
             };
+            connection.thread_id = thread_id;
             Ok(self.register_connection_v6(connection))
         } else {
-            let connection = if native_lifecycle {
+            let mut connection = if native_lifecycle {
                 ConnectionV4::from_key(key, process_id, direction)?
             } else {
                 ConnectionV4::from_untracked_key(key, process_id, direction)?
             };
+            connection.thread_id = thread_id;
             Ok(self.register_connection_v4(connection))
         }
     }
 
     fn register_connection_v4(&self, connection: ConnectionV4) -> ConnectionRegistration {
         let process_id = connection.process_id;
+        let thread_id = connection.thread_id;
         let native_lifecycle = connection.has_native_lifecycle();
         let mut connections = self.connections_v4.write_lock();
         match connections.insert_if_absent_with(connection, |existing| {
-            merge_process_id(&mut existing.process_id, process_id);
+            merge_process_id(
+                &mut existing.process_id,
+                &mut existing.thread_id,
+                process_id,
+                thread_id,
+            );
             if native_lifecycle {
                 existing.mark_native_lifecycle();
             }
@@ -169,10 +205,16 @@ impl ConnectionCache {
 
     fn register_connection_v6(&self, connection: ConnectionV6) -> ConnectionRegistration {
         let process_id = connection.process_id;
+        let thread_id = connection.thread_id;
         let native_lifecycle = connection.has_native_lifecycle();
         let mut connections = self.connections_v6.write_lock();
         match connections.insert_if_absent_with(connection, |existing| {
-            merge_process_id(&mut existing.process_id, process_id);
+            merge_process_id(
+                &mut existing.process_id,
+                &mut existing.thread_id,
+                process_id,
+                thread_id,
+            );
             if native_lifecycle {
                 existing.mark_native_lifecycle();
             }
@@ -263,12 +305,12 @@ impl ConnectionCache {
         if key.is_ipv6() {
             let mut connections = self.connections_v6.write_lock();
             if let Some(conn) = connections.get_mut_instance(key, instance_id) {
-                return merge_process_id(&mut conn.process_id, process_id);
+                return merge_process_id(&mut conn.process_id, &mut conn.thread_id, process_id, 0);
             }
         } else {
             let mut connections = self.connections_v4.write_lock();
             if let Some(conn) = connections.get_mut_instance(key, instance_id) {
-                return merge_process_id(&mut conn.process_id, process_id);
+                return merge_process_id(&mut conn.process_id, &mut conn.thread_id, process_id, 0);
             }
         }
         false
@@ -652,7 +694,7 @@ mod tests {
         connection::{Direction, Verdict, PM_DNS_PORT},
         connection_map::Key,
     };
-    use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Address};
+    use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Address, Ipv6Address};
     use std::sync::TryLockError;
 
     fn key(remote_address: [u8; 4], remote_port: u16) -> Key {
@@ -662,6 +704,75 @@ mod tests {
             local_port: 50_000,
             remote_address: IpAddress::Ipv4(Ipv4Address::from_bytes(&remote_address)),
             remote_port,
+        }
+    }
+
+    fn connect_thread_keys() -> [Key; 4] {
+        let v4 = key([192, 0, 2, 10], 443);
+        let v6 = Key {
+            local_address: IpAddress::Ipv6(Ipv6Address::LOOPBACK),
+            remote_address: IpAddress::Ipv6(Ipv6Address::from_bytes(&[
+                0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+            ])),
+            ..v4
+        };
+        [
+            v4,
+            Key {
+                protocol: IpProtocol::Udp,
+                ..v4
+            },
+            v6,
+            Key {
+                protocol: IpProtocol::Udp,
+                ..v6
+            },
+        ]
+    }
+
+    fn saved_identity(cache: &ConnectionCache, tuple: &Key) -> Option<(u64, u64)> {
+        if tuple.is_ipv6() {
+            cache.read_connection_v6(tuple, |conn| Some((conn.process_id, conn.thread_id)))
+        } else {
+            cache.read_connection_v4(tuple, |conn| Some((conn.process_id, conn.thread_id)))
+        }
+    }
+
+    #[test]
+    fn ale_registration_keeps_pid_and_tid_together() {
+        for tuple in connect_thread_keys() {
+            let cache = ConnectionCache::new();
+            let original = cache.register_ale_connection(&tuple, 100, 1234, Direction::Outbound)
+                .expect("ALE registration");
+            assert_eq!(saved_identity(&cache, &tuple), Some((100, 1234)));
+            for pid in [0, 4, 100] {
+                let repeated = cache.register_connection(&tuple, pid, Direction::Outbound)
+                    .expect("repeated registration");
+                assert_eq!(repeated.instance_id, original.instance_id);
+                assert_eq!(saved_identity(&cache, &tuple), Some((100, 1234)));
+            }
+            let repeated = cache.register_ale_connection(&tuple, 200, 5678, Direction::Outbound)
+                .expect("new process attribution");
+            assert_eq!(repeated.instance_id, original.instance_id);
+            assert_eq!(saved_identity(&cache, &tuple), Some((200, 5678)));
+            assert!(!cache.update_process_id_instance(&tuple, original.instance_id, 4));
+            assert_eq!(saved_identity(&cache, &tuple), Some((200, 5678)));
+            assert!(cache.update_process_id_instance(&tuple, original.instance_id, 300));
+            assert_eq!(saved_identity(&cache, &tuple), Some((300, 0)));
+            cache.register_ale_connection(&tuple, 300, 9012, Direction::Outbound)
+                .expect("thread attribution");
+            let ended_tid = if tuple.is_ipv6() {
+                cache.end_connection_instance_v6(tuple, original.instance_id)
+                    .expect("connection end").thread_id
+            } else {
+                cache.end_connection_instance_v4(tuple, original.instance_id)
+                    .expect("connection end").thread_id
+            };
+            assert_eq!(ended_tid, 9012);
+            let replacement = cache.register_connection(&tuple, 400, Direction::Outbound)
+                .expect("tuple reuse");
+            assert_ne!(replacement.instance_id, original.instance_id);
+            assert_eq!(saved_identity(&cache, &tuple), Some((400, 0)));
         }
     }
 
