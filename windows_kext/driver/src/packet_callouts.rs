@@ -319,13 +319,6 @@ fn ip_packet_layer(
         };
         let key = packet_metadata.key;
 
-        // Resets terminate TCP state, including after endpoint closure. Permit
-        // them in either direction without a cache lookup or userspace verdict.
-        if packet_metadata.is_tcp_reset {
-            data.action_permit();
-            return;
-        }
-
         if fast_track_pm_packets(&key) || packet_metadata.is_icmp_port_unreachable {
             data.action_permit();
             return;
@@ -335,7 +328,7 @@ fn ip_packet_layer(
             key.protocol,
             smoltcp::wire::IpProtocol::Tcp | smoltcp::wire::IpProtocol::Udp
         );
-        // Read connection state once for packets that still need policy.
+        // Read connection state once for policy or redirect rewriting.
         let connection_info = if transport_protocol {
             get_connection_info(
                 &device.connection_cache,
@@ -347,6 +340,18 @@ fn ip_packet_layer(
         } else {
             None
         };
+
+        // Resets never need a userspace verdict, but cached redirects must
+        // rewrite their tuple below, even after the sending endpoint closes.
+        if packet_metadata.is_tcp_reset
+            && connection_info
+                .as_ref()
+                .and_then(|info| info.redirect_info.as_ref())
+                .is_none()
+        {
+            data.action_permit();
+            return;
+        }
 
         let mut send_request_to_portmaster = true;
         let mut process_id = 0;

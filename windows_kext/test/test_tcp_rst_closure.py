@@ -1,7 +1,8 @@
 """Bounded local TCP abortive-close regression (requires Administrator).
 
-Checks reset delivery, PID/tuple/END records, exact-tuple reuse, and absence of
-RST verdict requests. The monitor unloads through --duration even on failure.
+Checks direct and redirected reset delivery, PID/tuple/END records, tuple reuse,
+and absence of RST verdict requests. The monitor unloads through --duration
+even on failure.
 """
 import argparse
 from datetime import datetime
@@ -38,7 +39,8 @@ with socket.socket(f, socket.SOCK_STREAM) as s:
         assert part, 'unexpected EOF before echo'
         received.extend(part)
     assert received == payload, 'echo payload mismatch'
-    meta = dict(pid=os.getpid(), port=s.getsockname()[1])
+    meta = dict(pid=os.getpid(), port=s.getsockname()[1], peer=s.getpeername())
+    assert meta['peer'][0] == c['remote'] and meta['peer'][1] == c['server_port'], meta
     if c['reset_side'] == 'server':
         s.sendall(b'!')
         try:
@@ -64,7 +66,8 @@ def owners():
     result = subprocess.run([
         'powershell.exe', '-NoProfile', '-Command',
         "Get-Process | Where-Object ProcessName -eq kext_monitor | ForEach-Object { 'monitor=' + $_.Id }; "
-        "[System.ServiceProcess.ServiceController]::GetServices() | Where-Object ServiceName -eq PortmasterKext | "
+        "([System.ServiceProcess.ServiceController]::GetServices() + [System.ServiceProcess.ServiceController]::GetDevices()) | "
+        "Where-Object ServiceName -eq PortmasterKext | "
         "ForEach-Object { 'service=' + $_.Status }; exit 0",
     ], capture_output=True, text=True, timeout=20)
     if result.returncode:
@@ -88,7 +91,8 @@ def main():
     parser.add_argument('--repeats', type=int, default=10)
     parser.add_argument('--reuse-port', action='store_true')
     parser.add_argument('--reset-side', choices=('client', 'server'), default='client')
-    parser.add_argument('--verdict', choices=('accept-client', 'accept-both', 'permanent'), default='accept-client')
+    parser.add_argument('--verdict', choices=('accept-client', 'accept-both', 'permanent',
+                                             'redirect-tunnel', 'redirect-split'), default='accept-client')
     parser.add_argument('--monitor', type=Path, default=ROOT / 'kext_client/build/kext_monitor.exe')
     parser.add_argument('--driver', type=Path, default=ROOT / 'windows_kext/portmaster-kext.sys')
     parser.add_argument('--output', type=Path,
@@ -108,11 +112,24 @@ def main():
     family = socket.AF_INET6 if args.ipv6 else socket.AF_INET
     local = '::1' if args.ipv6 else '127.0.0.1'
     remote = local if args.verdict == 'accept-both' else ('::1' if args.ipv6 else '127.0.0.2')
+    redirect_ports = {'redirect-tunnel': 717, 'redirect-split': 719}
+    redirect = args.verdict in redirect_ports
+    server_address = local if redirect else remote
     server = socket.socket(family, socket.SOCK_STREAM)
-    server.bind((remote, 0))
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+    server.bind((server_address, redirect_ports.get(args.verdict, 0)))
     server.listen(8)
     server.settimeout(0.2)
     port = server.getsockname()[1]
+    client_port = port
+    original = None
+    if redirect:
+        original = socket.socket(family, socket.SOCK_STREAM)
+        original.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        original.bind((remote, 0))
+        original.listen(1)
+        original.settimeout(0.2)
+        client_port = original.getsockname()[1]
     stopped = threading.Event()
     observations = queue.Queue()
 
@@ -160,15 +177,16 @@ def main():
             ends = []
             for event in END.finditer(data):
                 pid, direction, lip, lp, rip, rp = event.groups()
-                if {int(lp), int(rp)} == {meta['port'], port}:
+                if ((int(lp), int(rp)) == (meta['port'], client_port)
+                        or (int(lp), int(rp)) == (port, meta['port'])):
                     ends.append(dict(pid=int(pid), direction=direction, local=str(ipaddress.ip_address(lip)),
                                      lp=int(lp), remote=str(ipaddress.ip_address(rip)), rp=int(rp)))
             if len(ends) >= 2 or time.monotonic() >= deadline:
                 break
             time.sleep(0.05)
         for pid, direction, lip, lp, rip, rp in (
-            (meta['pid'], 'outbound', local, meta['port'], remote, port),
-            (os.getpid(), 'inbound', remote, port, local, meta['port']),
+            (meta['pid'], 'outbound', local, meta['port'], remote, client_port),
+            (os.getpid(), 'inbound', server_address, port, local, meta['port']),
         ):
             expected = dict(pid=pid, direction=direction, local=lip, lp=lp, remote=rip, rp=rp)
             assert ends.count(expected) == 1, f'incorrect END, expected {expected}, got {ends}'
@@ -181,7 +199,8 @@ def main():
                        and str(ipaddress.ip_address(event['remote'])) == rip for event in connections)
         resets = []
         for event in CONN.finditer(data):
-            if {int(event['lp']), int(event['rp'])} != {meta['port'], port} or event['payload'] == '(none)':
+            if ({int(event['lp']), int(event['rp'])} not in ({meta['port'], port}, {meta['port'], client_port})
+                    or event['payload'] == '(none)'):
                 continue
             packet = bytes.fromhex(event['payload'])
             tcp_offset = (40 if args.ipv6 else (packet[0] & 15) * 4) if int(event['layer']) == 3 else 0
@@ -189,17 +208,23 @@ def main():
             if packet[tcp_offset + 13] & 4:
                 resets.append(int(event['id']))
         assert not resets, f'RST was incorrectly submitted for a verdict: {resets}'
+        if redirect:
+            assert any(event['verdict'] == ('RedirectTunnel' if args.verdict == 'redirect-tunnel'
+                                          else 'RedirectSplitTunnel')
+                       and int(event['pid']) == meta['pid'] and event['direction'] == 'outbound'
+                       and int(event['lp']) == meta['port'] and int(event['rp']) == client_port
+                       for event in CONN.finditer(data)), 'missing matching redirect verdict'
         return dict(ends=ends, rst_request_ids=resets)
 
     duration = args.repeats + 10
     command = [str(args.monitor.resolve()), '--duration', str(duration), '--poll', '200', '--timestamps',
-               '--payload', '--no-bandwidth', '--filter-ip', remote, '--out', str(records.resolve())]
+               '--payload', '--no-bandwidth', '--filter-ip', local if redirect else remote, '--out', str(records.resolve())]
     if args.verdict != 'permanent':
         if args.verdict == 'accept-both':
             command += ['--verdict', 'accept', '--match', remote]
         else:
-            endpoint = f'[{remote}]:{port}' if args.ipv6 else f'{remote}:{port}'
-            command += ['--verdict', 'accept', '--match', endpoint]
+            endpoint = f'[{remote}]:{client_port}' if args.ipv6 else f'{remote}:{client_port}'
+            command += ['--verdict', args.verdict if redirect else 'accept', '--match', endpoint]
     command.append(str(args.driver.resolve()))
     failure = None
     cases = []
@@ -217,7 +242,7 @@ def main():
             for index in range(args.repeats):
                 assert monitor.poll() is None, 'monitor duration ended during test'
                 offset = len(text())
-                recipe = dict(ipv6=args.ipv6, local=local, remote=remote, server_port=port,
+                recipe = dict(ipv6=args.ipv6, local=local, remote=remote, server_port=client_port,
                               port=local_port if args.reuse_port else 0, reuse=args.reuse_port,
                               reset_side=args.reset_side, tag=f'tcp-rst-{index}')
                 child = subprocess.run([sys.executable, '-u', '-c', CLIENT, json.dumps(recipe)],
@@ -236,6 +261,14 @@ def main():
                     assert observation['status'] == 'RESET', f'RST not delivered: {case}'
                     case['reset_delay_ms'] = round((observation['reset_at'] - meta['closing']) * 1000, 3)
                 case.update(verify_events(meta, offset))
+                if original is not None:
+                    try:
+                        unexpected, address = original.accept()
+                    except socket.timeout:
+                        case['original_delivery'] = False
+                    else:
+                        unexpected.close()
+                        raise AssertionError(f'redirect bypassed: original listener accepted {address}')
                 problems = [line for line in text().splitlines()
                             if re.search(r'\[LOG\s+(?:ERROR|WARN|CRIT)|\[WARN\]|verdict FAILED', line)]
                 assert not problems, f'driver diagnostics: {problems}'
@@ -247,12 +280,14 @@ def main():
         finally:
             stopped.set()
             server.close()
+            if original is not None:
+                original.close()
             worker.join(5)
             code = monitor.wait(timeout=duration + 45)
     remaining = owners()
     problems = [line for line in text().splitlines()
                 if re.search(r'\[LOG\s+(?:ERROR|WARN|CRIT)|\[WARN\]|verdict FAILED', line)]
-    result = dict(command=command, server_pid=os.getpid(), server_port=port, cases=cases, failure=failure,
+    result = dict(command=command, server_pid=os.getpid(), server_port=port, client_port=client_port, cases=cases, failure=failure,
                   monitor_exit=code, owners_after=remaining, driver_diagnostics=problems, live_worker=worker.is_alive())
     (args.output / 'result.json').write_text(json.dumps(result, indent=2), encoding='utf-8')
     print(f"Completed {len(cases)}/{args.repeats}; monitor exit {code}; owners={remaining!r}; evidence={args.output}", flush=True)
