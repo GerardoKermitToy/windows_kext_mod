@@ -13,6 +13,8 @@
 // started without a real console (a background job in a shell, for example), so
 // --duration is the reliable way to bound an unattended run.
 #include "PortmasterKext.h"
+#include "DelayedVerdicts.h"
+#include "ProcessSuspensions.h"
 
 #include <windows.h>
 
@@ -21,16 +23,19 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
+#include <memory>
 #include <mutex>
 #include <string>
+#include <utility>
 
 namespace {
 
 pmkext::Driver* g_driver = nullptr;
 std::atomic<bool> g_shutdown_requested{false};
 
-// Output comes from the reader thread and the polling thread, so serialise it
-// to keep multi-line records from interleaving.
+// Output comes from the reader, polling and delayed-verdict threads, so serialise
+// it to keep multi-line records from interleaving.
 std::mutex g_print_mutex;
 
 // Destination for all records. stdout unless --out was given.
@@ -41,6 +46,8 @@ struct Options {
     std::wstring out_path;
     unsigned duration_s = 0;       // 0 = until Ctrl+C
     unsigned poll_ms = 1000;
+    unsigned verdict_delay_ms = 0; // 0 = send immediately
+    bool suspend_pid_on_verdict_delay = false;
     bool show_connections = true;
     bool show_ends = true;
     bool show_logs = true;
@@ -210,20 +217,41 @@ void PrintUsage() {
         "                   and do not suppress logs or warnings.\n"
         "\n"
         "Behaviour:\n"
+        "  --verdict-delay-ms N\n"
+        "                   wait N ms before each automatic verdict (default 0).\n"
+        "                   N: 0..4294967295. Events are still read while waiting.\n"
+        "                   With --match, delay only matching connections;\n"
+        "                   all others get PermanentAccept immediately.\n"
+        "                   Without --match, delay every automatic verdict.\n"
+        "                   Display filters do not affect the delay; commands\n"
+        "                   from a named-pipe client are not delayed.\n"
+        "                   Unsent verdicts are discarded when stopping.\n"
+        "                   Large delays can stall traffic; use --duration.\n"
+        "  --suspend-pid-on-verdict-delay\n"
+        "                   suspend the CONN process only for delayed verdicts.\n"
+        "                   Resume after all pending verdicts for that PID are\n"
+        "                   successfully written. Failed sends keep it paused\n"
+        "                   until monitor shutdown; shutdown resumes held PIDs.\n"
+        "                   No effect with delay 0 or --no-verdicts. Unknown/system\n"
+        "                   PIDs, critical processes and this monitor are skipped.\n"
+        "                   Use --match and --duration to bound the scope. Forcing\n"
+        "                   this monitor to exit may leave processes suspended.\n"
         "  --no-verdicts    do not answer connections.\n"
         "                   WARNING: the driver blocks pending packets until a\n"
         "                   verdict arrives, so traffic stalls. Diagnostic only.\n"
         "\n"
         "  --verdict V [--match IP[:PORT]]\n"
         "                   answer connections with verdict V.\n"
-        "                   V: accept | redirect-tunnel | redirect-split\n"
-        "                      | redirect-dns | block | drop\n"
-        "                      | permanent-block | permanent-drop\n"
+        "                   V: accept | permanent-accept\n"
+        "                      | redirect-tunnel | redirect-split | redirect-dns\n"
+        "                      | block | drop | permanent-block | permanent-drop\n"
         "\n"
         "                   accept permits the packet without caching the\n"
         "                   verdict, so the connection is indicated again on the\n"
         "                   next packet - unlike the PermanentAccept used for\n"
         "                   everything else.\n"
+        "                   permanent-accept caches permission for the connection;\n"
+        "                   subsequent packets do not need another verdict.\n"
         "\n"
         "                   With --match only connections to that IP get V. If a\n"
         "                   port is given, both IP and port must match. The rest\n"
@@ -243,6 +271,7 @@ void PrintUsage() {
         "  kext_monitor.exe --duration 30 --filter-pid 1234 --filter-protocol 6\n"
         "  kext_monitor.exe --duration 30 --filter-protocol 58\n"
         "  kext_monitor.exe --duration 30 --verdict accept --match 192.168.219.15\n"
+        "  kext_monitor.exe --duration 30 --verdict-delay-ms 250\n"
         "  kext_monitor.exe --duration 30 --verdict redirect-tunnel \\\n"
         "                   --match 192.168.219.15:9999\n");
 }
@@ -294,6 +323,19 @@ bool ParseArgs(int argc, wchar_t** argv, Options& opt) {
             opt.show_ends = false;
         } else if (a == L"--no-verdicts") {
             opt.send_verdicts = false;
+        } else if (a == L"--suspend-pid-on-verdict-delay") {
+            opt.suspend_pid_on_verdict_delay = true;
+        } else if (a == L"--verdict-delay-ms") {
+            if (i + 1 >= argc) {
+                std::printf("ERROR: --verdict-delay-ms needs a value in milliseconds\n");
+                return false;
+            }
+            uint64_t delay = 0;
+            if (!ParseUnsignedDecimal(argv[++i], ~uint32_t{0}, delay)) {
+                std::printf("ERROR: --verdict-delay-ms must be a number from 0 to 4294967295\n");
+                return false;
+            }
+            opt.verdict_delay_ms = static_cast<unsigned>(delay);
         } else if (a == L"--verdict") {
             if (i + 1 >= argc) {
                 std::printf("ERROR: --verdict needs a value\n");
@@ -306,6 +348,8 @@ bool ParseArgs(int argc, wchar_t** argv, Options& opt) {
                 // That is the point of having it here - it exercises the
                 // re-indication path that PermanentAccept never reaches.
                 opt.alt_verdict = pmkext::Verdict::Accept;
+            } else if (v == L"permanent-accept") {
+                opt.alt_verdict = pmkext::Verdict::PermanentAccept;
             } else if (v == L"redirect-tunnel") {
                 opt.alt_verdict = pmkext::Verdict::RedirectTunnel;
             } else if (v == L"redirect-split") {
@@ -623,6 +667,21 @@ int wmain(int argc, wchar_t** argv) {
     } else {
         std::printf("Answering every connection with PermanentAccept.\n");
     }
+    if (opt.send_verdicts && opt.verdict_delay_ms > 0) {
+        std::printf("Delaying %s by %u ms.\n",
+                    opt.has_match ? "only matching verdicts" : "each automatic verdict",
+                    opt.verdict_delay_ms);
+    }
+    if (opt.suspend_pid_on_verdict_delay) {
+        if (opt.send_verdicts && opt.verdict_delay_ms > 0) {
+            std::printf("Suspending CONN PIDs while their delayed verdicts are pending.\n");
+            if (!opt.has_match) {
+                std::printf("WARNING: without --match this can pause unrelated processes.\n");
+            }
+        } else {
+            std::printf("PID suspension inactive: no delayed automatic verdicts.\n");
+        }
+    }
     if (opt.duration_s > 0) {
         std::printf("Running for %u second(s), then stopping.\n", opt.duration_s);
     } else {
@@ -632,14 +691,50 @@ int wmain(int argc, wchar_t** argv) {
     std::fflush(stdout);
 
     unsigned long long connections = 0;
-    unsigned long long verdicts = 0;
+    std::atomic<unsigned long long> verdicts{0};
     unsigned long long logs = 0;
     unsigned long long ends = 0;
     unsigned long long bandwidth_records = 0;
 
+    std::unique_ptr<pmkext::ProcessSuspensions> suspended_processes;
+    std::unique_ptr<pmkext::DelayedVerdicts> delayed_verdicts;
+    if (opt.send_verdicts && opt.verdict_delay_ms > 0) {
+        if (opt.suspend_pid_on_verdict_delay) {
+            suspended_processes = std::make_unique<pmkext::ProcessSuspensions>();
+        }
+        delayed_verdicts = std::make_unique<pmkext::DelayedVerdicts>(opt.verdict_delay_ms);
+    }
+
     pmkext::Handlers handlers;
 
-    handlers.on_connection = [&](const pmkext::Connection& c) {
+    auto guard_process_work = [&](auto&& work) {
+        const char* failure = nullptr;
+        try {
+            work();
+            return;
+        } catch (const std::exception& error) {
+            g_shutdown_requested.store(true);
+            // Report inside the catch while the exception's message is valid.
+            Emit("[WARN] verdict processing failed; stopping: %s\n", error.what());
+        } catch (...) {
+            g_shutdown_requested.store(true);
+            failure = "unknown exception";
+        }
+        if (failure != nullptr) {
+            Emit("[WARN] verdict processing failed; stopping: %s\n", failure);
+        }
+        g_shutdown_requested.store(true);
+        try {
+            driver.Stop();
+        } catch (...) {
+            // Stop signals its event before the shutdown IOCTL can allocate.
+            // Run still wakes, cancels its reader and reaches resume cleanup.
+        }
+    };
+
+    auto handle_connection = [&](const pmkext::Connection& c) {
+        const uint64_t observed_at = suspended_processes ?
+            pmkext::ProcessSuspensions::ObservationTime() : 0;
         ++connections;
 
         // The verdict is sent whether or not the record is displayed: filtering
@@ -659,40 +754,91 @@ int wmain(int argc, wchar_t** argv) {
             matched = true;
         }
 
+        bool show_connection = opt.show_connections &&
+            (!opt.has_filter_pid || c.process_id == opt.filter_pid) &&
+            (!opt.has_filter_protocol || c.protocol == opt.filter_protocol);
+        if (show_connection && opt.has_filter_ip) {
+            show_connection =
+                (c.RemoteIpString() == opt.filter_ip || c.LocalIpString() == opt.filter_ip) &&
+                (!opt.has_filter_port || c.remote_port == opt.filter_port ||
+                 c.local_port == opt.filter_port);
+        }
+
         bool verdict_ok = false;
+        bool verdict_queued = false;
         std::string verdict_error;
         const bool needs_verdict = opt.send_verdicts && c.id != 0;
-        if (needs_verdict) {
-            verdict_ok = driver.SendVerdict(c.id, verdict, verdict_error);
-            if (verdict_ok) {
-                ++verdicts;
-            }
-        }
-
-        if (!opt.show_connections) {
-            return;
-        }
-        if (opt.has_filter_pid && c.process_id != opt.filter_pid) {
-            return;
-        }
-        if (opt.has_filter_protocol && c.protocol != opt.filter_protocol) {
-            return;
-        }
-
-        // --filter-ip: display only connections involving the specified IP.
-        if (opt.has_filter_ip) {
-            const std::string remote = c.RemoteIpString();
-            const std::string local = c.LocalIpString();
-            const bool ip_matches = (remote == opt.filter_ip || local == opt.filter_ip);
-            if (!ip_matches) {
-                return;
-            }
-            if (opt.has_filter_port) {
-                const bool port_matches = (c.remote_port == opt.filter_port || c.local_port == opt.filter_port);
-                if (!port_matches) {
-                    return;
+        if (needs_verdict && !g_shutdown_requested.load()) {
+            if (delayed_verdicts && (!opt.has_match || matched)) {
+                uint64_t suspended_pid = 0;
+                pmkext::ProcessSuspensions::Token suspension;
+                if (suspended_processes) {
+                    std::string err;
+                    if (suspended_processes->Acquire(c.process_id, suspension, err, observed_at)) {
+                        suspended_pid = c.process_id;
+                        Emit("%s[SUSPEND] pid=%llu held for delayed verdict id=%llu generation=%llu\n",
+                             TimePrefix(opt.timestamps).c_str(),
+                             static_cast<unsigned long long>(suspended_pid),
+                             static_cast<unsigned long long>(c.id),
+                             static_cast<unsigned long long>(suspension.generation));
+                    } else {
+                        Emit("%s[WARN] id=%llu pid=%llu not suspended: %s\n",
+                             TimePrefix(opt.timestamps).c_str(),
+                             static_cast<unsigned long long>(c.id),
+                             static_cast<unsigned long long>(c.process_id), err.c_str());
+                    }
+                }
+                // Capture only IDs and the decision, not the Connection or payload.
+                // A cancelled/failed send leaves its hold for shutdown cleanup.
+                auto send_delayed =
+                    [&, id = c.id, verdict, show_connection, matched, suspended_pid, suspension]() {
+                        if (g_shutdown_requested.load()) {
+                            return;
+                        }
+                        std::string err;
+                        if (!driver.SendVerdict(id, verdict, err)) {
+                            Emit("%s[WARN] id=%llu verdict %s FAILED: %s\n",
+                                 TimePrefix(opt.timestamps).c_str(),
+                                 static_cast<unsigned long long>(id),
+                                 pmkext::ToString(verdict), err.c_str());
+                            return;
+                        }
+                        ++verdicts;
+                        if (show_connection || suspended_pid != 0) {
+                            Emit("%s[VERDICT] id=%llu -> verdict %s sent%s\n",
+                                 TimePrefix(opt.timestamps).c_str(),
+                                 static_cast<unsigned long long>(id),
+                                 pmkext::ToString(verdict),
+                                 (matched && opt.has_match) ? "  <== MATCHED" : "");
+                        }
+                        if (suspended_pid != 0) {
+                            bool resumed = false;
+                            if (!suspended_processes->Release(suspension, resumed, err)) {
+                                Emit("%s[WARN] pid=%llu resume after verdict id=%llu FAILED: %s\n",
+                                     TimePrefix(opt.timestamps).c_str(),
+                                     static_cast<unsigned long long>(suspended_pid),
+                                     static_cast<unsigned long long>(id), err.c_str());
+                            } else if (resumed) {
+                                Emit("%s[RESUME] pid=%llu after verdict id=%llu generation=%llu\n",
+                                     TimePrefix(opt.timestamps).c_str(),
+                                     static_cast<unsigned long long>(suspended_pid),
+                                     static_cast<unsigned long long>(id),
+                                     static_cast<unsigned long long>(suspension.generation));
+                            }
+                        }
+                    };
+                verdict_queued = delayed_verdicts->Schedule(
+                    [&, send = std::move(send_delayed)]() { guard_process_work(send); });
+            } else {
+                verdict_ok = driver.SendVerdict(c.id, verdict, verdict_error);
+                if (verdict_ok) {
+                    ++verdicts;
                 }
             }
+        }
+
+        if (!show_connection) {
+            return;
         }
 
         Emit("%s[CONN %s] id=%llu pid=%llu %s proto=%u(%s) layer=%u(%s)\n"
@@ -732,15 +878,25 @@ int wmain(int argc, wchar_t** argv) {
             Emit("          (no pending packet, no verdict needed)\n");
         } else if (!opt.send_verdicts) {
             Emit("          -> no verdict sent (--no-verdicts)\n");
+        } else if (verdict_queued) {
+            Emit("          -> verdict %s scheduled after %u ms%s\n",
+                 pmkext::ToString(verdict), opt.verdict_delay_ms,
+                 (matched && opt.has_match) ? "  <== MATCHED" : "");
         } else if (verdict_ok) {
             // The marker only means something when --match narrowed the target.
             // Without it every connection matches, so flagging them all would be
             // noise.
             Emit("          -> verdict %s sent%s\n", pmkext::ToString(verdict),
                  (matched && opt.has_match) ? "  <== MATCHED" : "");
+        } else if (g_shutdown_requested.load()) {
+            Emit("          -> no verdict sent (stopping)\n");
         } else {
             Emit("          -> verdict FAILED: %s\n", verdict_error.c_str());
         }
+    };
+
+    handlers.on_connection = [&](const pmkext::Connection& c) {
+        guard_process_work([&]() { handle_connection(c); });
     };
 
     handlers.on_connection_end = [&](const pmkext::ConnectionEnd& e) {
@@ -873,7 +1029,7 @@ int wmain(int argc, wchar_t** argv) {
     // The driver only emits logs and bandwidth stats when asked. Run() invokes
     // this once per poll interval from its own thread, so no extra thread touches
     // the device and the cadence is independent of event traffic.
-    handlers.on_poll = [&]() {
+    auto handle_poll = [&]() {
         // Skip once shutdown is under way: the driver has run down its queue and
         // further commands would only produce noise.
         if (g_shutdown_requested.load()) {
@@ -908,19 +1064,40 @@ int wmain(int argc, wchar_t** argv) {
             // final poll's logs and stats are not lost to the shutdown.
             Sleep(300);
             g_shutdown_requested.store(true);
+            if (delayed_verdicts) {
+                delayed_verdicts->Stop();
+            }
             Emit("\nDuration elapsed, stopping...\n");
             driver.Stop();
         }
     };
+    handlers.on_poll = [&]() { guard_process_work(handle_poll); };
 
     driver.Run(handlers, opt.poll_ms);
 
     g_shutdown_requested.store(true);
+    if (delayed_verdicts) {
+        // Join the sender before reporting counts or closing the device/output.
+        delayed_verdicts->Stop();
+    }
+    const auto resume_on_shutdown = [&](uint64_t pid, bool ok, const std::string& error) {
+        if (ok) {
+            Emit("%s[RESUME] pid=%llu at monitor shutdown (pending verdicts cancelled)\n",
+                 TimePrefix(opt.timestamps).c_str(), static_cast<unsigned long long>(pid));
+        } else {
+            Emit("%s[WARN] pid=%llu resume at shutdown FAILED: %s\n",
+                 TimePrefix(opt.timestamps).c_str(), static_cast<unsigned long long>(pid),
+                 error.c_str());
+        }
+    };
+    if (suspended_processes) {
+        suspended_processes->ResumeAll(resume_on_shutdown);
+    }
 
     std::printf("\nShutting down.\n");
     std::printf("Connections: %llu (verdicts sent: %llu), ends: %llu, "
                 "log lines: %llu, bandwidth records: %llu\n",
-                connections, verdicts, ends, logs, bandwidth_records);
+                connections, verdicts.load(), ends, logs, bandwidth_records);
 
     // Stop() already issued IOCTL_SHUTDOWN_REQUEST, which released the reader
     // and resolved pending packets. No second shutdown is needed here.
@@ -931,6 +1108,10 @@ int wmain(int argc, wchar_t** argv) {
     driver.Cleanup();
     g_driver = nullptr;
     std::printf("Device closed; owned service state cleaned up.\n");
+    if (suspended_processes) {
+        suspended_processes->ResumeAll(resume_on_shutdown);
+        suspended_processes.reset();
+    }
 
     if (g_out != nullptr && g_out != stdout) {
         std::fclose(g_out);

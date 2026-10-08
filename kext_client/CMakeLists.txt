@@ -14,6 +14,7 @@ set(WINRPC_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../winrpc/src")
 # Client library for the Portmaster kernel extension.
 add_library(pmkext STATIC
     src/PortmasterKext.cpp
+    src/ProcessSuspensions.cpp
     "${WINRPC_SOURCE_DIR}/duplex_pipe/duplex_pipe_server.cpp"
     "${WINRPC_SOURCE_DIR}/duplex_pipe/pipe_transport.cpp"
     "${WINRPC_SOURCE_DIR}/pipe_support.cpp"
@@ -80,4 +81,19 @@ if(BUILD_TESTING)
     add_executable(ip_address_tests tests/ip_address_tests.cpp)
     target_link_libraries(ip_address_tests PRIVATE pmkext)
     add_test(NAME ip_address_tests COMMAND ip_address_tests)
+
+    add_executable(delayed_verdict_tests tests/delayed_verdict_tests.cpp)
+    target_link_libraries(delayed_verdict_tests PRIVATE pmkext)
+    add_test(NAME delayed_verdict_tests COMMAND delayed_verdict_tests)
+    set_tests_properties(delayed_verdict_tests PROPERTIES TIMEOUT 10)
+
+    add_executable(process_suspension_tests tests/process_suspension_tests.cpp)
+    target_link_libraries(process_suspension_tests PRIVATE pmkext)
+    add_test(NAME process_suspension_tests COMMAND process_suspension_tests)
+    set_tests_properties(process_suspension_tests PROPERTIES TIMEOUT 10)
+
+    add_test(NAME verdict_delay_cli_tests
+        COMMAND "${CMAKE_COMMAND}" "-DMONITOR=$<TARGET_FILE:kext_monitor>"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/verdict_delay_cli_tests.cmake")
+    set_tests_properties(verdict_delay_cli_tests PROPERTIES TIMEOUT 30)
 endif()

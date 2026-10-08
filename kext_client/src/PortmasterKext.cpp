@@ -10,6 +10,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <string>
 
 namespace pmkext {
@@ -752,7 +753,29 @@ void Driver::Run(const Handlers& handlers, unsigned poll_interval_ms) {
 
     // Reads must live on their own thread: they block inside the driver, while
     // Stop() and the polling cadence continue independently on this thread.
-    std::thread reader([this, &handlers]() { ReaderLoop(handlers); });
+    std::thread reader([this, &handlers]() {
+        const auto fail = [&](const char* message) {
+            try {
+                if (handlers.on_warning) {
+                    handlers.on_warning(message);
+                }
+            } catch (...) {
+                // Reporting may allocate too; stopping must still happen.
+            }
+            try {
+                Stop();
+            } catch (...) {
+                // Stop already signalled its event before issuing the IOCTL.
+            }
+        };
+        try {
+            ReaderLoop(handlers);
+        } catch (const std::exception& error) {
+            fail(error.what());
+        } catch (...) {
+            fail("reader failed with an unknown exception");
+        }
+    });
 
     // Poll immediately, then on a fixed cadence. WaitForSingleObject on the
     // stop event doubles as the sleep, so Stop() cuts the wait short.
