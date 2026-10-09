@@ -122,6 +122,20 @@ pub(crate) fn should_capture_ale_packet(
     protocol != IpProtocol::Tcp || !matches!(packet_direction, Direction::Outbound) || reauthorize
 }
 
+/// Resets observed during reauthorization have no live send endpoint to replay
+/// through. Leave their delivery and any cached redirect rewrite to packet layers.
+pub(crate) fn should_permit_ale_tcp_reset(
+    protocol: IpProtocol,
+    reauthorize: bool,
+    transport_header: &[u8],
+) -> bool {
+    protocol == IpProtocol::Tcp
+        && reauthorize
+        && transport_header.len() >= 20
+        && transport_header[12] >> 4 >= 5
+        && transport_header[13] & 0x04 != 0
+}
+
 /// An inbound packet reauthorizing AUTH_CONNECT has no injectable IP header there.
 pub(crate) fn should_skip_cross_direction_ale_clone(
     reauthorize: bool,
@@ -174,9 +188,9 @@ mod tests {
     use super::{
         can_reuse_ended_tcp_policy, classify_ale_injection, classify_packet_injection,
         self_injected_endpoint_identifies_socket, self_injected_packet_needs_accept_authorization,
-        should_capture_ale_packet, should_skip_cross_direction_ale_clone,
-        should_skip_injected_outbound_flow, AleInjectionAction, InjectionStatus,
-        PacketInjectionAction,
+        should_capture_ale_packet, should_permit_ale_tcp_reset,
+        should_skip_cross_direction_ale_clone, should_skip_injected_outbound_flow,
+        AleInjectionAction, InjectionStatus, PacketInjectionAction,
     };
     use crate::connection::Direction;
     use smoltcp::wire::IpProtocol;
@@ -238,6 +252,52 @@ mod tests {
             Direction::Outbound
         ));
         assert!(self_injected_endpoint_identifies_socket(Direction::Inbound));
+    }
+
+    #[test]
+    fn reauthorization_permits_resets_with_or_without_ack() {
+        let mut header = [0u8; 20];
+        header[12] = 5 << 4;
+        for flags in [0x04, 0x14] {
+            header[13] = flags;
+            assert!(should_permit_ale_tcp_reset(IpProtocol::Tcp, true, &header));
+            assert!(!should_permit_ale_tcp_reset(
+                IpProtocol::Tcp,
+                false,
+                &header
+            ));
+            for protocol in [IpProtocol::Udp, IpProtocol::Icmp, IpProtocol::Icmpv6] {
+                assert!(!should_permit_ale_tcp_reset(protocol, true, &header));
+            }
+        }
+    }
+
+    #[test]
+    fn reauthorization_keeps_non_reset_packets_on_the_policy_path() {
+        let mut header = [0u8; 20];
+        header[12] = 5 << 4;
+        for flags in [0x00, 0x02, 0x10, 0x11, 0x12, 0x18, 0x19] {
+            header[13] = flags;
+            assert!(!should_permit_ale_tcp_reset(IpProtocol::Tcp, true, &header));
+        }
+    }
+
+    #[test]
+    fn reset_detection_rejects_truncated_or_invalid_transport_headers() {
+        let mut header = [0u8; 20];
+        header[12] = 5 << 4;
+        header[13] = 0x14;
+        for size in 0..20 {
+            assert!(!should_permit_ale_tcp_reset(
+                IpProtocol::Tcp,
+                true,
+                &header[..size]
+            ));
+        }
+        for words in 0..5 {
+            header[12] = words << 4;
+            assert!(!should_permit_ale_tcp_reset(IpProtocol::Tcp, true, &header));
+        }
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use crate::ale_policy::{
     can_reuse_ended_tcp_policy, classify_ale_injection, self_injected_endpoint_identifies_socket,
-    should_capture_ale_packet, should_skip_cross_direction_ale_clone,
+    should_capture_ale_packet, should_permit_ale_tcp_reset, should_skip_cross_direction_ale_clone,
     should_skip_injected_outbound_flow, AleInjectionAction, InjectionStatus,
 };
 use crate::connection::{Connection, ConnectionV4, ConnectionV6, Direction, Verdict};
@@ -606,7 +606,7 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
                 crate::dbg!("saving packet: {}", key);
                 // Connection is already pended. Save packet and wait for verdict.
                 match save_packet(device, &mut data, &ale_data, false) {
-                    Ok(packet) => {
+                    Ok(Some(packet)) => {
                         if let Some(pending) = device.publish_pending_packet(
                             (key, packet),
                             Some(connection_instance_id),
@@ -624,6 +624,7 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
                             }
                         }
                     }
+                    Ok(None) => return,
                     Err(err) => {
                         crate::err!("failed to pend packet: {}", err);
                     }
@@ -700,7 +701,8 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
         // and is safe to pend: there is no application send operation to freeze.
         let can_pend_connection = !ale_data.reauthorize;
         let packet = match save_packet(device, &mut data, &ale_data, can_pend_connection) {
-            Ok(packet) => packet,
+            Ok(Some(packet)) => packet,
+            Ok(None) => return,
             Err(err) => {
                 crate::err!("failed to pend packet: {}", err);
                 return;
@@ -769,12 +771,14 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
     }
 }
 
+/// Returns no pending packet when a TCP reset was permitted using the existing
+/// clone's bytes. Cached verdicts never enter this packet-saving slow path.
 fn save_packet(
     device: &Device,
     callout_data: &mut CalloutData,
     ale_data: &AleLayerData,
     pend: bool,
-) -> Result<Packet, alloc::string::String> {
+) -> Result<Option<Packet>, alloc::string::String> {
     let mut packet_list = None;
     // Initial outbound TCP authorization has no packet data. A later
     // reauthorization may carry a transport-header NBL, so preserve it when WFP
@@ -786,6 +790,18 @@ fn save_packet(
     );
     if save_packet_list {
         packet_list = create_packet_list(device, callout_data, ale_data)?;
+    }
+    // A reset's send endpoint is already closing; replaying it after a verdict
+    // fails with STATUS_NOT_FOUND. Inspect only the clone we already had to save,
+    // with no extra NBL reads on the cached-verdict path. Packet layers retain
+    // responsibility for cached redirect rewriting.
+    if packet_list.as_ref().is_some_and(|packet| {
+        packet.get_event_data().is_some_and(|header| {
+            should_permit_ale_tcp_reset(ale_data.protocol, ale_data.reauthorize, header)
+        })
+    }) {
+        callout_data.action_permit();
+        return Ok(None);
     }
     if pend && matches!(ale_data.packet_direction, Direction::Inbound) && packet_list.is_none() {
         return Err("ALE receive/accept indication has no packet data".into());
@@ -816,7 +832,7 @@ fn save_packet(
             );
         }
     }
-    Ok(packet)
+    Ok(Some(packet))
 }
 
 fn create_packet_list(
