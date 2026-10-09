@@ -751,15 +751,27 @@ unsafe extern "system" fn device_control(
         return control_request.not_implemented();
     };
 
-    wdk::info!("IOCTL: {}", control_code);
-
     match control_code {
         ControlCode::Version => {
+            wdk::info!("IOCTL: {}", control_code);
             if !control_request.write_exact(&VERSION) {
                 return control_request.fail(STATUS_BUFFER_TOO_SMALL);
             }
         }
-        ControlCode::ShutdownRequest => device.shutdown(),
+        ControlCode::ShutdownRequest => {
+            wdk::info!("IOCTL: {}", control_code);
+            device.shutdown();
+        }
+        ControlCode::GetThreadId => {
+            let Some(id) = control_request.read_u64() else {
+                return control_request.fail(STATUS_INVALID_PARAMETER);
+            };
+            if control_request.free_space() < 8 {
+                return control_request.fail(STATUS_BUFFER_TOO_SMALL);
+            }
+            let thread_id = device.packet_cache.write_lock().get_thread_id(id);
+            control_request.write_exact(&thread_id.to_le_bytes());
+        }
     };
 
     control_request.complete()

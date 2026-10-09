@@ -575,31 +575,39 @@ impl<T: Connection + Clone> ConnectionMap<T> {
         })
     }
 
-    /// Returns whether one exact live instance matches either its original tuple or
+    /// Returns one exact live instance matching either its original tuple or
     /// its current reverse-redirect tuple.
     ///
     /// Pending packet publication uses the packet's observed key. A response from a
     /// local redirect target no longer carries the original remote endpoint, but its
     /// instance ID still identifies exactly one cached generation. The instance
     /// check makes the otherwise ambiguous redirect scan safe for this operation.
-    pub fn has_live_instance_matching(&self, key: &Key, instance_id: u64) -> bool {
-        if self.has_live_instance(key, instance_id) {
-            return true;
+    pub fn get_live_instance_matching(&self, key: &Key, instance_id: u64) -> Option<&T> {
+        if instance_id == 0 {
+            return None;
         }
-        if instance_id == 0 || !is_redirect_port(key.remote_port) {
-            return false;
+        if let Some(conn) = self.bucket(key).and_then(|bucket| {
+            bucket.iter().find(|conn| {
+                conn.remote_equals(key)
+                    && conn.get_instance_id() == instance_id
+                    && !conn.has_ended()
+            })
+        }) {
+            return Some(conn);
+        }
+        if !is_redirect_port(key.remote_port) {
+            return None;
         }
 
-        self.0.get(&key.small()).is_some_and(|connections| {
-            connections
-                .values()
-                .flat_map(ConnectionBucket::iter)
-                .any(|conn| {
-                    conn.redirect_equals(key)
-                        && conn.get_instance_id() == instance_id
-                        && !conn.has_ended()
-                })
-        })
+        self.0
+            .get(&key.small())?
+            .values()
+            .flat_map(ConnectionBucket::iter)
+            .find(|conn| {
+                conn.redirect_equals(key)
+                    && conn.get_instance_id() == instance_id
+                    && !conn.has_ended()
+            })
     }
 
     /// Returns the exact live cache instance for mutation.

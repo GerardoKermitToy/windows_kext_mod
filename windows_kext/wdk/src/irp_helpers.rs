@@ -381,6 +381,7 @@ pub struct DeviceControlRequest {
     irp: IrpPtr,
     buffer: *mut u8,
     buffer_len: usize,
+    input_buffer_len: usize,
     fill_index: usize,
     control_code: u32,
 }
@@ -452,8 +453,8 @@ impl DeviceControlRequest {
         let irp = unsafe { IrpPtr::new(irp)? };
         // SAFETY: the IRP is still owned by this uncompleted wrapper.
         let irp_sp = unsafe { irp.current_stack_location() };
-        let (output_buffer_length, control_code) = if irp_sp.is_null() {
-            (0, 0)
+        let (output_buffer_length, input_buffer_length, control_code) = if irp_sp.is_null() {
+            (0, 0, 0)
         } else {
             // SAFETY: the constructor contract identifies an IRP_MJ_DEVICE_CONTROL
             // stack entry. The native Parameters storage is live, aligned, and its
@@ -461,21 +462,39 @@ impl DeviceControlRequest {
             let device_io = unsafe {
                 &*core::ptr::addr_of!((*irp_sp).Parameters).cast::<DeviceIOControlParams>()
             };
-            (device_io.output_buffer_length, device_io.io_control_code)
+            (
+                device_io.output_buffer_length,
+                device_io.input_buffer_length,
+                device_io.io_control_code,
+            )
         };
-        let (buffer, buffer_len) = unsafe {
-            // SAFETY: The constructor's METHOD_BUFFERED IRP contract guarantees
-            // that SystemBuffer covers the advertised output length.
-            normalize_buffer(irp.system_buffer(), output_buffer_length)
+        let (buffer, buffer_len, input_buffer_len) = unsafe {
+            // SAFETY: METHOD_BUFFERED SystemBuffer covers the larger of the input
+            // and output lengths. Keep the two usable ranges independent.
+            let buffer = irp.system_buffer();
+            let (_, output_len) = normalize_buffer(buffer, output_buffer_length);
+            let (_, input_len) = normalize_buffer(buffer, input_buffer_length);
+            (buffer, output_len, input_len)
         };
 
         Some(Self {
             irp,
             buffer,
             buffer_len,
+            input_buffer_len,
             fill_index: 0,
             control_code,
         })
+    }
+
+    pub fn read_u64(&self) -> Option<u64> {
+        if self.input_buffer_len < core::mem::size_of::<u64>() {
+            return None;
+        }
+        // SAFETY: the normalized input range covers eight initialized bytes.
+        Some(u64::from_le(unsafe {
+            core::ptr::read_unaligned(self.buffer.cast::<u64>())
+        }))
     }
 
     pub fn write(&mut self, bytes: &[u8]) -> usize {
@@ -543,9 +562,38 @@ mod tests {
                 buffer.as_mut_ptr()
             },
             buffer_len: buffer.len(),
+            input_buffer_len: buffer.len(),
             fill_index: 0,
             control_code: 0,
         }
+    }
+
+    #[test]
+    fn ioctl_read_rejects_short_input_independently_of_output_length() {
+        for input_len in 0..8 {
+            let mut buffer = [0xAA; 8];
+            let mut request = device_control_request(&mut buffer);
+            request.input_buffer_len = input_len;
+            assert_eq!(request.read_u64(), None);
+            assert_eq!(request.fill_index, 0);
+            assert_eq!(buffer, [0xAA; 8]);
+        }
+        assert_eq!(device_control_request(&mut []).read_u64(), None);
+    }
+
+    #[test]
+    fn ioctl_read_decodes_little_endian_input_before_in_place_output() {
+        let id = 0x0102_0304_0506_0708_u64;
+        let thread_id = 0x1112_1314_1516_1718_u64;
+        let mut buffer = [0xAA; 17];
+        buffer[1..9].copy_from_slice(&id.to_le_bytes());
+        let mut request = device_control_request(&mut buffer[1..]);
+        request.input_buffer_len = 8;
+        assert_eq!(request.read_u64(), Some(id));
+        assert!(request.write_exact(&thread_id.to_le_bytes()));
+        assert_eq!(request.fill_index, 8);
+        assert_eq!(&buffer[1..9], &thread_id.to_le_bytes());
+        assert_eq!(&buffer[9..], &[0xAA; 8]);
     }
 
     #[test]

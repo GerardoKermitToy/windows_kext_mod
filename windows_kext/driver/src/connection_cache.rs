@@ -267,12 +267,13 @@ impl ConnectionCache {
     /// key. The map's shared guard remains held while `use_instance` publishes both
     /// the pending packet and its userspace event. A lifecycle end requires the
     /// exclusive guard, so it cannot emit END between validation and publication.
+    /// The callback also receives the matched generation's captured thread ID.
     pub fn with_live_connection_instance_matching<T, R>(
         &self,
         key: &Key,
         instance_id: u64,
         value: T,
-        use_instance: impl FnOnce(u64, T) -> R,
+        use_instance: impl FnOnce(u64, T, u64) -> R,
     ) -> Result<R, T> {
         if instance_id == 0 {
             return Err(value);
@@ -280,13 +281,13 @@ impl ConnectionCache {
 
         if key.is_ipv6() {
             let connections = self.connections_v6.read_lock();
-            if connections.has_live_instance_matching(key, instance_id) {
-                return Ok(use_instance(instance_id, value));
+            if let Some(conn) = connections.get_live_instance_matching(key, instance_id) {
+                return Ok(use_instance(instance_id, value, conn.thread_id));
             }
         } else {
             let connections = self.connections_v4.read_lock();
-            if connections.has_live_instance_matching(key, instance_id) {
-                return Ok(use_instance(instance_id, value));
+            if let Some(conn) = connections.get_live_instance_matching(key, instance_id) {
+                return Ok(use_instance(instance_id, value, conn.thread_id));
             }
         }
         Err(value)
@@ -777,6 +778,52 @@ mod tests {
     }
 
     #[test]
+    fn publication_copies_thread_id_from_exact_live_generation() {
+        for tuple in connect_thread_keys() {
+            let cache = ConnectionCache::new();
+            let original = cache
+                .register_ale_connection(&tuple, 100, 1234, Direction::Outbound)
+                .expect("ALE registration");
+            assert_eq!(
+                cache.with_live_connection_instance_matching(
+                    &tuple,
+                    original.instance_id,
+                    41,
+                    |id, value, thread_id| (id, value, thread_id),
+                ),
+                Ok((original.instance_id, 41, 1234))
+            );
+
+            if tuple.is_ipv6() {
+                cache.end_connection_instance_v6(tuple, original.instance_id);
+            } else {
+                cache.end_connection_instance_v4(tuple, original.instance_id);
+            }
+            let replacement = cache
+                .register_ale_connection(&tuple, 200, 5678, Direction::Outbound)
+                .expect("tuple reuse");
+            assert_eq!(
+                cache.with_live_connection_instance_matching(
+                    &tuple,
+                    original.instance_id,
+                    (),
+                    |_, _, _| panic!("stale generation published"),
+                ),
+                Err(())
+            );
+            assert_eq!(
+                cache.with_live_connection_instance_matching(
+                    &tuple,
+                    replacement.instance_id,
+                    (),
+                    |_, _, thread_id| thread_id,
+                ),
+                Ok(5678)
+            );
+        }
+    }
+
+    #[test]
     fn native_registration_promotes_existing_fallback_instance() {
         let cache = ConnectionCache::new();
         let tuple = key([192, 0, 2, 10], 443);
@@ -811,7 +858,7 @@ mod tests {
             &tuple,
             registration.instance_id,
             41,
-            |_, value| {
+            |_, value, _| {
                 // A lifecycle end needs this map's exclusive guard. Verify that the
                 // publication callback still owns the shared guard, rather than
                 // merely running after an already-stale liveness check.
@@ -832,7 +879,7 @@ mod tests {
             &tuple,
             registration.instance_id,
             42,
-            |_, value| {
+            |_, value, _| {
                 callback_ran = true;
                 value
             },
@@ -848,7 +895,7 @@ mod tests {
         let original = key([203, 0, 113, 1], 53);
         let redirect = key([127, 0, 0, 1], PM_DNS_PORT);
         let registration = cache
-            .register_connection(&original, 100, Direction::Outbound)
+            .register_ale_connection(&original, 100, 1234, Direction::Outbound)
             .expect("connection registration");
         assert!(cache
             .update_connection_instance(
@@ -863,7 +910,10 @@ mod tests {
                 &redirect,
                 registration.instance_id,
                 41,
-                |_, value| value + 1,
+                |_, value, thread_id| {
+                    assert_eq!(thread_id, 1234);
+                    value + 1
+                },
             ),
             Ok(42)
         );
@@ -872,7 +922,7 @@ mod tests {
                 &redirect,
                 registration.instance_id.wrapping_add(1),
                 41,
-                |_, value| value + 1,
+                |_, value, _| value + 1,
             ),
             Err(41)
         );
@@ -885,7 +935,7 @@ mod tests {
                 &redirect,
                 registration.instance_id,
                 41,
-                |_, value| value + 1,
+                |_, value, _| value + 1,
             ),
             Err(41)
         );

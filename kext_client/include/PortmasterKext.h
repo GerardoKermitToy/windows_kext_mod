@@ -215,6 +215,9 @@ public:
 
     // IOCTL_VERSION: returns the 4-byte driver version.
     bool GetVersion(uint8_t out[4], std::string& error);
+    // IOCTL_GET_THREAD_ID: CONN request ID -> captured TID, or 0 if unavailable.
+    // Query before sending the verdict; completed request IDs are discarded.
+    bool GetThreadId(uint64_t id, uint64_t& thread_id, std::string& error);
     // IOCTL_SHUTDOWN_REQUEST: asks the driver to release pending packets.
     bool RequestShutdown(std::string& error);
 
@@ -232,7 +235,8 @@ public:
 
 private:
     bool SendCommand(const uint8_t* data, size_t len, std::string& error);
-    bool DeviceControl(uint32_t code, uint8_t* out, uint32_t out_len, std::string& error);
+    bool DeviceControl(uint32_t code, uint8_t* out, uint32_t out_len, std::string& error,
+                       void* input = nullptr, uint32_t input_len = 0);
     // Consumes whole records from buffer_, returns bytes consumed.
     size_t Dispatch(const Handlers& handlers);
     void ReaderLoop(const Handlers& handlers);

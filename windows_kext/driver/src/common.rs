@@ -46,6 +46,12 @@ pub enum ControlCode {
         METHOD_BUFFERED,
         FILE_READ_DATA | FILE_WRITE_DATA
     ),
+    GetThreadId = ctl_code!(
+        SIOCTL_TYPE,
+        0x802,
+        METHOD_BUFFERED,
+        FILE_READ_DATA | FILE_WRITE_DATA
+    ),
 }
 
 impl Display for ControlCode {
@@ -53,6 +59,7 @@ impl Display for ControlCode {
         match self {
             ControlCode::Version => _ = write!(f, "Version"),
             ControlCode::ShutdownRequest => _ = write!(f, "Shutdown"),
+            ControlCode::GetThreadId => _ = write!(f, "GetThreadId"),
         };
         return Ok(());
     }

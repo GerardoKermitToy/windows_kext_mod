@@ -972,19 +972,16 @@ impl Device {
                     &key,
                     instance_id,
                     pending,
-                    |_, pending| {
+                    |_, pending, thread_id| {
                         self.enqueue_pending_packet(
-                            pending,
-                            process_id,
-                            direction,
-                            ale_layer,
+                            pending, process_id, thread_id, direction, ale_layer,
                         );
                     },
                 )
                 .err();
         }
 
-        self.enqueue_pending_packet(pending, process_id, direction, ale_layer);
+        self.enqueue_pending_packet(pending, process_id, 0, direction, ale_layer);
         None
     }
 
@@ -992,6 +989,7 @@ impl Device {
         &self,
         pending: PendingPacket,
         process_id: u64,
+        thread_id: u64,
         direction: crate::connection::Direction,
         ale_layer: bool,
     ) {
@@ -1011,6 +1009,7 @@ impl Device {
                     (pending.key, pending.packet),
                     connection_instance_id,
                     process_id,
+                    thread_id,
                     direction,
                     ale_layer,
                 )

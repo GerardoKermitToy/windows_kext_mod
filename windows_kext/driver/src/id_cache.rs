@@ -142,6 +142,8 @@ pub struct IdCache {
     /// from this queue.
     pending_by_instance: BTreeMap<u64, PendingIds>,
     active: BTreeMap<u64, PendingIdentity>,
+    /// CONN request ID -> captured TID, retained until the request finishes.
+    thread_id_by_request: BTreeMap<u64, u64>,
     lock: RwSpinLock,
     next_id: u64,
 }
@@ -152,6 +154,7 @@ impl IdCache {
             values: VecDeque::with_capacity(1000),
             pending_by_instance: BTreeMap::new(),
             active: BTreeMap::new(),
+            thread_id_by_request: BTreeMap::new(),
             lock: RwSpinLock::default(),
             next_id: 1, // 0 is invalid id
         }
@@ -163,6 +166,7 @@ impl IdCache {
         value: (Key, Packet),
         connection_instance_id: Option<u64>,
         process_id: u64,
+        thread_id: u64,
         direction: Direction,
         ale_layer: bool,
     ) -> Vec<(u64, Info)> {
@@ -181,7 +185,7 @@ impl IdCache {
         // its own cache entry, event and verdict ID. Keep this expansion under the
         // same lock (and the caller's connection-liveness guard) so endpoint closure
         // cannot observe only part of the original batch.
-        match packet {
+        let queued = match packet {
             Packet::NetworkBatch(nbls, inject_info) => {
                 let mut queued = Vec::with_capacity(nbls.len());
                 for nbl in nbls {
@@ -189,24 +193,26 @@ impl IdCache {
                     if let Some(entry) =
                         push_packet(&mut self.values, &mut self.next_id, packet, context)
                     {
-                        add_pending_request(
-                            &mut self.pending_by_instance,
-                            connection_instance_id,
-                            entry.0,
-                        );
                         queued.push(entry);
                     }
                 }
                 queued
             }
-            packet => {
-                let queued = push_packet(&mut self.values, &mut self.next_id, packet, context);
-                if let Some((id, _)) = &queued {
-                    add_pending_request(&mut self.pending_by_instance, connection_instance_id, *id);
-                }
-                queued.into_iter().collect()
+            packet => push_packet(&mut self.values, &mut self.next_id, packet, context)
+                .into_iter()
+                .collect(),
+        };
+        for (id, _) in &queued {
+            add_pending_request(&mut self.pending_by_instance, connection_instance_id, *id);
+            if thread_id != 0 {
+                self.thread_id_by_request.insert(*id, thread_id);
             }
         }
+        queued
+    }
+
+    pub fn get_thread_id(&self, id: u64) -> u64 {
+        self.thread_id_by_request.get(&id).copied().unwrap_or(0)
     }
 
     pub fn pop_id(&mut self, id: u64) -> Option<PendingPacket> {
@@ -234,6 +240,7 @@ impl IdCache {
     pub fn finish_id(&mut self, id: u64) {
         let _guard = self.lock.write_lock();
         self.active.remove(&id);
+        self.thread_id_by_request.remove(&id);
     }
 
     /// Snapshots packet decisions already queued or being applied for one closing
@@ -305,7 +312,13 @@ impl IdCache {
         if sorted_instance_ids.len() == 1 {
             let instance_id = sorted_instance_ids[0];
             if let Some(ids) = self.pending_by_instance.remove(&instance_id) {
-                retire_pending_ids(&mut self.values, instance_id, ids, &mut removed);
+                retire_pending_ids(
+                    &mut self.values,
+                    &mut self.thread_id_by_request,
+                    instance_id,
+                    ids,
+                    &mut removed,
+                );
             }
             return removed;
         }
@@ -335,7 +348,13 @@ impl IdCache {
                 .find(|instance_id| self.pending_by_instance.contains_key(instance_id))
             {
                 if let Some(ids) = self.pending_by_instance.remove(&instance_id) {
-                    retire_pending_ids(&mut self.values, instance_id, ids, &mut removed);
+                    retire_pending_ids(
+                        &mut self.values,
+                        &mut self.thread_id_by_request,
+                        instance_id,
+                        ids,
+                        &mut removed,
+                    );
                 }
             }
             return removed;
@@ -356,7 +375,13 @@ impl IdCache {
         }
         pending_ids.sort_unstable_by_key(|(id, _)| *id);
         for (id, instance_id) in pending_ids {
-            retire_pending_id(&mut self.values, id, instance_id, &mut removed);
+            retire_pending_id(
+                &mut self.values,
+                &mut self.thread_id_by_request,
+                id,
+                instance_id,
+                &mut removed,
+            );
         }
         removed
     }
@@ -372,6 +397,7 @@ impl IdCache {
         let _guard = self.lock.write_lock();
         mem::swap(&mut self.values, &mut values);
         self.pending_by_instance.clear();
+        self.thread_id_by_request.clear();
 
         return values;
     }
@@ -413,15 +439,17 @@ fn remove_pending_request(
 
 fn retire_pending_ids(
     values: &mut VecDeque<Entry<PendingPacket>>,
+    thread_id_by_request: &mut BTreeMap<u64, u64>,
     instance_id: u64,
     ids: PendingIds,
     removed: &mut VecDeque<Entry<PendingPacket>>,
 ) {
-    ids.for_each(|id| retire_pending_id(values, id, instance_id, removed));
+    ids.for_each(|id| retire_pending_id(values, thread_id_by_request, id, instance_id, removed));
 }
 
 fn retire_pending_id(
     values: &mut VecDeque<Entry<PendingPacket>>,
+    thread_id_by_request: &mut BTreeMap<u64, u64>,
     id: u64,
     instance_id: u64,
     removed: &mut VecDeque<Entry<PendingPacket>>,
@@ -440,6 +468,7 @@ fn retire_pending_id(
     {
         values[index].value.connection_instance_id = None;
     } else if let Some(entry) = values.remove(index) {
+        thread_id_by_request.remove(&id);
         removed.push_back(entry);
     }
 }
@@ -579,10 +608,23 @@ mod tests {
             id,
         });
         add_pending_request(&mut cache.pending_by_instance, connection_instance_id, id);
+        cache.thread_id_by_request.insert(id, 1000 + id);
     }
 
     fn queued_ids(cache: &IdCache) -> alloc::vec::Vec<u64> {
         cache.values.iter().map(Entry::id).collect()
+    }
+
+    #[test]
+    fn thread_id_lookup_uses_only_the_request_index() {
+        let mut cache = IdCache::new();
+        for id in [0, 1, u64::MAX] {
+            assert_eq!(cache.get_thread_id(id), 0);
+        }
+        cache.thread_id_by_request.insert(u64::MAX, 1234);
+        assert!(cache.values.is_empty());
+        assert_eq!(cache.get_thread_id(u64::MAX), 1234);
+        assert_eq!(cache.get_thread_id(1), 0);
     }
 
     #[test]
@@ -602,10 +644,14 @@ mod tests {
         assert!(!cache.pending_by_instance.contains_key(&20));
         assert!(cache.pending_by_instance.contains_key(&10));
         assert!(cache.pending_by_instance.contains_key(&30));
+        assert_eq!(cache.get_thread_id(2), 1002);
 
         let detached = cache.pop_id(2).expect("detached request remains claimable");
         assert_eq!(detached.connection_instance_id, None);
         assert_eq!(queued_ids(&cache), vec![1, 3]);
+        assert_eq!(cache.get_thread_id(2), 1002);
+        cache.finish_id(2);
+        assert_eq!(cache.get_thread_id(2), 0);
     }
 
     #[test]
@@ -632,6 +678,9 @@ mod tests {
         assert!(!cache.pending_by_instance.contains_key(&30));
         assert!(cache.pending_by_instance.contains_key(&10));
         assert!(cache.pending_by_instance.contains_key(&40));
+        assert_eq!(cache.get_thread_id(2), 0);
+        assert_eq!(cache.get_thread_id(4), 0);
+        assert_eq!(cache.get_thread_id(3), 1003);
     }
 
     #[test]
@@ -660,6 +709,10 @@ mod tests {
         assert_eq!(queued_ids(&cache), vec![3]);
         assert!(cache.pending_by_instance.get(&10).is_none());
         assert!(cache.active.contains_key(&1));
+        assert_eq!(cache.get_thread_id(1), 1001);
+        assert_eq!(cache.get_thread_id(2), 0);
+        cache.finish_id(1);
+        assert_eq!(cache.get_thread_id(1), 0);
     }
 
     #[test]
@@ -695,6 +748,8 @@ mod tests {
             vec![1]
         );
         assert_eq!(queued_ids(&cache), vec![2]);
+        assert_eq!(cache.get_thread_id(1), 0);
+        assert_eq!(cache.get_thread_id(2), 1002);
     }
 
     #[test]
@@ -714,5 +769,6 @@ mod tests {
         );
         assert!(cache.values.is_empty());
         assert!(cache.pending_by_instance.is_empty());
+        assert!(cache.thread_id_by_request.is_empty());
     }
 }

@@ -28,6 +28,7 @@ constexpr uint32_t MakeCtlCode(uint32_t function) {
 
 constexpr uint32_t kIoctlVersion = MakeCtlCode(0x800);
 constexpr uint32_t kIoctlShutdown = MakeCtlCode(0x801);
+constexpr uint32_t kIoctlGetThreadId = MakeCtlCode(0x802);
 
 // Every record is [InfoType: u8, size: u32 LE, payload: size bytes].
 constexpr size_t kRecordHeaderSize = 5;
@@ -374,7 +375,8 @@ private:
 
 } // namespace
 
-bool Driver::DeviceControl(uint32_t code, uint8_t* out, uint32_t out_len, std::string& error) {
+bool Driver::DeviceControl(uint32_t code, uint8_t* out, uint32_t out_len, std::string& error,
+                           void* input, uint32_t input_len) {
     if (device_ == nullptr) {
         error = "device not open";
         return false;
@@ -386,13 +388,28 @@ bool Driver::DeviceControl(uint32_t code, uint8_t* out, uint32_t out_len, std::s
     }
     HANDLE device = static_cast<HANDLE>(device_);
     DWORD returned = 0;
-    const BOOL ok = DeviceIoControl(device, code, nullptr, 0, out, out_len,
+    const BOOL ok = DeviceIoControl(device, code, input, input_len, out, out_len,
                                     &returned, ov.get());
     return FinishOverlapped(device, ov.get(), ok, "DeviceIoControl", nullptr, error);
 }
 
 bool Driver::GetVersion(uint8_t out[4], std::string& error) {
     return DeviceControl(kIoctlVersion, out, 4, error);
+}
+
+bool Driver::GetThreadId(uint64_t id, uint64_t& thread_id, std::string& error) {
+    uint8_t input[8] = {};
+    uint8_t output[8] = {};
+    thread_id = 0;
+    for (int i = 0; i < 8; ++i) {
+        input[i] = static_cast<uint8_t>((id >> (i * 8)) & 0xFF);
+    }
+    if (!DeviceControl(kIoctlGetThreadId, output, sizeof(output), error,
+                       input, sizeof(input))) {
+        return false;
+    }
+    thread_id = ReadU64(output);
+    return true;
 }
 
 bool Driver::RequestShutdown(std::string& error) {

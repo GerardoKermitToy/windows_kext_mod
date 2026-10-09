@@ -764,6 +764,16 @@ int wmain(int argc, wchar_t** argv) {
                  c.local_port == opt.filter_port);
         }
 
+        uint64_t thread_id = 0;
+        if (show_connection && c.id != 0) {
+            std::string error;
+            if (!driver.GetThreadId(c.id, thread_id, error)) {
+                Emit("%s[WARN] id=%llu thread ID query FAILED: %s\n",
+                     TimePrefix(opt.timestamps).c_str(),
+                     static_cast<unsigned long long>(c.id), error.c_str());
+            }
+        }
+
         bool verdict_ok = false;
         bool verdict_queued = false;
         std::string verdict_error;
@@ -841,12 +851,13 @@ int wmain(int argc, wchar_t** argv) {
             return;
         }
 
-        Emit("%s[CONN %s] id=%llu pid=%llu %s proto=%u(%s) layer=%u(%s)\n"
+        Emit("%s[CONN %s] id=%llu pid=%llu tid=%llu %s proto=%u(%s) layer=%u(%s)\n"
              "          %s:%u -> %s:%u  payload=%u bytes\n",
              TimePrefix(opt.timestamps).c_str(),
              c.ipv6 ? "v6" : "v4",
              static_cast<unsigned long long>(c.id),
              static_cast<unsigned long long>(c.process_id),
+             static_cast<unsigned long long>(thread_id),
              pmkext::DirectionToString(c.direction),
              static_cast<unsigned>(c.protocol), pmkext::ProtocolToString(c.protocol),
              static_cast<unsigned>(c.payload_layer),
