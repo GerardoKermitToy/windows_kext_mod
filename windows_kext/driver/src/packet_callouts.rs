@@ -315,7 +315,7 @@ fn ip_packet_layer(
                 return;
             }
         };
-        let key = packet_metadata.key;
+        let mut key = packet_metadata.key;
 
         if fast_track_pm_packets(&key) || packet_metadata.is_icmp_port_unreachable {
             data.action_permit();
@@ -388,32 +388,25 @@ fn ip_packet_layer(
                 Direction::Outbound => {
                     if let Some(echo) = packet_metadata.icmp_echo {
                         if !echo.is_request {
-                            // This is an echo reply reported as OUTBOUND. Two cases:
-                            // 1. Reply to our own request (loopback or external): we
-                            //    sent a request, this is the answer coming back. WFP
-                            //    reports it as OUTBOUND (routing quirk). Semantically
-                            //    it's inbound, and we have the request cached.
-                            // 2. Our reply to someone else's request: they sent us a
-                            //    request, this is our answer going out. WFP correctly
-                            //    reports it as OUTBOUND, and we have no cached request.
-                            //
-                            // Distinguish by checking if we have a cached request.
-                            let request_identity = {
+                            // WFP reports a loopback reply as OUTBOUND, so its source
+                            // is the request's remote address. Match the reversed key,
+                            // then normalize both the tuple and semantic direction.
+                            // A normal outbound kernel reply to a remote ping must not
+                            // consume an unrelated request with the same identifier.
+                            let request = echo.loopback_reply_key(key).and_then(|reply_key| {
                                 let mut icmp_echo_cache = device.icmp_echo_cache.write_lock();
                                 icmp_echo_cache
-                                    .take_request_identity(key.remote_address, echo.identifier)
-                            };
+                                    .take_request_identity(reply_key.remote_address, echo.identifier)
+                                    .map(|identity| (reply_key, identity))
+                            });
 
-                            if let Some(identity) = request_identity {
-                                // Case 1: Found our request > this is a reply to us.
-                                // Correct direction to INBOUND for semantic accuracy.
+                            if let Some((reply_key, identity)) = request {
+                                key = reply_key;
                                 effective_direction = Direction::Inbound;
                                 (process_id, thread_id) = identity;
                             } else {
-                                // Case 2: No cached request > this is our reply to them.
-                                // This is a kernel stack reply (automatic ICMP response).
-                                // current_process_id() would return arbitrary DPC context,
-                                // so use 0 (System/kernel) instead.
+                                // No matching local request: keep this a kernel reply.
+                                // Its current process is an arbitrary DPC context.
                                 process_id = 0;
                             }
                         } else {
@@ -442,9 +435,8 @@ fn ip_packet_layer(
                     }
                 }
                 Direction::Inbound => {
-                    // Inbound ICMP echo replies are straightforward: someone sent us
-                    // a request, they're getting their reply back. Try to attribute
-                    // it to their original request if we cached it.
+                    // A received echo reply belongs to our original outbound
+                    // request, not to the current receive-processing thread.
                     if let Some(echo) = packet_metadata.icmp_echo {
                         if !echo.is_request {
                             (process_id, thread_id) = {

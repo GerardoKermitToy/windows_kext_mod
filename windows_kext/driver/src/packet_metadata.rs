@@ -45,6 +45,18 @@ pub(crate) struct IcmpEcho {
     pub(crate) identifier: u16,
 }
 
+impl IcmpEcho {
+    /// An outbound loopback reply has the request's remote address as its source.
+    /// Return the requester's key; a cache match must still establish ownership.
+    pub(crate) fn loopback_reply_key(self, key: Key) -> Option<Key> {
+        if !self.is_request && key.is_loopback_like() {
+            Some(key.reverse())
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct PacketMetadata {
     pub(crate) key: Key,
@@ -397,6 +409,89 @@ mod tests {
             .metadata
             .expect("inbound ICMP unreachable metadata");
         assert!(inbound.is_icmp_port_unreachable);
+    }
+
+    #[test]
+    fn outbound_loopback_echo_reply_uses_requesters_key() {
+        let mut packet = [0u8; IPV4_HEADER_LEN + ICMP_HEADER_LEN];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&28u16.to_be_bytes());
+        packet[9] = u8::from(IpProtocol::Icmp);
+        packet[12..16].copy_from_slice(&[127, 0, 0, 2]);
+        packet[16..20].copy_from_slice(&[127, 0, 0, 1]);
+        packet[24..26].copy_from_slice(&0x1234u16.to_be_bytes());
+
+        let metadata = inspect_packet(&packet, false, Direction::Outbound)
+            .metadata
+            .expect("outbound loopback echo reply");
+        let echo = metadata.icmp_echo.unwrap();
+        let reply_key = echo.loopback_reply_key(metadata.key).unwrap();
+        assert_eq!(echo.identifier, 0x1234);
+        assert_eq!(
+            reply_key.remote_address,
+            IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 2))
+        );
+        assert_eq!(
+            reply_key.local_address,
+            IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1))
+        );
+        let inbound_key = inspect_packet(&packet, false, Direction::Inbound)
+            .metadata
+            .unwrap()
+            .key;
+        assert!(reply_key == inbound_key);
+
+        packet[20] = 8;
+        let request = inspect_packet(&packet, false, Direction::Outbound)
+            .metadata
+            .unwrap();
+        assert!(request
+            .icmp_echo
+            .unwrap()
+            .loopback_reply_key(request.key)
+            .is_none());
+    }
+
+    #[test]
+    fn outbound_kernel_echo_reply_has_no_requesters_key() {
+        let mut packet = [0u8; IPV4_HEADER_LEN + ICMP_HEADER_LEN];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&28u16.to_be_bytes());
+        packet[9] = u8::from(IpProtocol::Icmp);
+        set_ipv4_endpoints(&mut packet);
+        let metadata = inspect_packet(&packet, false, Direction::Outbound)
+            .metadata
+            .unwrap();
+        assert!(metadata
+            .icmp_echo
+            .unwrap()
+            .loopback_reply_key(metadata.key)
+            .is_none());
+    }
+
+    #[test]
+    fn same_address_echo_replies_keep_their_key() {
+        let echo = IcmpEcho {
+            is_request: false,
+            identifier: 0x1234,
+        };
+        for address in [
+            IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1)),
+            IpAddress::Ipv4(Ipv4Address::new(192, 0, 2, 1)),
+            IpAddress::Ipv6(Ipv6Address::LOOPBACK),
+        ] {
+            let key = Key {
+                protocol: match address {
+                    IpAddress::Ipv4(_) => IpProtocol::Icmp,
+                    IpAddress::Ipv6(_) => IpProtocol::Icmpv6,
+                },
+                local_address: address,
+                local_port: 0,
+                remote_address: address,
+                remote_port: 0,
+            };
+            assert!(echo.loopback_reply_key(key) == Some(key));
+        }
     }
 
     #[test]
