@@ -365,6 +365,19 @@ impl TcpEndpointCache {
         expired_set.into_iter().collect()
     }
 
+    /// Resource release covers sockets closed before FLOW_ESTABLISHED. Leave
+    /// established generations to the existing endpoint-closure deferral path.
+    pub fn take_unestablished(&mut self, endpoint_handle: u64) -> Option<TcpEndpointConnection> {
+        let record = self.endpoints.get(&endpoint_handle)?;
+        if record.established {
+            return None;
+        }
+
+        let endpoint = record.endpoint;
+        self.remove_endpoint_aliases(endpoint);
+        Some(endpoint)
+    }
+
     /// Consumes the exact connection identity assigned to the closing endpoint.
     /// Every alias of the same generation is removed defensively as well.
     pub fn take(&mut self, endpoint_handle: u64) -> Option<TcpEndpointConnection> {
@@ -414,7 +427,7 @@ mod tests {
         connection::{Connection, ConnectionV4, Direction},
         connection_map::{ConnectionMap, Key},
     };
-    use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Address};
+    use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Address, Ipv6Address};
 
     fn key() -> Key {
         Key {
@@ -428,6 +441,71 @@ mod tests {
 
     fn connection(key: &Key, process_id: u64) -> ConnectionV4 {
         ConnectionV4::from_key(key, process_id, Direction::Outbound).expect("IPv4 key")
+    }
+
+    #[test]
+    fn resource_release_consumes_unestablished_ipv4_and_ipv6_aliases_once() {
+        let mut ipv6 = key();
+        ipv6.local_address = IpAddress::Ipv6(Ipv6Address::LOOPBACK);
+        ipv6.remote_address = IpAddress::Ipv6(Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
+
+        for tuple in [key(), ipv6] {
+            let mut cache = TcpEndpointCache::new();
+            assert!(cache.associate_instance_at(10, tuple, None, 100, 1_000));
+            assert!(cache.associate_instance_at(11, tuple, None, 100, 1_000));
+            assert!(cache.take_unestablished(0).is_none());
+            assert!(cache.take_unestablished(99).is_none());
+
+            let released = cache.take_unestablished(10).expect("unestablished endpoint");
+            assert!(released.key == tuple);
+            assert_eq!(released.instance_id, 100);
+            assert!(cache.take_unestablished(10).is_none());
+            assert!(cache.take_unestablished(11).is_none());
+            assert!(cache.take(10).is_none());
+            assert!(cache.lookup_is_consistent());
+            assert_eq!(cache.get_entries_count(), 0);
+        }
+    }
+
+    #[test]
+    fn resource_release_preserves_established_endpoint_and_aliases() {
+        let mut cache = TcpEndpointCache::new();
+        let tuple = key();
+        assert!(cache.associate_instance_at(10, tuple, Some(10), 100, 1_000));
+        let endpoint = cache
+            .resolve_live_instance(&tuple, Some(10), |_| true)
+            .expect("socket resource generation");
+        assert!(cache.rebind_established(30, endpoint));
+        assert!(cache.associate_instance(31, tuple, Some(10), 100));
+
+        assert!(cache.take_unestablished(10).is_none());
+        assert!(cache.take_unestablished(30).is_none());
+        assert!(cache.take_unestablished(31).is_none());
+        assert!(cache.lookup_is_consistent());
+        assert_eq!(cache.get_entries_count(), 2);
+        assert!(cache.take(30).is_some_and(|candidate| candidate == endpoint));
+        assert!(cache.take_unestablished(31).is_none());
+        assert_eq!(cache.get_entries_count(), 0);
+    }
+
+    #[test]
+    fn resource_release_preserves_another_generation_of_the_same_tuple() {
+        let mut cache = TcpEndpointCache::new();
+        let tuple = key();
+        assert!(cache.associate_instance(10, tuple, None, 100));
+        assert!(cache.associate_instance(20, tuple, None, 101));
+
+        assert_eq!(
+            cache.take_unestablished(10).expect("old endpoint").instance_id,
+            100
+        );
+        assert!(cache.take_unestablished(10).is_none());
+        assert!(cache.lookup_is_consistent());
+        assert_eq!(cache.get_entries_count(), 1);
+        assert_eq!(
+            cache.take_unestablished(20).expect("new endpoint").instance_id,
+            101
+        );
     }
 
     #[test]

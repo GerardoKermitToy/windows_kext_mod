@@ -55,7 +55,7 @@ with socket.socket(f, socket.SOCK_STREAM) as s:
 '''
 END = re.compile(r"\[END\s+v[46]\] pid=(\d+) (\w+) proto=6\(TCP\) (\S+):(\d+) -> (\S+):(\d+)")
 CONN = re.compile(
-    r"\[CONN v[46]\] id=(?P<id>\d+) pid=(?P<pid>\d+) (?P<direction>\w+) proto=6\(TCP\) "
+    r"\[CONN v[46]\] id=(?P<id>\d+) pid=(?P<pid>\d+) (?:tid=\d+ )?(?P<direction>\w+) proto=6\(TCP\) "
     r"layer=(?P<layer>\d+)\([^)]*\)\r?\n"
     r"\s+(?P<local>\S+):(?P<lp>\d+) -> (?P<remote>\S+):(?P<rp>\d+)\s+payload=\d+ bytes\r?\n"
     r"\s+payload: (?P<payload>[0-9a-f]+|\(none\))\r?\n\s+-> verdict (?P<verdict>\w+) sent"

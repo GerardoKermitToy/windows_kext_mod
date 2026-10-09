@@ -23,6 +23,7 @@ pub struct Callout {
     pub(crate) filter_id: u64,
     pub(crate) callout_fn: fn(CalloutData),
     pub(crate) flow_delete_fn: Option<FwpsCalloutFlowDeleteNotifyFn>,
+    pub(crate) ip_protocol: Option<u8>,
 }
 
 impl Callout {
@@ -48,6 +49,7 @@ impl Callout {
             filter_id: 0,
             callout_fn,
             flow_delete_fn: None,
+            ip_protocol: None,
         }
     }
 
@@ -55,6 +57,12 @@ impl Callout {
     /// with WFP data flows.
     pub fn with_flow_delete_fn(mut self, flow_delete_fn: FwpsCalloutFlowDeleteNotifyFn) -> Self {
         self.flow_delete_fn = Some(flow_delete_fn);
+        self
+    }
+
+    /// Lets WFP exclude other protocols before invoking the classify callback.
+    pub fn with_ip_protocol(mut self, ip_protocol: u8) -> Self {
+        self.ip_protocol = Some(ip_protocol);
         self
     }
 
@@ -72,6 +80,7 @@ impl Callout {
             self.layer,
             self.action,
             self.address, // The address of the callout is passed as context.
+            self.ip_protocol,
         ) {
             Ok(id) => {
                 self.filter_id = id;

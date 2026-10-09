@@ -418,6 +418,15 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
     } else {
         None
     };
+    // Outbound AUTH_CONNECT can expose a child of the bound socket. Until
+    // FLOW_ESTABLISHED, track the socket resource identity used by RESOURCE_RELEASE.
+    // Inbound children must retain their own handle, not their shared listener.
+    let endpoint_handle = match (ale_data.protocol, ale_data.connection_direction) {
+        (IpProtocol::Tcp, Direction::Outbound) => {
+            endpoint_handle.map(|handle| parent_endpoint_handle.unwrap_or(handle))
+        }
+        _ => endpoint_handle,
+    };
 
     match injection_action {
         AleInjectionAction::PermitSelfInjected => {
@@ -560,13 +569,23 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
     // Connection already in cache.
     if let Some((verdict, connection_instance_id, live)) = cached {
         if live {
-            track_endpoint_instance(
-                device,
-                endpoint_handle,
-                parent_endpoint_handle,
-                key,
-                connection_instance_id,
-            );
+            // Outbound TCP reauthorization may omit the optional parent. Keep
+            // its existing resource/flow identity instead of adding a detached
+            // child alias that RESOURCE_RELEASE cannot retire with its parent.
+            let parentless_tcp_reauthorization = matches!(
+                (ale_data.protocol, ale_data.connection_direction),
+                (IpProtocol::Tcp, Direction::Outbound)
+            ) && ale_data.reauthorize
+                && parent_endpoint_handle.is_none();
+            if !parentless_tcp_reauthorization {
+                track_endpoint_instance(
+                    device,
+                    endpoint_handle,
+                    parent_endpoint_handle,
+                    key,
+                    connection_instance_id,
+                );
+            }
         } else {
             crate::dbg!(
                 "processing TCP reauthorization after endpoint closure: {}",
@@ -1201,7 +1220,12 @@ fn close_tcp_endpoint(
     // remains live while WFP holds a pended endpoint-closure classification.
     let endpoint = {
         let mut endpoint_cache = device.tcp_endpoint_cache.write_lock();
-        endpoint_cache.take(endpoint_handle)
+        endpoint_cache.take(endpoint_handle).or_else(|| {
+            // An unestablished outbound child can close before resource release.
+            // Its exact parent resource is authoritative; never use a tuple here.
+            let parent = parent_endpoint_handle(data)?;
+            endpoint_cache.take_unestablished(parent)
+        })
     };
     let Some(endpoint) = endpoint else {
         return false;
@@ -1409,6 +1433,30 @@ pub(crate) fn expire_unestablished_tcp_connections(device: &Device) {
     }
 }
 
+pub fn tcp_resource_assignment(_data: CalloutData) {
+    // Observing TCP assignment makes WFP indicate the corresponding release.
+    // AUTH_CONNECT already supplies the resource's parent handle, so no additional
+    // per-socket state is needed here.
+}
+
+pub fn tcp_resource_release(data: CalloutData) {
+    // Both filters are TCP-only. Resource release supplies the native endpoint
+    // handle even when no TCP handshake (and hence no flow) ever completed.
+    let Some(endpoint_handle) = transport_endpoint_handle(&data) else {
+        return;
+    };
+    let Some(device) = crate::entry::get_device() else {
+        return;
+    };
+    let endpoint = {
+        let mut endpoint_cache = device.tcp_endpoint_cache.write_lock();
+        endpoint_cache.take_unestablished(endpoint_handle)
+    };
+    if let Some(endpoint) = endpoint {
+        end_tcp_connection(device, endpoint, data.get_process_id().unwrap_or(0));
+    }
+}
+
 pub fn endpoint_closure_v4(mut data: CalloutData) {
     type Fields = layer::FieldsAleEndpointClosureV4;
     let Some(device) = crate::entry::get_device() else {
@@ -1436,7 +1484,12 @@ pub fn endpoint_closure_v4(mut data: CalloutData) {
             if !close_tcp_endpoint(device, &mut data, endpoint_handle, process_id)
                 && connected_endpoint
             {
-                crate::err!("TCP endpoint closure did not match a tracked connection");
+                // Resource release may already have retired this socket before
+                // WFP reports the child authorization endpoint's closure.
+                crate::dbg!(
+                    "TCP closure for retired or untracked endpoint {}",
+                    endpoint_handle
+                );
             }
         }
         Some(IpProtocol::Udp) => {
@@ -1505,7 +1558,12 @@ pub fn endpoint_closure_v6(mut data: CalloutData) {
             if !close_tcp_endpoint(device, &mut data, endpoint_handle, process_id)
                 && connected_endpoint
             {
-                crate::err!("TCP endpoint closure did not match a tracked connection");
+                // Resource release may already have retired this socket before
+                // WFP reports the child authorization endpoint's closure.
+                crate::dbg!(
+                    "TCP closure for retired or untracked endpoint {}",
+                    endpoint_handle
+                );
             }
         }
         Some(IpProtocol::Udp) => {

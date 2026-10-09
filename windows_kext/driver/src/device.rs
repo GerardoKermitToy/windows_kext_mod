@@ -432,9 +432,11 @@ impl Device {
 
                 wdk::dbg!("Verdict command");
                 // Received verdict decision for a specific connection.
-                let packet = {
+                let (packet, issued_id) = {
                     let mut packet_cache = self.packet_cache.write_lock();
-                    packet_cache.pop_id(verdict.id)
+                    let packet = packet_cache.pop_id(verdict.id);
+                    let issued_id = packet.is_none() && packet_cache.was_issued_id(verdict.id);
+                    (packet, issued_id)
                 };
                 if let Some(PendingPacket {
                     key,
@@ -532,8 +534,12 @@ impl Device {
                             }
                         }
                     }
+                } else if issued_id {
+                    // A socket can close before userspace reads CONN or sends its
+                    // verdict. Resource release already completed the pending ALE
+                    // operation; do not retain it or treat the late reply as an error.
+                    dbg!("ignoring verdict for completed request id: {}", verdict.id);
                 } else {
-                    // Id was not in the packet cache.
                     let id = verdict.id;
                     err!("Verdict invalid id: {}", id);
                 }

@@ -17,8 +17,8 @@ use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
     FwpmCalloutAdd0, FwpmEngineClose0, FwpmEngineOpen0, FwpmFilterAdd0, FwpmFilterDeleteById0,
     FwpmSubLayerAdd0, FwpmSubLayerDeleteByKey0, FwpmTransactionAbort0, FwpmTransactionBegin0,
     FwpmTransactionCommit0, FWPM_CALLOUT0, FWPM_CALLOUT_FLAG_USES_PROVIDER_CONTEXT,
-    FWPM_DISPLAY_DATA0, FWPM_FILTER0, FWPM_SESSION0, FWPM_SESSION_FLAG_DYNAMIC, FWPM_SUBLAYER0,
-    FWP_UINT8,
+    FWPM_CONDITION_IP_PROTOCOL, FWPM_DISPLAY_DATA0, FWPM_FILTER0, FWPM_FILTER_CONDITION0,
+    FWPM_SESSION0, FWPM_SESSION_FLAG_DYNAMIC, FWPM_SUBLAYER0, FWP_MATCH_EQUAL, FWP_UINT8,
 };
 use windows_sys::Win32::System::Rpc::RPC_C_AUTHN_WINNT;
 use windows_sys::{
@@ -50,6 +50,11 @@ const _: () = {
     assert!(align_of::<FWP_CONDITION_VALUE0>() == 8);
     assert!(offset_of!(FWP_CONDITION_VALUE0, r#type) == 0);
     assert!(offset_of!(FWP_CONDITION_VALUE0, Anonymous) == 8);
+    assert!(size_of::<FWPM_FILTER_CONDITION0>() == 40);
+    assert!(align_of::<FWPM_FILTER_CONDITION0>() == 8);
+    assert!(offset_of!(FWPM_FILTER_CONDITION0, fieldKey) == 0);
+    assert!(offset_of!(FWPM_FILTER_CONDITION0, matchType) == 16);
+    assert!(offset_of!(FWPM_FILTER_CONDITION0, conditionValue) == 24);
     assert!(size_of::<FWPM_DISPLAY_DATA0>() == 16);
     assert!(align_of::<FWPM_DISPLAY_DATA0>() == 8);
     assert!(offset_of!(FWPM_DISPLAY_DATA0, name) == 0);
@@ -278,6 +283,7 @@ pub(crate) fn register_filter(
     layer: Layer,
     action: u32,
     context: u64,
+    ip_protocol: Option<u8>,
 ) -> Result<u64, String> {
     let Ok(name) = U16CString::from_str(name) else {
         return Err("invalid argument name".to_owned());
@@ -299,7 +305,15 @@ pub(crate) fn register_filter(
         // FWPS_RIGHT_ACTION_WRITE explicitly, and the narrow Portmaster-owner
         // permit path does the same when it intentionally needs a hard permit.
         filter.flags = 0;
-        filter.numFilterConditions = 0; // If you specify 0, this filter invokes its callout for all traffic in its layer
+        let mut protocol_condition: FWPM_FILTER_CONDITION0 = MaybeUninit::zeroed().assume_init();
+        if let Some(ip_protocol) = ip_protocol {
+            protocol_condition.fieldKey = FWPM_CONDITION_IP_PROTOCOL;
+            protocol_condition.matchType = FWP_MATCH_EQUAL;
+            protocol_condition.conditionValue.r#type = FWP_UINT8;
+            protocol_condition.conditionValue.Anonymous.uint8 = ip_protocol;
+            filter.numFilterConditions = 1;
+            filter.filterCondition = &mut protocol_condition;
+        }
         filter.layerKey = layer.get_guid(); // This layer must match the layer that ExampleCallout is registered to
         filter.action.Anonymous.calloutKey = GUID::from_u128(callout_guid);
         filter.Anonymous.rawContext = context;

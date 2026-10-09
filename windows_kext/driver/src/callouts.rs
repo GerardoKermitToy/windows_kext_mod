@@ -1,4 +1,5 @@
 use alloc::vec::Vec;
+use smoltcp::wire::IpProtocol;
 use wdk::filter_engine::callout::FilterType;
 use wdk::{
     consts,
@@ -67,6 +68,48 @@ pub fn get_callout_vec() -> Vec<Callout> {
             FilterType::NonResettable,
             ale_callouts::endpoint_closure_v6,
         ),
+        Callout::new(
+            "Portmaster TCP Resource Assignment IPv4",
+            "Portmaster observes IPv4 TCP endpoint allocation",
+            0x842eac16_702d_4b93_ae84_05c139762fb0,
+            Layer::AleResourceAssignmentV4,
+            consts::FWP_ACTION_CALLOUT_INSPECTION,
+            FilterType::NonResettable,
+            ale_callouts::tcp_resource_assignment,
+        )
+        .with_ip_protocol(u8::from(IpProtocol::Tcp)),
+        Callout::new(
+            "Portmaster TCP Resource Assignment IPv6",
+            "Portmaster observes IPv6 TCP endpoint allocation",
+            0x06b92d38_ca17_48e5_9fd2_63a74c0158eb,
+            Layer::AleResourceAssignmentV6,
+            consts::FWP_ACTION_CALLOUT_INSPECTION,
+            FilterType::NonResettable,
+            ale_callouts::tcp_resource_assignment,
+        )
+        .with_ip_protocol(u8::from(IpProtocol::Tcp)),
+        // TCP sockets closed before the handshake may omit ENDPOINT_CLOSURE.
+        // RESOURCE_RELEASE instead reports the exact bound socket resource.
+        Callout::new(
+            "Portmaster TCP Resource Release IPv4",
+            "Portmaster uses this layer to detect unestablished IPv4 TCP socket closure",
+            0x3a8d4197_6f52_4e1b_982c_b057e2ac9136,
+            Layer::AleResourceReleaseV4,
+            consts::FWP_ACTION_CALLOUT_INSPECTION,
+            FilterType::NonResettable,
+            ale_callouts::tcp_resource_release,
+        )
+        .with_ip_protocol(u8::from(IpProtocol::Tcp)),
+        Callout::new(
+            "Portmaster TCP Resource Release IPv6",
+            "Portmaster uses this layer to detect unestablished IPv6 TCP socket closure",
+            0x9c62b4e0_1387_49fa_a53d_74e1c906bf28,
+            Layer::AleResourceReleaseV6,
+            consts::FWP_ACTION_CALLOUT_INSPECTION,
+            FilterType::NonResettable,
+            ale_callouts::tcp_resource_release,
+        )
+        .with_ip_protocol(u8::from(IpProtocol::Tcp)),
         // -----------------------------------------
         // Flow-established layers. TCP is indicated after its three-way handshake;
         // UDP is indicated immediately after the first packet for a remote tuple is

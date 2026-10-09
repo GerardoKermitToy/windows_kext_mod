@@ -215,6 +215,13 @@ impl IdCache {
         self.thread_id_by_request.get(&id).copied().unwrap_or(0)
     }
 
+    /// Recognizes late verdicts for requests already retired by endpoint release
+    /// without retaining per-request tombstones. IDs are monotonically assigned.
+    pub fn was_issued_id(&self, id: u64) -> bool {
+        let _guard = self.lock.read_lock();
+        id != 0 && id < self.next_id
+    }
+
     pub fn pop_id(&mut self, id: u64) -> Option<PendingPacket> {
         let _guard = self.lock.write_lock();
         if let Ok(index) = self.values.binary_search_by_key(&id, |val| val.id) {
@@ -609,6 +616,34 @@ mod tests {
         });
         add_pending_request(&mut cache.pending_by_instance, connection_instance_id, id);
         cache.thread_id_by_request.insert(id, 1000 + id);
+    }
+
+    #[test]
+    fn retired_request_id_is_known_without_retaining_the_packet() {
+        let mut cache = IdCache::new();
+        queue(&mut cache, 1, Some(10), false);
+        cache.next_id = 2;
+
+        assert!(cache.was_issued_id(1));
+        assert!(!cache.was_issued_id(0));
+        assert!(!cache.was_issued_id(2));
+        assert!(!cache.was_issued_id(u64::MAX));
+        assert_eq!(cache.retire_connection_instances(&[10]).len(), 1);
+        assert!(cache.pop_id(1).is_none());
+        assert!(cache.was_issued_id(1));
+    }
+
+    #[test]
+    fn completed_request_id_remains_known_for_duplicate_verdicts() {
+        let mut cache = IdCache::new();
+        queue(&mut cache, 1, Some(10), false);
+        cache.next_id = 2;
+
+        assert!(cache.pop_id(1).is_some());
+        cache.finish_id(1);
+        assert!(cache.pop_id(1).is_none());
+        assert!(cache.was_issued_id(1));
+        assert!(!cache.was_issued_id(2));
     }
 
     fn queued_ids(cache: &IdCache) -> alloc::vec::Vec<u64> {
