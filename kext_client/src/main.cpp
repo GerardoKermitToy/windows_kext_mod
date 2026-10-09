@@ -15,6 +15,7 @@
 #include "PortmasterKext.h"
 #include "DelayedVerdicts.h"
 #include "ProcessSuspensions.h"
+#include "RecordOutput.h"
 
 #include <windows.h>
 
@@ -162,17 +163,11 @@ bool ParseUnsignedDecimal(const wchar_t* text, uint64_t maximum, uint64_t& resul
 // still in the buffer - which is how the previous version could produce an empty
 // file despite the driver working.
 void Emit(const char* fmt, ...) {
-    std::lock_guard<std::mutex> guard(g_print_mutex);
-
-    if (g_out == nullptr) {
-        return;
-    }
-
+    pmkext::RecordOutput record(g_out, g_print_mutex);
     va_list args;
     va_start(args, fmt);
-    std::vfprintf(g_out, fmt, args);
+    record.WriteV(fmt, args);
     va_end(args);
-    std::fflush(g_out);
 }
 
 // Prefix for one record: "HH:MM:SS.mmm " when timestamps are on, else empty.
@@ -851,7 +846,8 @@ int wmain(int argc, wchar_t** argv) {
             return;
         }
 
-        Emit("%s[CONN %s] id=%llu pid=%llu tid=%llu %s proto=%u(%s) layer=%u(%s)\n"
+        pmkext::RecordOutput record(g_out, g_print_mutex);
+        record.Write("%s[CONN %s] id=%llu pid=%llu tid=%llu %s proto=%u(%s) layer=%u(%s)\n"
              "          %s:%u -> %s:%u  payload=%u bytes\n",
              TimePrefix(opt.timestamps).c_str(),
              c.ipv6 ? "v6" : "v4",
@@ -868,16 +864,16 @@ int wmain(int argc, wchar_t** argv) {
 
         if (opt.show_payload) {
             if (c.payload.empty()) {
-                Emit("          payload: (none)\n");
+                record.Write("          payload: (none)\n");
             } else {
                 // One unbroken line: it is meant to be pasted into a decoder, and
                 // wrapping would have to be undone by hand. The byte count is
                 // printed when it differs from payload_size, so a truncated record
                 // is not mistaken for a short packet.
                 if (c.payload.size() == c.payload_size) {
-                    Emit("          payload: %s\n", c.PayloadHexString().c_str());
+                    record.Write("          payload: %s\n", c.PayloadHexString().c_str());
                 } else {
-                    Emit("          payload (%zu of %u bytes): %s\n",
+                    record.Write("          payload (%zu of %u bytes): %s\n",
                          c.payload.size(), static_cast<unsigned>(c.payload_size),
                          c.PayloadHexString().c_str());
                 }
@@ -886,23 +882,23 @@ int wmain(int argc, wchar_t** argv) {
 
         // id 0 is never a valid pending packet (id_cache.rs:26 starts at 1).
         if (c.id == 0) {
-            Emit("          (no pending packet, no verdict needed)\n");
+            record.Write("          (no pending packet, no verdict needed)\n");
         } else if (!opt.send_verdicts) {
-            Emit("          -> no verdict sent (--no-verdicts)\n");
+            record.Write("          -> no verdict sent (--no-verdicts)\n");
         } else if (verdict_queued) {
-            Emit("          -> verdict %s scheduled after %u ms%s\n",
+            record.Write("          -> verdict %s scheduled after %u ms%s\n",
                  pmkext::ToString(verdict), opt.verdict_delay_ms,
                  (matched && opt.has_match) ? "  <== MATCHED" : "");
         } else if (verdict_ok) {
             // The marker only means something when --match narrowed the target.
             // Without it every connection matches, so flagging them all would be
             // noise.
-            Emit("          -> verdict %s sent%s\n", pmkext::ToString(verdict),
+            record.Write("          -> verdict %s sent%s\n", pmkext::ToString(verdict),
                  (matched && opt.has_match) ? "  <== MATCHED" : "");
         } else if (g_shutdown_requested.load()) {
-            Emit("          -> no verdict sent (stopping)\n");
+            record.Write("          -> no verdict sent (stopping)\n");
         } else {
-            Emit("          -> verdict FAILED: %s\n", verdict_error.c_str());
+            record.Write("          -> verdict FAILED: %s\n", verdict_error.c_str());
         }
     };
 
@@ -1003,7 +999,8 @@ int wmain(int argc, wchar_t** argv) {
             return;
         }
 
-        Emit("%s[BANDWIDTH] proto=%u(%s) entries=%zu\n",
+        pmkext::RecordOutput record(g_out, g_print_mutex);
+        record.Write("%s[BANDWIDTH] proto=%u(%s) entries=%zu\n",
              TimePrefix(opt.timestamps).c_str(),
              static_cast<unsigned>(stats.protocol),
              pmkext::ProtocolToString(stats.protocol),
@@ -1012,7 +1009,7 @@ int wmain(int argc, wchar_t** argv) {
             if (!keep(e)) {
                 continue;
             }
-            Emit("            %s:%u <-> %s:%u  tx=%llu rx=%llu\n",
+            record.Write("            %s:%u <-> %s:%u  tx=%llu rx=%llu\n",
                  e.LocalIpString().c_str(), static_cast<unsigned>(e.local_port),
                  e.RemoteIpString().c_str(), static_cast<unsigned>(e.remote_port),
                  static_cast<unsigned long long>(e.transmitted_bytes),

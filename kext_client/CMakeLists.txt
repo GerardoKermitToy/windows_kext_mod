@@ -92,6 +92,11 @@ if(BUILD_TESTING)
     add_test(NAME process_suspension_tests COMMAND process_suspension_tests)
     set_tests_properties(process_suspension_tests PROPERTIES TIMEOUT 10)
 
+    add_executable(record_output_tests tests/record_output_tests.cpp)
+    target_link_libraries(record_output_tests PRIVATE pmkext)
+    add_test(NAME record_output_tests COMMAND record_output_tests)
+    set_tests_properties(record_output_tests PROPERTIES TIMEOUT 10)
+
     add_test(NAME verdict_delay_cli_tests
         COMMAND "${CMAKE_COMMAND}" "-DMONITOR=$<TARGET_FILE:kext_monitor>"
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/verdict_delay_cli_tests.cmake")
