@@ -961,6 +961,7 @@ impl Device {
         value: (Key, Packet),
         connection_instance_id: Option<u64>,
         process_id: u64,
+        thread_id: u64,
         direction: crate::connection::Direction,
         ale_layer: bool,
     ) -> Option<PendingPacket> {
@@ -987,7 +988,7 @@ impl Device {
                 .err();
         }
 
-        self.enqueue_pending_packet(pending, process_id, 0, direction, ale_layer);
+        self.enqueue_pending_packet(pending, process_id, thread_id, direction, ale_layer);
         None
     }
 

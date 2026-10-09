@@ -611,6 +611,7 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
                             (key, packet),
                             Some(connection_instance_id),
                             ale_data.process_id,
+                            0,
                             ale_data.packet_direction,
                             true,
                         ) {
@@ -752,6 +753,7 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
             (key, packet),
             Some(registration.instance_id),
             ale_data.process_id,
+            0,
             ale_data.packet_direction,
             true,
         ) {

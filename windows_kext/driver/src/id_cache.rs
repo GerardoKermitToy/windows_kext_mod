@@ -663,6 +663,21 @@ mod tests {
     }
 
     #[test]
+    fn icmp_thread_id_survives_without_a_connection_instance() {
+        let mut cache = IdCache::new();
+        queue(&mut cache, 1, None, false);
+        cache.values[0].value.key.protocol = IpProtocol::Icmp;
+
+        assert!(cache.retire_connection_instances(&[10]).is_empty());
+        assert_eq!(cache.get_thread_id(1), 1001);
+        let packet = cache.pop_id(1).expect("ICMP request");
+        assert_eq!(packet.connection_instance_id, None);
+        assert_eq!(cache.get_thread_id(1), 1001);
+        cache.finish_id(1);
+        assert_eq!(cache.get_thread_id(1), 0);
+    }
+
+    #[test]
     fn surviving_request_is_detached_in_place() {
         let mut cache = IdCache::new();
         queue(&mut cache, 1, Some(10), false);

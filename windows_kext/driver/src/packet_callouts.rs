@@ -352,6 +352,7 @@ fn ip_packet_layer(
         }
 
         let mut process_id = 0;
+        let mut thread_id = 0;
         let mut connection_instance_id = None;
 
         // For loopback ICMP echo reply, WFP reports it as OUTBOUND but it is
@@ -397,17 +398,17 @@ fn ip_packet_layer(
                             //    reports it as OUTBOUND, and we have no cached request.
                             //
                             // Distinguish by checking if we have a cached request.
-                            let request_pid = {
+                            let request_identity = {
                                 let mut icmp_echo_cache = device.icmp_echo_cache.write_lock();
                                 icmp_echo_cache
-                                    .take_request_pid(key.remote_address, echo.identifier)
+                                    .take_request_identity(key.remote_address, echo.identifier)
                             };
 
-                            if let Some(pid) = request_pid {
+                            if let Some(identity) = request_identity {
                                 // Case 1: Found our request > this is a reply to us.
                                 // Correct direction to INBOUND for semantic accuracy.
                                 effective_direction = Direction::Inbound;
-                                process_id = pid;
+                                (process_id, thread_id) = identity;
                             } else {
                                 // Case 2: No cached request > this is our reply to them.
                                 // This is a kernel stack reply (automatic ICMP response).
@@ -416,8 +417,9 @@ fn ip_packet_layer(
                                 process_id = 0;
                             }
                         } else {
-                            // This is a request. Use the current process as the sender.
+                            // This is a request. Capture the sending thread's identity.
                             process_id = wdk::utils::current_process_id();
+                            thread_id = wdk::utils::current_thread_id();
 
                             // Remember the request so its reply can be attributed.
                             {
@@ -426,6 +428,7 @@ fn ip_packet_layer(
                                     key.remote_address,
                                     echo.identifier,
                                     process_id,
+                                    thread_id,
                                 );
                             }
                         }
@@ -444,11 +447,11 @@ fn ip_packet_layer(
                     // it to their original request if we cached it.
                     if let Some(echo) = packet_metadata.icmp_echo {
                         if !echo.is_request {
-                            process_id = {
+                            (process_id, thread_id) = {
                                 let mut icmp_echo_cache = device.icmp_echo_cache.write_lock();
                                 icmp_echo_cache
-                                    .take_request_pid(key.remote_address, echo.identifier)
-                                    .unwrap_or(0)
+                                    .take_request_identity(key.remote_address, echo.identifier)
+                                    .unwrap_or((0, 0))
                             };
                         }
                     }
@@ -613,6 +616,7 @@ fn ip_packet_layer(
             (key, packet),
             connection_instance_id,
             process_id,
+            thread_id,
             effective_direction,
             false,
         ) {

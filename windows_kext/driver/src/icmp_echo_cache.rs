@@ -39,6 +39,7 @@ struct EchoKey {
 #[derive(Clone, Copy)]
 struct EchoEntry {
     process_id: u64,
+    thread_id: u64,
     /// Milliseconds since boot, from `get_monotonic_timestamp_ms`.
     inserted_at_ms: u64,
 }
@@ -59,7 +60,7 @@ const ENTRY_TTL_MS: u64 = 10_000;
 ///
 /// The data is small: a key is 20 bytes (a smoltcp `IpAddress` is 17 - a
 /// discriminant plus room for a v6 address - and the identifier pads it out) and a
-/// value is 16, so 512 entries carry about 18 KB. Actual pool use is higher, and
+/// value is 24, so 512 entries carry about 22 KB. Actual pool use is higher, and
 /// not by a constant factor: entries sit in `BTreeMap` nodes that hold a fixed
 /// number of slots, stay only part full after a split, and are each a separate
 /// non-paged allocation with its own header. Budget around 40 KB, not 20.
@@ -86,7 +87,13 @@ impl IcmpEchoCache {
     /// A repeated request with the same identifier to the same host overwrites the
     /// previous entry, which also refreshes its timestamp - that is correct for
     /// `ping`, where every echo in a run shares one identifier.
-    pub fn insert_request(&mut self, remote_address: IpAddress, identifier: u16, process_id: u64) {
+    pub fn insert_request(
+        &mut self,
+        remote_address: IpAddress,
+        identifier: u16,
+        process_id: u64,
+        thread_id: u64,
+    ) {
         if process_id == 0 {
             // Nothing worth remembering: a zero PID would later be reported as
             // "unknown" anyway, and storing it would only occupy a slot.
@@ -100,6 +107,7 @@ impl IcmpEchoCache {
         };
         let entry = EchoEntry {
             process_id,
+            thread_id,
             inserted_at_ms: now,
         };
 
@@ -124,16 +132,16 @@ impl IcmpEchoCache {
         self.entries.insert(key, entry);
     }
 
-    /// Returns the process that sent the matching request, removing the entry.
+    /// Returns the PID and TID that sent the matching request, removing the entry.
     ///
     /// Removal is deliberate. Each reply consumes its request, so a duplicated or
     /// spoofed reply arriving afterwards is not attributed to the process. For
     /// `ping`, the next echo re-inserts the entry before its own reply arrives.
-    pub fn take_request_pid(
+    pub fn take_request_identity(
         &mut self,
         remote_address: IpAddress,
         identifier: u16,
-    ) -> Option<u64> {
+    ) -> Option<(u64, u64)> {
         // Expiry is checked on read as well as on insert: an entry can sit here
         // long after its TTL if no insert forced a cleanup in between.
         let now = wdk::utils::get_monotonic_timestamp_ms();
@@ -150,7 +158,7 @@ impl IcmpEchoCache {
             return None;
         }
 
-        Some(entry.process_id)
+        Some((entry.process_id, entry.thread_id))
     }
 
     #[allow(dead_code)]
