@@ -4,15 +4,7 @@ use smoltcp::wire::{
     IpAddress, IpProtocol, Ipv4Address, Ipv4Packet, Ipv6Packet, IPV4_HEADER_LEN, IPV6_HEADER_LEN,
 };
 
-use crate::{
-    common::{
-        ICMPV4_CODE_DU_PORT_UNREACHABLE, ICMPV4_TYPE_DESTINATION_UNREACHABLE,
-        ICMPV6_CODE_DU_PORT_UNREACHABLE, ICMPV6_TYPE_DESTINATION_UNREACHABLE,
-    },
-    connection::Direction,
-    connection_map::Key,
-    ipv6_packet::walk_ipv6_headers,
-};
+use crate::{connection::Direction, connection_map::Key, ipv6_packet::walk_ipv6_headers};
 
 /// Prefix large enough for the IPv6 base header, the bounded extension-header
 /// chain and every transport field inspected by the packet callout.
@@ -62,7 +54,6 @@ pub(crate) struct PacketMetadata {
     pub(crate) key: Key,
     pub(crate) icmp_echo: Option<IcmpEcho>,
     pub(crate) icmp_error_echo: Option<(Ipv4Address, u16, u16)>,
-    pub(crate) is_icmp_port_unreachable: bool,
     pub(crate) is_tcp_reset: bool,
 }
 
@@ -145,14 +136,6 @@ fn inspect_ipv4_packet(packet: &[u8], direction: Direction) -> PacketInspection 
             (None, None)
         };
 
-    let is_icmp_port_unreachable = protocol == IpProtocol::Icmp
-        && ip_packet.version() == 4
-        && is_port_unreachable(
-            packet,
-            raw_transport_offset,
-            usize::from(ip_packet.total_len()),
-            false,
-        );
     let is_tcp_reset = protocol == IpProtocol::Tcp
         && (IPV4_HEADER_LEN..=IPV4_MAX_HEADER_LEN).contains(&raw_transport_offset)
         && has_tcp_reset(packet, raw_transport_offset);
@@ -163,7 +146,6 @@ fn inspect_ipv4_packet(packet: &[u8], direction: Direction) -> PacketInspection 
             key,
             icmp_echo,
             icmp_error_echo,
-            is_icmp_port_unreachable,
             is_tcp_reset,
         }),
     }
@@ -200,10 +182,6 @@ fn inspect_ipv6_packet(packet: &[u8], direction: Direction) -> PacketInspection 
         None
     };
 
-    let total_len = IPV6_HEADER_LEN + ip_packet.payload_len() as usize;
-    let is_icmp_port_unreachable = headers.protocol == IpProtocol::Icmpv6
-        && ip_packet.version() == 6
-        && is_port_unreachable(packet, headers.transport_offset, total_len, true);
     let is_tcp_reset =
         headers.protocol == IpProtocol::Tcp && has_tcp_reset(packet, headers.transport_offset);
 
@@ -213,7 +191,6 @@ fn inspect_ipv6_packet(packet: &[u8], direction: Direction) -> PacketInspection 
             key,
             icmp_echo,
             icmp_error_echo: None,
-            is_icmp_port_unreachable,
             is_tcp_reset,
         }),
     }
@@ -317,54 +294,13 @@ fn has_tcp_reset(packet: &[u8], transport_offset: usize) -> bool {
         .is_some_and(|flags| flags & TCP_RST_FLAG != 0)
 }
 
-fn is_port_unreachable(
-    packet: &[u8],
-    transport_offset: usize,
-    total_len: usize,
-    ipv6: bool,
-) -> bool {
-    let max_header_len = if ipv6 {
-        MAX_PACKET_INSPECT_LEN
-    } else {
-        IPV4_MAX_HEADER_LEN
-    };
-    if !(if ipv6 {
-        IPV6_HEADER_LEN
-    } else {
-        IPV4_HEADER_LEN
-    }..=max_header_len)
-        .contains(&transport_offset)
-    {
-        return false;
-    }
-
-    let Some(header_end) = transport_offset.checked_add(ICMP_HEADER_LEN) else {
-        return false;
-    };
-    if total_len < header_end {
-        return false;
-    }
-    let Some(header) = packet.get(transport_offset..header_end) else {
-        return false;
-    };
-
-    let (message_type, code) = if ipv6 {
-        (
-            ICMPV6_TYPE_DESTINATION_UNREACHABLE,
-            ICMPV6_CODE_DU_PORT_UNREACHABLE,
-        )
-    } else {
-        (
-            ICMPV4_TYPE_DESTINATION_UNREACHABLE,
-            ICMPV4_CODE_DU_PORT_UNREACHABLE,
-        )
-    };
-    header[0] == message_type && header[1] == code
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::{
+        ICMPV4_CODE_DU_PORT_UNREACHABLE, ICMPV4_TYPE_DESTINATION_UNREACHABLE,
+        ICMPV6_CODE_DU_PORT_UNREACHABLE, ICMPV6_TYPE_DESTINATION_UNREACHABLE,
+    };
     use smoltcp::wire::{Ipv4Address, Ipv6Address};
 
     fn set_ipv4_endpoints(packet: &mut [u8]) {
@@ -438,20 +374,20 @@ mod tests {
         let echo = metadata.icmp_echo.expect("echo request");
         assert!(echo.is_request);
         assert_eq!(echo.identifier, 0x1234);
-        assert!(!metadata.is_icmp_port_unreachable);
 
         packet[20] = ICMPV4_TYPE_DESTINATION_UNREACHABLE;
         packet[21] = ICMPV4_CODE_DU_PORT_UNREACHABLE;
-        let metadata = inspect_packet(&packet, false, Direction::Outbound)
-            .metadata
-            .expect("ICMP unreachable metadata");
-        assert!(metadata.icmp_echo.is_none());
-        assert!(metadata.is_icmp_port_unreachable);
-
-        let inbound = inspect_packet(&packet, false, Direction::Inbound)
-            .metadata
-            .expect("inbound ICMP unreachable metadata");
-        assert!(inbound.is_icmp_port_unreachable);
+        for direction in [Direction::Outbound, Direction::Inbound] {
+            let metadata = inspect_packet(&packet, false, direction)
+                .metadata
+                .expect("ICMP unreachable metadata");
+            assert_eq!(metadata.key.protocol, IpProtocol::Icmp);
+            assert_eq!(metadata.key.local_port, 0);
+            assert_eq!(metadata.key.remote_port, 0);
+            assert!(metadata.icmp_echo.is_none());
+            assert!(metadata.icmp_error_echo.is_none());
+            assert!(!metadata.is_tcp_reset);
+        }
     }
 
     #[test]
@@ -587,7 +523,6 @@ mod tests {
             IpAddress::Ipv4(Ipv4Address::new(192, 168, 219, 15))
         );
         assert!(metadata.icmp_echo.is_none());
-        assert!(!metadata.is_icmp_port_unreachable);
         assert!(inspect_packet(&packet, false, Direction::Outbound)
             .metadata
             .unwrap()
@@ -655,7 +590,7 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_captured_ipv4_port_unreachable() {
+    fn captured_ipv4_port_unreachable_keeps_icmp_key() {
         let packet = [
             0x45, 0x00, 0x00, 0x39, 0x55, 0x3a, 0x00, 0x00, 0x80, 0x01, 0xad, 0x97, 0xc0, 0xa8,
             0xdb, 0x10, 0xc0, 0xa8, 0xdb, 0x90, 0x03, 0x03, 0x35, 0x0a, 0x00, 0x00, 0x00, 0x00,
@@ -664,10 +599,17 @@ mod tests {
             0x00,
         ];
 
-        let metadata = inspect_packet(&packet, false, Direction::Outbound)
-            .metadata
-            .expect("captured ICMPv4 metadata");
-        assert!(metadata.is_icmp_port_unreachable);
+        for direction in [Direction::Outbound, Direction::Inbound] {
+            let metadata = inspect_packet(&packet, false, direction)
+                .metadata
+                .expect("captured ICMPv4 metadata");
+            assert_eq!(metadata.key.protocol, IpProtocol::Icmp);
+            assert_eq!(metadata.key.local_port, 0);
+            assert_eq!(metadata.key.remote_port, 0);
+            assert!(metadata.icmp_echo.is_none());
+            assert!(metadata.icmp_error_echo.is_none());
+            assert!(!metadata.is_tcp_reset);
+        }
     }
 
     #[test]
@@ -752,7 +694,7 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_ipv6_port_unreachable_after_extension_header() {
+    fn ipv6_port_unreachable_after_extension_header_keeps_icmp_key() {
         let mut packet = [0u8; IPV6_HEADER_LEN + 16];
         packet[0] = 0x60;
         packet[4..6].copy_from_slice(&16u16.to_be_bytes());
@@ -762,15 +704,17 @@ mod tests {
         packet[48] = ICMPV6_TYPE_DESTINATION_UNREACHABLE;
         packet[49] = ICMPV6_CODE_DU_PORT_UNREACHABLE;
 
-        let outbound = inspect_packet(&packet, true, Direction::Outbound)
-            .metadata
-            .expect("outbound ICMPv6 metadata");
-        assert!(outbound.is_icmp_port_unreachable);
-
-        let inbound = inspect_packet(&packet, true, Direction::Inbound)
-            .metadata
-            .expect("inbound ICMPv6 metadata");
-        assert!(inbound.is_icmp_port_unreachable);
+        for direction in [Direction::Outbound, Direction::Inbound] {
+            let metadata = inspect_packet(&packet, true, direction)
+                .metadata
+                .expect("ICMPv6 metadata");
+            assert_eq!(metadata.key.protocol, IpProtocol::Icmpv6);
+            assert_eq!(metadata.key.local_port, 0);
+            assert_eq!(metadata.key.remote_port, 0);
+            assert!(metadata.icmp_echo.is_none());
+            assert!(metadata.icmp_error_echo.is_none());
+            assert!(!metadata.is_tcp_reset);
+        }
     }
 
     #[test]
