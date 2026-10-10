@@ -1,7 +1,7 @@
 use core::fmt;
 
 use smoltcp::wire::{
-    IpAddress, IpProtocol, Ipv4Packet, Ipv6Packet, IPV4_HEADER_LEN, IPV6_HEADER_LEN,
+    IpAddress, IpProtocol, Ipv4Address, Ipv4Packet, Ipv6Packet, IPV4_HEADER_LEN, IPV6_HEADER_LEN,
 };
 
 use crate::{
@@ -20,7 +20,6 @@ pub(crate) const MAX_PACKET_INSPECT_LEN: usize = 128;
 
 const IPV4_MAX_HEADER_LEN: usize = 60;
 const ICMP_HEADER_LEN: usize = 8;
-const ICMP_ECHO_ID_END: usize = 6;
 const TCP_FLAGS_OFFSET: usize = 13;
 const TCP_RST_FLAG: u8 = 0x04;
 
@@ -43,6 +42,7 @@ impl fmt::Display for PacketMetadataError {
 pub(crate) struct IcmpEcho {
     pub(crate) is_request: bool,
     pub(crate) identifier: u16,
+    pub(crate) sequence: u16,
 }
 
 impl IcmpEcho {
@@ -61,6 +61,7 @@ impl IcmpEcho {
 pub(crate) struct PacketMetadata {
     pub(crate) key: Key,
     pub(crate) icmp_echo: Option<IcmpEcho>,
+    pub(crate) icmp_error_echo: Option<(Ipv4Address, u16, u16)>,
     pub(crate) is_icmp_port_unreachable: bool,
     pub(crate) is_tcp_reset: bool,
 }
@@ -124,13 +125,25 @@ fn inspect_ipv4_packet(packet: &[u8], direction: Direction) -> PacketInspection 
         destination_port,
     );
 
-    // The old IPv4 echo reader required the complete eight-byte ICMP header
-    // even though the identifier itself ends at byte six.
-    let icmp_echo = if protocol == IpProtocol::Icmp && transport.len() >= ICMP_HEADER_LEN {
-        get_icmp_echo(transport, false)
-    } else {
-        None
-    };
+    let (icmp_echo, icmp_error_echo) =
+        if protocol == IpProtocol::Icmp && transport.len() >= ICMP_HEADER_LEN {
+            let echo = get_icmp_echo(transport, false);
+            let error_echo = if matches!(direction, Direction::Inbound)
+                && transport[..2] == [11, 0]
+                && ip_packet.version() == 4
+                && raw_transport_offset >= IPV4_HEADER_LEN
+            {
+                let end = core::cmp::min(packet.len(), usize::from(ip_packet.total_len()));
+                packet
+                    .get(raw_transport_offset..end)
+                    .and_then(|transport| get_icmpv4_error_echo(transport, ip_packet.dst_addr()))
+            } else {
+                None
+            };
+            (echo, error_echo)
+        } else {
+            (None, None)
+        };
 
     let is_icmp_port_unreachable = protocol == IpProtocol::Icmp
         && ip_packet.version() == 4
@@ -149,6 +162,7 @@ fn inspect_ipv4_packet(packet: &[u8], direction: Direction) -> PacketInspection 
         metadata: Ok(PacketMetadata {
             key,
             icmp_echo,
+            icmp_error_echo,
             is_icmp_port_unreachable,
             is_tcp_reset,
         }),
@@ -198,6 +212,7 @@ fn inspect_ipv6_packet(packet: &[u8], direction: Direction) -> PacketInspection 
         metadata: Ok(PacketMetadata {
             key,
             icmp_echo,
+            icmp_error_echo: None,
             is_icmp_port_unreachable,
             is_tcp_reset,
         }),
@@ -242,7 +257,7 @@ fn get_ports(transport: &[u8], protocol: IpProtocol) -> (u16, u16) {
 }
 
 fn get_icmp_echo(transport: &[u8], ipv6: bool) -> Option<IcmpEcho> {
-    if transport.len() < ICMP_ECHO_ID_END {
+    if transport.len() < ICMP_HEADER_LEN {
         return None;
     }
 
@@ -264,7 +279,35 @@ fn get_icmp_echo(transport: &[u8], ipv6: bool) -> Option<IcmpEcho> {
     Some(IcmpEcho {
         is_request,
         identifier: u16::from_be_bytes([transport[4], transport[5]]),
+        sequence: u16::from_be_bytes([transport[6], transport[7]]),
     })
+}
+
+/// Time Exceeded quotes the request's target, not the router that sent the error.
+fn get_icmpv4_error_echo(
+    transport: &[u8],
+    local_address: Ipv4Address,
+) -> Option<(Ipv4Address, u16, u16)> {
+    let quoted = transport.get(ICMP_HEADER_LEN..)?;
+    quoted.get(..IPV4_HEADER_LEN)?;
+    let ip_packet = Ipv4Packet::new_unchecked(quoted);
+    let offset = usize::from(ip_packet.header_len());
+    if ip_packet.version() != 4
+        || offset < IPV4_HEADER_LEN
+        || ip_packet.next_header() != IpProtocol::Icmp
+        || ip_packet.src_addr() != local_address
+        || ip_packet.frag_offset() != 0
+        || usize::from(ip_packet.total_len()) < offset + ICMP_HEADER_LEN
+    {
+        return None;
+    }
+    let echo_header = quoted.get(offset..offset + ICMP_HEADER_LEN)?;
+    let echo = get_icmp_echo(echo_header, false)?;
+    (echo.is_request && echo_header[1] == 0).then_some((
+        ip_packet.dst_addr(),
+        echo.identifier,
+        echo.sequence,
+    ))
 }
 
 fn has_tcp_reset(packet: &[u8], transport_offset: usize) -> bool {
@@ -412,6 +455,30 @@ mod tests {
     }
 
     #[test]
+    fn echo_identity_keeps_sequence_for_ipv4_and_ipv6() {
+        for ipv6 in [false, true] {
+            let mut header = [0u8; ICMP_HEADER_LEN];
+            header[0] = if ipv6 { 128 } else { 8 };
+            header[4..6].copy_from_slice(&1u16.to_be_bytes());
+            for sequence in [0x006fu16, 0x0070] {
+                header[6..8].copy_from_slice(&sequence.to_be_bytes());
+                let echo = get_icmp_echo(&header, ipv6).unwrap();
+                assert!(echo.is_request);
+                assert_eq!(echo.identifier, 1);
+                assert_eq!(echo.sequence, sequence);
+                header[0] = if ipv6 { 129 } else { 0 };
+                let reply = get_icmp_echo(&header, ipv6).unwrap();
+                assert!(!reply.is_request);
+                assert_eq!(reply.sequence, sequence);
+                header[0] = if ipv6 { 128 } else { 8 };
+            }
+            for len in 0..ICMP_HEADER_LEN {
+                assert!(get_icmp_echo(&header[..len], ipv6).is_none());
+            }
+        }
+    }
+
+    #[test]
     fn outbound_loopback_echo_reply_uses_requesters_key() {
         let mut packet = [0u8; IPV4_HEADER_LEN + ICMP_HEADER_LEN];
         packet[0] = 0x45;
@@ -474,6 +541,7 @@ mod tests {
         let echo = IcmpEcho {
             is_request: false,
             identifier: 0x1234,
+            sequence: 0x5678,
         };
         for address in [
             IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1)),
@@ -492,6 +560,98 @@ mod tests {
             };
             assert!(echo.loopback_reply_key(key) == Some(key));
         }
+    }
+
+    fn captured_ipv4_time_exceeded() -> [u8; 56] {
+        // Only the quoted IP/ICMP headers are needed, not the full 92-byte request.
+        [
+            0x45, 0xc0, 0x00, 0x78, 0x6b, 0x70, 0x00, 0x00, 0x40, 0x01, 0xd6, 0xe3, 0xc0, 0xa8,
+            0xdb, 0x0f, 0xc0, 0xa8, 0xdb, 0x10, 0x0b, 0x00, 0xf4, 0xff, 0x00, 0x00, 0x00, 0x00,
+            0x45, 0x00, 0x00, 0x5c, 0x99, 0x23, 0x00, 0x00, 0x01, 0x01, 0x82, 0xc3, 0xc0, 0xa8,
+            0xdb, 0x10, 0x01, 0x01, 0x01, 0x01, 0x08, 0x00, 0xf7, 0x8f, 0x00, 0x01, 0x00, 0x6f,
+        ]
+    }
+
+    #[test]
+    fn time_exceeded_uses_quoted_echo_target_and_identifier() {
+        let packet = captured_ipv4_time_exceeded();
+        let metadata = inspect_packet(&packet, false, Direction::Inbound)
+            .metadata
+            .unwrap();
+        assert_eq!(
+            metadata.icmp_error_echo,
+            Some((Ipv4Address::new(1, 1, 1, 1), 1, 0x006f))
+        );
+        assert_eq!(
+            metadata.key.remote_address,
+            IpAddress::Ipv4(Ipv4Address::new(192, 168, 219, 15))
+        );
+        assert!(metadata.icmp_echo.is_none());
+        assert!(!metadata.is_icmp_port_unreachable);
+        assert!(inspect_packet(&packet, false, Direction::Outbound)
+            .metadata
+            .unwrap()
+            .icmp_error_echo
+            .is_none());
+    }
+
+    #[test]
+    fn time_exceeded_rejects_truncated_and_unrelated_quotes() {
+        let packet = captured_ipv4_time_exceeded();
+        for len in IPV4_HEADER_LEN + 4..packet.len() {
+            assert!(inspect_packet(&packet[..len], false, Direction::Inbound)
+                .metadata
+                .unwrap()
+                .icmp_error_echo
+                .is_none());
+        }
+        for (offset, value) in [
+            (0, 0x65),  // wrong outer IP version
+            (0, 0x44),  // invalid outer IHL
+            (3, 55),    // quote extends beyond declared outer length
+            (20, 8),    // not Time Exceeded
+            (21, 1),    // not TTL exceeded
+            (28, 0x65), // wrong quoted IP version
+            (28, 0x44), // invalid quoted IHL
+            (28, 0x4f), // truncated quoted options
+            (31, 27),   // quoted IP too short for an echo header
+            (35, 1),    // non-initial quoted fragment
+            (37, 17),   // quoted UDP, not ICMP
+            (40, 203),  // quote belongs to another local address
+            (48, 0),    // quoted Echo Reply, not Request
+            (49, 1),    // invalid Echo Request code
+        ] {
+            let mut invalid = packet;
+            invalid[offset] = value;
+            assert!(
+                inspect_packet(&invalid, false, Direction::Inbound)
+                    .metadata
+                    .unwrap()
+                    .icmp_error_echo
+                    .is_none(),
+                "offset {offset}"
+            );
+        }
+    }
+
+    #[test]
+    fn time_exceeded_handles_outer_and_quoted_ipv4_options() {
+        let captured = captured_ipv4_time_exceeded();
+        let mut packet = [0u8; 64];
+        packet[..20].copy_from_slice(&captured[..20]);
+        packet[0] = 0x46;
+        packet[2..4].copy_from_slice(&64u16.to_be_bytes());
+        packet[24..32].copy_from_slice(&captured[20..28]);
+        packet[32..52].copy_from_slice(&captured[28..48]);
+        packet[32] = 0x46;
+        packet[56..64].copy_from_slice(&captured[48..56]);
+        assert_eq!(
+            inspect_packet(&packet, false, Direction::Inbound)
+                .metadata
+                .unwrap()
+                .icmp_error_echo,
+            Some((Ipv4Address::new(1, 1, 1, 1), 1, 0x006f))
+        );
     }
 
     #[test]

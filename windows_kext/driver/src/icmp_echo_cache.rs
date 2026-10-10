@@ -1,4 +1,4 @@
-//! Matches an inbound ICMP echo reply to the process that sent the request.
+//! Matches an inbound ICMP echo reply or quoted error to the request's process.
 //!
 //! An outbound echo request is indicated in the context of the sending thread, so
 //! the packet layer can read the originating process directly. An inbound reply
@@ -10,12 +10,9 @@
 //! So the association has to be carried across by the driver: remember the
 //! outbound request, then look it up when the reply comes back.
 //!
-//! Keyed on (remote address, echo identifier). The identifier is chosen by the
-//! sender and echoed back unchanged, which is exactly what makes it usable here -
-//! it is the only field that ties a reply to one specific sender when several
-//! processes ping the same host. The sequence number is deliberately NOT part of
-//! the key: it increments per request, so keying on it would need one entry per
-//! packet in flight rather than one per session.
+//! Keyed on (remote address, echo identifier, sequence number), all echoed or
+//! quoted unchanged. Windows can use the same identifier across processes, so
+//! the sequence is needed to distinguish their outstanding requests.
 //!
 //! Entries expire. A request that is never answered - unreachable host, dropped
 //! reply - would otherwise occupy its slot forever, and an identifier reused later
@@ -27,13 +24,14 @@ use wdk::rw_spin_lock::RwSpinLock;
 
 /// What a reply is matched against.
 ///
-/// The remote address is the constant of the exchange: the request goes to it and
-/// the reply comes from it. The local address is not part of the key - it can
-/// differ between request and reply on a multi-homed host.
+/// The remote address is the request's target: an echo reply comes from it,
+/// while an ICMP error quotes it. The local address is not part of the key - it
+/// can differ between request and reply on a multi-homed host.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct EchoKey {
     remote_address: IpAddress,
     identifier: u16,
+    sequence: u16,
 }
 
 #[derive(Clone, Copy)]
@@ -58,9 +56,9 @@ const ENTRY_TTL_MS: u64 = 10_000;
 /// bound exists so that a host which never replies cannot grow the map without
 /// limit.
 ///
-/// The data is small: a key is 20 bytes (a smoltcp `IpAddress` is 17 - a
-/// discriminant plus room for a v6 address - and the identifier pads it out) and a
-/// value is 24, so 512 entries carry about 22 KB. Actual pool use is higher, and
+/// The data is small: a key is 22 bytes (a smoltcp `IpAddress` is 17 - a
+/// discriminant plus room for a v6 address - followed by identifier and sequence)
+/// and a value is 24, so 512 entries carry about 23 KB. Actual pool use is higher, and
 /// not by a constant factor: entries sit in `BTreeMap` nodes that hold a fixed
 /// number of slots, stay only part full after a split, and are each a separate
 /// non-paged allocation with its own header. Budget around 40 KB, not 20.
@@ -84,13 +82,13 @@ impl IcmpEchoCache {
 
     /// Records an outbound echo request.
     ///
-    /// A repeated request with the same identifier to the same host overwrites the
-    /// previous entry, which also refreshes its timestamp - that is correct for
-    /// `ping`, where every echo in a run shares one identifier.
+    /// A repeated request with the same identifier and sequence to the same host
+    /// replaces the previous entry and refreshes its timestamp.
     pub fn insert_request(
         &mut self,
         remote_address: IpAddress,
         identifier: u16,
+        sequence: u16,
         process_id: u64,
         thread_id: u64,
     ) {
@@ -104,6 +102,7 @@ impl IcmpEchoCache {
         let key = EchoKey {
             remote_address,
             identifier,
+            sequence,
         };
         let entry = EchoEntry {
             process_id,
@@ -141,6 +140,7 @@ impl IcmpEchoCache {
         &mut self,
         remote_address: IpAddress,
         identifier: u16,
+        sequence: u16,
     ) -> Option<(u64, u64)> {
         // Expiry is checked on read as well as on insert: an entry can sit here
         // long after its TTL if no insert forced a cleanup in between.
@@ -149,6 +149,7 @@ impl IcmpEchoCache {
         let key = EchoKey {
             remote_address,
             identifier,
+            sequence,
         };
 
         let _guard = self.lock.write_lock();

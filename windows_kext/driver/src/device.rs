@@ -130,7 +130,7 @@ pub struct Device {
     pub(crate) udp_endpoint_cache: RwSpinLock<UdpEndpointCache>,
     /// Contexts currently owned by WFP for per-peer UDP ALE flows.
     pub(crate) udp_flow_cache: UdpFlowCache,
-    /// (remote address, echo identifier) -> PID that sent the request.
+    /// (remote address, echo identifier, sequence) -> identity of the request.
     /// An inbound echo reply has no process of its own to read, so it is matched
     /// against the outbound request that caused it.
     pub(crate) icmp_echo_cache: RwSpinLock<IcmpEchoCache>,

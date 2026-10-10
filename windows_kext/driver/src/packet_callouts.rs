@@ -381,8 +381,8 @@ fn ip_packet_layer(
         // layers did not help either: an echo reply is not indicated there at all,
         // because no socket is associated with it.
         //
-        // An inbound echo reply is therefore matched against the request that caused
-        // it, using the identifier the sender chose and the responder echoed back.
+        // An inbound echo reply or quoted error is matched against its request
+        // using the echoed/quoted identifier and sequence number.
         if !transport_protocol {
             match direction {
                 Direction::Outbound => {
@@ -396,7 +396,11 @@ fn ip_packet_layer(
                             let request = echo.loopback_reply_key(key).and_then(|reply_key| {
                                 let mut icmp_echo_cache = device.icmp_echo_cache.write_lock();
                                 icmp_echo_cache
-                                    .take_request_identity(reply_key.remote_address, echo.identifier)
+                                    .take_request_identity(
+                                        reply_key.remote_address,
+                                        echo.identifier,
+                                        echo.sequence,
+                                    )
                                     .map(|identity| (reply_key, identity))
                             });
 
@@ -420,6 +424,7 @@ fn ip_packet_layer(
                                 icmp_echo_cache.insert_request(
                                     key.remote_address,
                                     echo.identifier,
+                                    echo.sequence,
                                     process_id,
                                     thread_id,
                                 );
@@ -435,17 +440,32 @@ fn ip_packet_layer(
                     }
                 }
                 Direction::Inbound => {
-                    // A received echo reply belongs to our original outbound
-                    // request, not to the current receive-processing thread.
-                    if let Some(echo) = packet_metadata.icmp_echo {
-                        if !echo.is_request {
-                            (process_id, thread_id) = {
-                                let mut icmp_echo_cache = device.icmp_echo_cache.write_lock();
-                                icmp_echo_cache
-                                    .take_request_identity(key.remote_address, echo.identifier)
-                                    .unwrap_or((0, 0))
-                            };
-                        }
+                    // Echo replies and Time Exceeded belong to the original
+                    // request, not to the receive-processing thread or router.
+                    let request = packet_metadata
+                        .icmp_error_echo
+                        .map(|(address, identifier, sequence)| {
+                            (
+                                smoltcp::wire::IpAddress::Ipv4(address),
+                                identifier,
+                                sequence,
+                            )
+                        })
+                        .or_else(|| {
+                            let echo = packet_metadata.icmp_echo?;
+                            (!echo.is_request).then_some((
+                                key.remote_address,
+                                echo.identifier,
+                                echo.sequence,
+                            ))
+                        });
+                    if let Some((remote_address, identifier, sequence)) = request {
+                        (process_id, thread_id) = {
+                            let mut icmp_echo_cache = device.icmp_echo_cache.write_lock();
+                            icmp_echo_cache
+                                .take_request_identity(remote_address, identifier, sequence)
+                                .unwrap_or((0, 0))
+                        };
                     }
                 }
             }
