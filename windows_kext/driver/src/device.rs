@@ -995,13 +995,25 @@ impl Device {
     fn enqueue_pending_packet(
         &self,
         pending: PendingPacket,
-        process_id: u64,
-        thread_id: u64,
+        mut process_id: u64,
+        mut thread_id: u64,
         direction: crate::connection::Direction,
         ale_layer: bool,
     ) {
         let key = pending.key;
         let connection_instance_id = pending.connection_instance_id;
+        // Last-resort execution-context attribution for outbound UDP packet events.
+        if !ale_layer
+            && key.protocol == IpProtocol::Udp
+            && matches!(direction, crate::connection::Direction::Outbound)
+        {
+            if process_id == 0 {
+                process_id = wdk::utils::current_process_id();
+            }
+            if thread_id == 0 && !self.is_owner_pid(process_id as u32) {
+                thread_id = wdk::utils::current_thread_id();
+            }
+        }
         let infos = {
             // Connection publication already holds the family map's read guard.
             // Take closure state before the packet cache, matching endpoint-close
