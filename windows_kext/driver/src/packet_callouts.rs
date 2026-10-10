@@ -13,6 +13,7 @@ use crate::connection::{
 use crate::connection_cache::ConnectionCache;
 use crate::connection_map::Key;
 use crate::device::{Device, Packet};
+use crate::packet_metadata::IcmpError;
 use crate::packet_util::{inspect_packet, recalc_header_checksums, Redirect};
 
 struct PacketLayerFields {
@@ -381,11 +382,11 @@ fn ip_packet_layer(
         // layers did not help either: an echo reply is not indicated there at all,
         // because no socket is associated with it.
         //
-        // An inbound echo reply or quoted error is matched against its request
-        // using the echoed/quoted identifier and sequence number.
+        // Inbound errors use the quoted TCP/UDP tuple or echo identity; echo
+        // replies use their identifier and sequence number.
         if !transport_protocol {
             match direction {
-                Direction::Outbound => {
+                Direction::Outbound if !packet_metadata.is_local_icmp_error => {
                     if let Some(echo) = packet_metadata.icmp_echo {
                         if !echo.is_request {
                             // WFP reports a loopback reply as OUTBOUND, so its source
@@ -439,26 +440,51 @@ fn ip_packet_layer(
                         process_id = 0;
                     }
                 }
-                Direction::Inbound => {
-                    // Echo replies and Time Exceeded belong to the original
-                    // request, not to the receive-processing thread or router.
-                    let request = packet_metadata
-                        .icmp_error_echo
-                        .map(|(address, identifier, sequence)| {
-                            (
-                                smoltcp::wire::IpAddress::Ipv4(address),
-                                identifier,
-                                sequence,
-                            )
-                        })
-                        .or_else(|| {
-                            let echo = packet_metadata.icmp_echo?;
-                            (!echo.is_request).then_some((
-                                key.remote_address,
-                                echo.identifier,
-                                echo.sequence,
-                            ))
-                        });
+                _ => {
+                    // Attribute only: the outer ICMP key, verdict and lifetime
+                    // must not become those of the quoted connection.
+                    let request = match packet_metadata.icmp_error {
+                        Some(IcmpError::Transport(
+                            protocol,
+                            remote_address,
+                            local_port,
+                            remote_port,
+                        )) => {
+                            let quoted_key = Key {
+                                protocol,
+                                local_address: key.local_address,
+                                local_port,
+                                remote_address,
+                                remote_port,
+                            };
+                            // The error can arrive after the sending endpoint closed.
+                            let cache = &device.connection_cache;
+                            (process_id, thread_id) = if ipv6 {
+                                let identity = |conn: &ConnectionV6| {
+                                    Some((conn.get_process_id(), conn.thread_id))
+                                };
+                                cache.read_connection_v6(&quoted_key, identity).or_else(|| {
+                                    cache.read_ended_connection_v6(&quoted_key, identity)
+                                })
+                            } else {
+                                let identity = |conn: &ConnectionV4| {
+                                    Some((conn.get_process_id(), conn.thread_id))
+                                };
+                                cache.read_connection_v4(&quoted_key, identity).or_else(|| {
+                                    cache.read_ended_connection_v4(&quoted_key, identity)
+                                })
+                            }
+                            .unwrap_or((0, 0));
+                            None
+                        }
+                        Some(IcmpError::Echo(address, identifier, sequence)) => {
+                            Some((address, identifier, sequence))
+                        }
+                        None => packet_metadata
+                            .icmp_echo
+                            .filter(|echo| !echo.is_request)
+                            .map(|echo| (key.remote_address, echo.identifier, echo.sequence)),
+                    };
                     if let Some((remote_address, identifier, sequence)) = request {
                         (process_id, thread_id) = {
                             let mut icmp_echo_cache = device.icmp_echo_cache.write_lock();
@@ -624,6 +650,10 @@ fn ip_packet_layer(
             }
         };
 
+        // Preserve outbound reinjection; only userspace sees a local error as inbound.
+        if packet_metadata.is_local_icmp_error {
+            effective_direction = Direction::Inbound;
+        }
         if let Some(pending) = device.publish_pending_packet(
             (key, packet),
             connection_instance_id,
