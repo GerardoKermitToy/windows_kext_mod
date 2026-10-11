@@ -17,6 +17,8 @@ pub mod interface;
 pub mod ioqueue;
 pub mod irp_helpers;
 pub mod passive_mutex;
+#[cfg(feature = "perf-etw")]
+pub mod perf;
 pub mod rw_spin_lock;
 pub mod utils;
 

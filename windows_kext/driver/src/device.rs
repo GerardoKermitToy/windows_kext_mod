@@ -270,10 +270,17 @@ impl Device {
     /// not be pended. Reset the filters before consuming that marker so an IRQL
     /// failure cannot strand its packet after ownership has left the cache.
     fn inject_verdict_packet(&self, packet: Packet, blocked: bool) -> Result<(), String> {
+        #[cfg(feature = "perf-etw")]
+        let mut perf_span = wdk::perf::Span::new(wdk::perf::Operation::Inject, blocked as u64);
+        #[cfg(feature = "perf-etw")]
+        perf_span.set_result(1, 0);
         if packet.requires_reauthorization() {
             self.reset_filters_for_defer()?;
         }
-        self.inject_packet(packet, blocked)
+        let result = self.inject_packet(packet, blocked);
+        #[cfg(feature = "perf-etw")]
+        perf_span.set_result(result.is_err() as u64, 0);
+        result
     }
 
     fn write_buffer(read_request: &mut ReadRequest, info: Info, read_stream: &mut ArrayHolder) {
@@ -301,6 +308,11 @@ impl Device {
 
     /// Called when handle. Read is called from user-space.
     pub fn read(&self, read_request: &mut ReadRequest) -> NTSTATUS {
+        #[cfg(feature = "perf-etw")]
+        let _perf_span = wdk::perf::Span::new(
+            wdk::perf::Operation::Read,
+            read_request.free_space() as u64,
+        );
         // Keep one exclusive owner across the entire operation. Locking only the
         // individual load/save calls permits two overlapped reads to consume the
         // same logical stream concurrently and overwrite each other's fragment.
@@ -421,6 +433,10 @@ impl Device {
                     err!("Failed to decode Verdict command");
                     return Err(STATUS_INVALID_PARAMETER);
                 };
+                #[cfg(feature = "perf-etw")]
+                let mut perf_span = wdk::perf::Span::new(wdk::perf::Operation::Verdict, verdict.id);
+                #[cfg(feature = "perf-etw")]
+                perf_span.set_result(verdict.verdict as u64, 3);
                 let Some(action): Option<crate::connection::Verdict> =
                     FromPrimitive::from_u8(verdict.verdict)
                 else {
@@ -430,6 +446,8 @@ impl Device {
                     return Err(STATUS_INVALID_PARAMETER);
                 };
 
+                #[cfg(feature = "perf-etw")]
+                perf_span.set_result(verdict.verdict as u64, 0);
                 wdk::dbg!("Verdict command");
                 // Received verdict decision for a specific connection.
                 let (packet, issued_id) = {
@@ -442,8 +460,18 @@ impl Device {
                     key,
                     mut packet,
                     connection_instance_id,
+                    #[cfg(feature = "perf-etw")]
+                    perf_stamp,
                 }) = packet
                 {
+                    #[cfg(feature = "perf-etw")]
+                    wdk::perf::request_received(
+                        verdict.id,
+                        perf_stamp,
+                        u8::from(key.protocol),
+                        if matches!(key.local_address, IpAddress::Ipv4(_)) { 4 } else { 6 },
+                        verdict.verdict,
+                    );
                     let _request_guard = PendingRequestGuard {
                         device: self,
                         id: verdict.id,
@@ -477,6 +505,8 @@ impl Device {
                                 None
                             }
                             None => {
+                                #[cfg(feature = "perf-etw")]
+                                perf_span.set_result(verdict.verdict as u64, 4);
                                 dbg!(
                                     "discarding stale verdict for ended connection instance {}: {}",
                                     instance_id,
@@ -535,11 +565,15 @@ impl Device {
                         }
                     }
                 } else if issued_id {
+                    #[cfg(feature = "perf-etw")]
+                    perf_span.set_result(verdict.verdict as u64, 1);
                     // A socket can close before userspace reads CONN or sends its
                     // verdict. Resource release already completed the pending ALE
                     // operation; do not retain it or treat the late reply as an error.
                     dbg!("ignoring verdict for completed request id: {}", verdict.id);
                 } else {
+                    #[cfg(feature = "perf-etw")]
+                    perf_span.set_result(verdict.verdict as u64, 2);
                     let id = verdict.id;
                     err!("Verdict invalid id: {}", id);
                 }
@@ -727,6 +761,8 @@ impl Device {
                 crate::err!("ICMP echo cache: {} entries", icmp_echo_entries);
             }
             CommandType::CleanEndedConnections => {
+                #[cfg(feature = "perf-etw")]
+                let _perf_span = wdk::perf::Span::new(wdk::perf::Operation::Cleanup, 0);
                 wdk::dbg!("CleanEndedConnections command");
                 self.connection_cache.clean_ended_connections();
                 // An outbound packet-layer fallback has no native endpoint identity
@@ -969,6 +1005,9 @@ impl Device {
             key: value.0,
             packet: value.1,
             connection_instance_id,
+            // The sampled timestamp is assigned after the verdict ID is allocated.
+            #[cfg(feature = "perf-etw")]
+            perf_stamp: wdk::perf::RequestStamp::default(),
         };
 
         if let Some(instance_id) = connection_instance_id {

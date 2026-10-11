@@ -398,6 +398,11 @@ unsafe extern "system" fn catch_all_callout(
                 )
             }
         };
+        #[cfg(feature = "perf-etw")]
+        let mut perf_span = crate::perf::Span::new(
+            crate::perf::Operation::Classify,
+            fixed_values.layer_id as u64,
+        );
         let data = CalloutData::from_parts(CalloutDataParts {
             layer: callout.layer,
             layer_id: fixed_values.layer_id,
@@ -412,5 +417,10 @@ unsafe extern "system" fn catch_all_callout(
         });
         // Call the defined function.
         (callout.callout_fn)(data);
+        #[cfg(feature = "perf-etw")]
+        {
+            let (action, flags) = classify_out.perf_result();
+            perf_span.set_result(action, flags);
+        }
     }
 }

@@ -91,6 +91,11 @@ impl ClassifyOut {
         self.flags & FWPS_CLASSIFY_OUT_FLAG_ABSORB != 0
     }
 
+    #[cfg(feature = "perf-etw")]
+    pub(super) fn perf_result(&self) -> (u64, u64) {
+        (self.action_type as u64, self.flags as u64)
+    }
+
     // Checks if write action flag is set. Indicates if the callout can change the action.
     pub fn can_set_action(&self) -> bool {
         self.rights & FWPS_RIGHT_ACTION_WRITE > 0

@@ -12,6 +12,7 @@ crate-type = ["staticlib"]
 
 [features]
 udp-lifecycle-diagnostics = []
+perf-etw = ["wdk/perf-etw"]
 
 [dependencies]
 wdk = { path = "../wdk" }

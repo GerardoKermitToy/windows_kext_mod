@@ -133,6 +133,8 @@ pub struct PendingPacket {
     /// Exact live connection that queued this packet. Protocols without
     /// connection state (for example ICMP) deliberately leave this unset.
     pub connection_instance_id: Option<u64>,
+    #[cfg(all(feature = "perf-etw", not(test)))]
+    pub perf_stamp: wdk::perf::RequestStamp,
 }
 
 pub struct IdCache {
@@ -488,6 +490,8 @@ fn push_packet(
     context: PendingContext,
 ) -> Option<(u64, Info)> {
     let id = *next_id;
+    #[cfg(feature = "perf-etw")]
+    let perf_stamp = wdk::perf::request_queued(id, context.process_id);
     let info = build_info(
         &context.key,
         id,
@@ -501,6 +505,8 @@ fn push_packet(
             key: context.key,
             packet,
             connection_instance_id: context.connection_instance_id,
+            #[cfg(feature = "perf-etw")]
+            perf_stamp,
         },
         id,
     });

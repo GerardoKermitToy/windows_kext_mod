@@ -420,6 +420,12 @@ pub unsafe extern "system" fn driver_entry(
         return windows_sys::Win32::Foundation::STATUS_FAILED_DRIVER_ENTRY;
     }
 
+    #[cfg(feature = "perf-etw")]
+    if let Err(status) = wdk::perf::register() {
+        // Profiling is diagnostic-only and must not prevent normal filtering.
+        err!("ETW performance provider registration failed: NTSTATUS({:#010x})", status as u32);
+    }
+
     if !wdk::callback_barrier::CALLBACK_BARRIER.activate() {
         // No callback was granted Device access, but committed WFP state and any
         // PREPARED bypass callback must still be synchronously drained.
@@ -436,6 +442,8 @@ pub unsafe extern "system" fn driver_entry(
                 drop(Box::from_raw(published));
             }
         }
+        #[cfg(feature = "perf-etw")]
+        wdk::perf::unregister();
         wdk::err!("driver_entry: failed to activate callback barrier");
         return windows_sys::Win32::Foundation::STATUS_FAILED_DRIVER_ENTRY;
     }
@@ -511,6 +519,9 @@ unsafe extern "system" fn driver_unload(_driver: windows_sys::Win32::Foundation:
             drop(Box::from_raw(ptr));
         }
     }
+    // Device destruction also drains the asynchronous injection handles.
+    #[cfg(feature = "perf-etw")]
+    wdk::perf::unregister();
 }
 
 /// driver_create is triggered when user-space opens a handle to the device (CreateFile).
