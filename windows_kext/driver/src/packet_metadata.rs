@@ -19,6 +19,7 @@ const TCP_RST_FLAG: u8 = 0x04;
 pub(crate) enum PacketMetadataError {
     UnreadablePacket,
     UnresolvedIpv6Headers,
+    FragmentRequiresReassembly,
 }
 
 impl fmt::Display for PacketMetadataError {
@@ -26,6 +27,7 @@ impl fmt::Display for PacketMetadataError {
         formatter.write_str(match self {
             Self::UnreadablePacket => "failed to get net_buffer data",
             Self::UnresolvedIpv6Headers => "IPv6 extension header chain did not resolve",
+            Self::FragmentRequiresReassembly => "IP fragment requires reassembly",
         })
     }
 }
@@ -80,26 +82,39 @@ impl PacketInspection {
     }
 }
 
-/// Parses every field needed by the packet callout from one bounded prefix.
-///
-/// Fragment state is returned independently from the remaining metadata. This
-/// preserves the packet-layer rule that an identifiable individual fragment is
-/// permitted even when it is too short to produce a connection key.
-pub(crate) fn inspect_packet(packet: &[u8], ipv6: bool, direction: Direction) -> PacketInspection {
+/// Parses the packet callout's metadata from one bounded prefix. When the first
+/// NBL can bypass policy as an individual fragment, stop before parsing its key
+/// or transport fields; reassembled indications still need that metadata.
+pub(crate) fn inspect_packet(
+    packet: &[u8],
+    ipv6: bool,
+    direction: Direction,
+    permit_fragments: bool,
+) -> PacketInspection {
     if ipv6 {
-        inspect_ipv6_packet(packet, direction)
+        inspect_ipv6_packet(packet, direction, permit_fragments)
     } else {
-        inspect_ipv4_packet(packet, direction)
+        inspect_ipv4_packet(packet, direction, permit_fragments)
     }
 }
 
-fn inspect_ipv4_packet(packet: &[u8], direction: Direction) -> PacketInspection {
+fn inspect_ipv4_packet(
+    packet: &[u8],
+    direction: Direction,
+    permit_fragments: bool,
+) -> PacketInspection {
     if packet.len() < IPV4_HEADER_LEN {
         return PacketInspection::unreadable();
     }
 
     let ip_packet = Ipv4Packet::new_unchecked(packet);
     let is_fragment = ip_packet.frag_offset() != 0 || ip_packet.more_frags();
+    if permit_fragments && is_fragment {
+        return PacketInspection {
+            is_fragment,
+            metadata: Err(PacketMetadataError::FragmentRequiresReassembly),
+        };
+    }
 
     // Preserve the existing key contract: four bytes beyond the base header
     // must be readable even for a protocol that does not use ports.
@@ -163,13 +178,23 @@ fn inspect_ipv4_packet(packet: &[u8], direction: Direction) -> PacketInspection 
     }
 }
 
-fn inspect_ipv6_packet(packet: &[u8], direction: Direction) -> PacketInspection {
+fn inspect_ipv6_packet(
+    packet: &[u8],
+    direction: Direction,
+    permit_fragments: bool,
+) -> PacketInspection {
     if packet.len() < IPV6_HEADER_LEN {
         return PacketInspection::unreadable();
     }
 
     let ip_packet = Ipv6Packet::new_unchecked(packet);
     let headers = walk_ipv6_headers(packet);
+    if permit_fragments && headers.is_fragment {
+        return PacketInspection {
+            is_fragment: true,
+            metadata: Err(PacketMetadataError::FragmentRequiresReassembly),
+        };
+    }
     if !headers.resolved {
         return PacketInspection {
             is_fragment: headers.is_fragment,
@@ -382,6 +407,66 @@ mod tests {
         ICMPV6_CODE_DU_PORT_UNREACHABLE, ICMPV6_TYPE_DESTINATION_UNREACHABLE,
     };
     use smoltcp::wire::{Ipv4Address, Ipv6Address};
+
+    fn inspect_packet(packet: &[u8], ipv6: bool, direction: Direction) -> PacketInspection {
+        super::inspect_packet(packet, ipv6, direction, false)
+    }
+
+    #[test]
+    fn fragment_bypass_skips_metadata_only_for_individual_fragments() {
+        for ipv6 in [false, true] {
+            let mut packet = [0u8; IPV6_HEADER_LEN + 8 + 20];
+            let transport_offset = if ipv6 {
+                packet[0] = 0x60;
+                packet[4..6].copy_from_slice(&28u16.to_be_bytes());
+                packet[6] = u8::from(IpProtocol::Ipv6Frag);
+                packet[40] = u8::from(IpProtocol::Tcp);
+                IPV6_HEADER_LEN + 8
+            } else {
+                packet[0] = 0x45;
+                packet[2..4].copy_from_slice(&40u16.to_be_bytes());
+                packet[9] = u8::from(IpProtocol::Tcp);
+                IPV4_HEADER_LEN
+            };
+            packet[transport_offset..transport_offset + 2]
+                .copy_from_slice(&50_000u16.to_be_bytes());
+            packet[transport_offset + 2..transport_offset + 4]
+                .copy_from_slice(&443u16.to_be_bytes());
+            packet[transport_offset + TCP_FLAGS_OFFSET] = TCP_RST_FLAG;
+
+            for fragmented in [false, true] {
+                if ipv6 {
+                    packet[43] = u8::from(fragmented);
+                } else {
+                    packet[6] = if fragmented { 0x20 } else { 0 };
+                }
+                for direction in [Direction::Outbound, Direction::Inbound] {
+                    let inspected = super::inspect_packet(&packet, ipv6, direction, true);
+                    assert_eq!(inspected.is_fragment, fragmented);
+                    let full = inspect_packet(&packet, ipv6, direction).metadata.unwrap();
+                    assert!(full.is_tcp_reset);
+                    assert_eq!(
+                        full.key.local_port,
+                        if matches!(direction, Direction::Outbound) {
+                            50_000
+                        } else {
+                            443
+                        }
+                    );
+                    if fragmented {
+                        assert!(matches!(
+                            inspected.metadata,
+                            Err(PacketMetadataError::FragmentRequiresReassembly)
+                        ));
+                    } else {
+                        let metadata = inspected.metadata.unwrap();
+                        assert!(metadata.key == full.key);
+                        assert_eq!(metadata.is_tcp_reset, full.is_tcp_reset);
+                    }
+                }
+            }
+        }
+    }
 
     fn set_ipv4_endpoints(packet: &mut [u8]) {
         packet[12..16].copy_from_slice(&[192, 0, 2, 1]);

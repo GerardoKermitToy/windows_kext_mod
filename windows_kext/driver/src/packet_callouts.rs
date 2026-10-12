@@ -176,82 +176,16 @@ fn ip_packet_layer(
     // WFP owns this NBL chain for the complete callback, and every yielded wrapper
     // remains inside it.
     let mut nbls = unsafe { NetBufferListIter::new(layer_data as _) };
-    let Some(mut first_nbl) = nbls.next() else {
+    let Some(first_nbl) = nbls.next() else {
         return;
     };
-
-    // Only inbound buffers need the IP-header size. Routing metadata is read
-    // lazily below, once per indication, if any packet actually needs a clone.
-    let wfp_ip_header_size = if inbound {
-        data.get_ip_header_size()
-    } else {
-        None
-    };
-    let reassembled = data.is_reassembled(fields.flags);
-
-    // A fragmented datagram is indicated twice at this layer: once per individual
-    // fragment, and once more as the reassembled whole (verified on Windows 11:
-    // the reassembled indication carries FWP_CONDITION_FLAG_IS_REASSEMBLED and the
-    // full 3028-byte length, while the fragments carry only 1500).
-    //
-    // Only the reassembled indication has a usable transport header. Individual
-    // fragments other than the first begin directly with payload bytes, so reading
-    // ports at the transport offset returns payload data - that is where the bogus
-    // `0 -> 0` connection keys came from.
-    //
-    // Inspect the first NBL once and retain both its retreat and parsed metadata for
-    // the main loop. Previously the fragment pass restored the inbound data offset,
-    // then the normal pass retreated and read the same header again.
-    let mut first_retreated = false;
-    let mut first_inspection = None;
-    if !reassembled {
-        if !inbound {
-            let inspection = inspect_packet(&first_nbl, ipv6, direction);
-            if inspection.is_fragment {
-                data.action_permit();
-                return;
-            }
-            if inspection.metadata.is_ok() {
-                first_inspection = Some(inspection);
-            }
-        } else {
-            match retreat_to_ip_header(&mut first_nbl, ipv6, wfp_ip_header_size) {
-                Ok(()) => {
-                    first_retreated = true;
-                    let inspection = inspect_packet(&first_nbl, ipv6, direction);
-                    if inspection.is_fragment {
-                        data.action_permit();
-                        return;
-                    }
-                    if inspection.metadata.is_ok() {
-                        first_inspection = Some(inspection);
-                    }
-                }
-                Err(err) => {
-                    // Preserve the self-injection bypass below. A non-self packet
-                    // gets the same second retreat attempt the old normal pass made.
-                    crate::err!("failed to retreat packet to IP header: {}", err);
-                }
-            }
-        }
-    }
 
     let Some(device) = crate::entry::get_device() else {
         return;
     };
 
-    // Portmaster's own local redirect traffic is an unconditional permit. Its
-    // already parsed first packet does not need the comparatively expensive WFP
-    // injection-state query.
-    if let Some(metadata) = first_inspection.and_then(|inspection| inspection.metadata.ok()) {
-        if fast_track_pm_packets(&metadata.key) {
-            data.action_permit();
-            return;
-        }
-    }
-
-    // SAFETY: The WFP-owned layer data is still live. The synchronous query
-    // does not depend on the first net buffer's data offset.
+    // Self-injected packets need no header reads, parsing or inbound retreat.
+    // SAFETY: WFP owns the live NBL for this entire synchronous query.
     let network_injection_origin = unsafe {
         device
             .injector
@@ -279,37 +213,53 @@ fn ip_packet_layer(
         }
         PacketInjectionAction::Process { injected_by_other } => injected_by_other,
     };
+    let wfp_ip_header_size = if inbound {
+        data.get_ip_header_size()
+    } else {
+        None
+    };
+    let reassembled = data.is_reassembled(fields.flags);
     let mut routing_info = None;
     let mut other_injector_process_id = None;
 
     let mut first = true;
     for mut nbl in core::iter::once(first_nbl).chain(nbls) {
-        let inspection = if first {
-            first = false;
-            if inbound && !first_retreated {
-                // The first fragment probe can fail its retreat. Retry here after
-                // the self-injection check, matching the previous two-pass path.
-                if let Err(err) = retreat_to_ip_header(&mut nbl, ipv6, wfp_ip_header_size) {
-                    crate::err!("failed to retreat packet to IP header: {}", err);
-                    return;
+        let permit_fragments = first && !reassembled;
+        if inbound {
+            // At inbound packet layers the current offset follows the IP header.
+            // The wrapper restores it automatically when this iteration ends.
+            let retreat = retreat_to_ip_header(&mut nbl, ipv6, wfp_ip_header_size).or_else(|err| {
+                if !permit_fragments {
+                    return Err(err);
                 }
+                // Preserve the old first-probe retry, but only after an actual failure.
+                crate::err!("failed to retreat packet to IP header: {}", err);
+                retreat_to_ip_header(&mut nbl, ipv6, wfp_ip_header_size)
+            });
+            if let Err(err) = retreat {
+                crate::err!("failed to retreat packet to IP header: {}", err);
+                return;
             }
-            first_inspection
-                .take()
-                .unwrap_or_else(|| inspect_packet(&nbl, ipv6, direction))
-        } else {
-            if inbound {
-                // At inbound packet layers the current offset follows the IP header.
-                // The wrapper restores it automatically when this iteration ends.
-                if let Err(err) = retreat_to_ip_header(&mut nbl, ipv6, wfp_ip_header_size) {
-                    crate::err!("failed to retreat packet to IP header: {}", err);
-                    return;
-                }
-            }
-            inspect_packet(&nbl, ipv6, direction)
-        };
+        }
+        let inspection = inspect_packet(&nbl, ipv6, direction, permit_fragments);
+        // Individual fragments bypass transport parsing and reach reassembly.
+        // Preserve the indication-wide bypass based on the first NBL.
+        if permit_fragments && inspection.is_fragment {
+            data.action_permit();
+            return;
+        }
+        first = false;
 
-        let packet_metadata = match inspection.metadata {
+        // A failed first probe used to retry on the normal pass. Keep that chance
+        // for transient NDIS materialization failures without rereading on success.
+        let metadata = inspection.metadata.or_else(|err| {
+            if permit_fragments {
+                inspect_packet(&nbl, ipv6, direction, false).metadata
+            } else {
+                Err(err)
+            }
+        });
+        let packet_metadata = match metadata {
             Ok(metadata) => metadata,
             Err(err) => {
                 crate::err!("failed to get key from nbl: {}", err);

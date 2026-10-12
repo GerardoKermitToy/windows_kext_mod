@@ -282,6 +282,7 @@ pub(crate) fn inspect_packet(
     nbl: &NetBufferList,
     ipv6: bool,
     direction: Direction,
+    permit_fragments: bool,
 ) -> PacketInspection {
     // The IPv4 fallback reaches the TCP flags byte with a base-sized header and
     // also covers the complete ICMP header. IPv6 extension parsing retains its
@@ -296,7 +297,7 @@ pub(crate) fn inspect_packet(
     // only parses bytes into owned metadata; it cannot mutate or release the packet.
     unsafe {
         nbl.inspect_bytes_up_to::<MAX_PACKET_INSPECT_LEN, _>(fallback_length, |packet| {
-            inspect_packet_bytes(packet, ipv6, direction)
+            inspect_packet_bytes(packet, ipv6, direction, permit_fragments)
         })
     }
     .unwrap_or_else(|()| PacketInspection::unreadable())
