@@ -50,18 +50,37 @@ fn get_monotonic_timestamp_ms() -> u64 {
     }
 }
 
-/// Returns true if `remote_port` is a port that `redirect_equals` can match on.
+/// Returns true if redirect lookup is enabled for `remote_port`.
 ///
 /// Every arm of `redirect_equals` rejects the key unless its remote port equals
-/// the port belonging to that redirect verdict, so a key with any other remote
-/// port cannot match a redirected connection at all. `ConnectionMap::read` uses
-/// this to skip the linear redirect scan entirely, which is what keeps the
-/// binary-searched lookup path from degrading to O(n) on every miss.
+/// the port belonging to that redirect verdict. When IgnoreSpecialPorts is set,
+/// these ports use exact lookup only. `ConnectionMap::read` uses this to skip the
+/// linear redirect scan, keeping ordinary misses off the O(n) path.
 ///
 /// Keep in sync with `redirect_equals`: a new redirect verdict needs its port
 /// added here, or connections carrying it will never be found.
+#[inline]
 pub fn is_redirect_port(remote_port: u16) -> bool {
-    remote_port == PM_DNS_PORT || remote_port == PM_SPN_PORT || remote_port == PM_SPLIT_TUN_PORT
+    is_redirect_port_with_setting(remote_port, crate::registry_settings::ignore_special_ports)
+}
+
+#[inline]
+fn is_redirect_port_with_setting(port: u16, ignore_special_ports: impl FnOnce() -> bool) -> bool {
+    matches!(port, PM_DNS_PORT | PM_SPN_PORT | PM_SPLIT_TUN_PORT) && !ignore_special_ports()
+}
+
+#[inline]
+pub(crate) fn fast_track_pm_packets(key: &Key) -> bool {
+    fast_track_pm_packets_with_setting(key, crate::registry_settings::ignore_special_ports)
+}
+
+#[inline]
+fn fast_track_pm_packets_with_setting(
+    key: &Key,
+    ignore_special_ports: impl FnOnce() -> bool,
+) -> bool {
+    key.local_address == key.remote_address
+        && is_redirect_port_with_setting(key.local_port, ignore_special_ports)
 }
 
 // Make sure this in sync with the Go version
@@ -706,6 +725,97 @@ impl Clone for ConnectionV6 {
                 self.last_accessed_timestamp.load(Ordering::Relaxed),
             ),
             extra: self.extra.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        fast_track_pm_packets, fast_track_pm_packets_with_setting, is_redirect_port,
+        is_redirect_port_with_setting, PM_DNS_PORT, PM_SPLIT_TUN_PORT, PM_SPN_PORT,
+    };
+    use crate::connection_map::Key;
+    use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Address, Ipv6Address};
+
+    #[test]
+    fn special_ports_keep_redirect_lookup_when_setting_is_off() {
+        for port in [PM_DNS_PORT, PM_SPN_PORT, PM_SPLIT_TUN_PORT] {
+            assert!(is_redirect_port(port));
+            assert!(is_redirect_port_with_setting(port, || false));
+        }
+    }
+
+    #[test]
+    fn special_ports_skip_redirect_lookup_when_setting_is_on() {
+        for port in [PM_DNS_PORT, PM_SPN_PORT, PM_SPLIT_TUN_PORT] {
+            assert!(!is_redirect_port_with_setting(port, || true));
+        }
+    }
+
+    #[test]
+    fn ordinary_ports_do_not_read_setting() {
+        for port in [0, 52, 54, 716, 718, 720, 12345, u16::MAX] {
+            assert!(!is_redirect_port_with_setting(port, || {
+                panic!("ordinary ports must not read the setting")
+            }));
+        }
+    }
+
+    #[test]
+    fn fast_track_requires_local_special_port_and_equal_addresses() {
+        for (local, remote) in [
+            (
+                IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1)),
+                IpAddress::Ipv4(Ipv4Address::new(192, 0, 2, 1)),
+            ),
+            (
+                IpAddress::Ipv6(Ipv6Address::LOOPBACK),
+                IpAddress::Ipv6(Ipv6Address::from_bytes(&[
+                    0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                ])),
+            ),
+        ] {
+            for port in [PM_DNS_PORT, PM_SPN_PORT, PM_SPLIT_TUN_PORT] {
+                let mut key = Key {
+                    protocol: IpProtocol::Udp,
+                    local_address: local,
+                    local_port: port,
+                    remote_address: local,
+                    remote_port: 40000,
+                };
+                assert!(fast_track_pm_packets(&key));
+                assert!(fast_track_pm_packets_with_setting(&key, || false));
+                key.remote_address = remote;
+                assert!(!fast_track_pm_packets_with_setting(&key, || {
+                    panic!("non-local traffic must not read the setting")
+                }));
+                key.remote_address = local;
+                key.local_port = 40000;
+                key.remote_port = port;
+                assert!(!fast_track_pm_packets_with_setting(&key, || false));
+            }
+        }
+    }
+
+    #[test]
+    fn ignore_special_ports_disables_fast_track_for_both_families() {
+        for address in [
+            IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1)),
+            IpAddress::Ipv6(Ipv6Address::LOOPBACK),
+        ] {
+            for protocol in [IpProtocol::Tcp, IpProtocol::Udp] {
+                for port in [PM_DNS_PORT, PM_SPN_PORT, PM_SPLIT_TUN_PORT] {
+                    let key = Key {
+                        protocol,
+                        local_address: address,
+                        local_port: port,
+                        remote_address: address,
+                        remote_port: 40000,
+                    };
+                    assert!(!fast_track_pm_packets_with_setting(&key, || true));
+                }
+            }
         }
     }
 }

@@ -242,9 +242,9 @@ bool Driver::Install(const std::wstring& sys_path, std::string& error,
     }
     service_created_ = true;
 
-    // Publish the selected packet-layer inbound UDP attribution setting before
-    // the driver's initial registry read. A failed write must not start it with a
-    // stale/default setting; the existing service_created_ cleanup still applies.
+    // Publish settings before the driver's initial registry read. A failed write
+    // must not start it with stale/default settings; the existing service_created_
+    // cleanup still applies.
     const std::wstring parameters_path =
         L"SYSTEM\\CurrentControlSet\\Services\\" + service_name_ + L"\\Parameters";
     HKEY parameters = nullptr;
@@ -260,9 +260,19 @@ bool Driver::Install(const std::wstring& sys_path, std::string& error,
     registry_status = RegSetValueExW(
         parameters, L"EnableInboundUdpCacheMissPidFallback", 0, REG_DWORD,
         reinterpret_cast<const BYTE*>(&enabled), sizeof(enabled));
+    if (registry_status != ERROR_SUCCESS) {
+        RegCloseKey(parameters);
+        error = "RegSetValueEx for inbound UDP PID fallback failed: " + LastErrorText(registry_status);
+        CloseServiceHandle(service);
+        return false;
+    }
+    const DWORD ignore_special_ports = 1;
+    registry_status = RegSetValueExW(
+        parameters, L"IgnoreSpecialPorts", 0, REG_DWORD,
+        reinterpret_cast<const BYTE*>(&ignore_special_ports), sizeof(ignore_special_ports));
     RegCloseKey(parameters);
     if (registry_status != ERROR_SUCCESS) {
-        error = "RegSetValueEx for inbound UDP PID fallback failed: " + LastErrorText(registry_status);
+        error = "RegSetValueEx for IgnoreSpecialPorts failed: " + LastErrorText(registry_status);
         CloseServiceHandle(service);
         return false;
     }

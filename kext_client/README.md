@@ -43,6 +43,18 @@ writes `1` again. The driver reads the setting once at load; changing the regist
 while it is running does not change its behavior. See
 [the driver setting documentation](../windows_kext/INBOUND_UDP_PID_FALLBACK.md).
 
+## Special ports
+
+The monitor always writes `IgnoreSpecialPorts=1` as a `REG_DWORD` in
+`HKLM\SYSTEM\CurrentControlSet\Services\PortmasterKext\Parameters` before starting
+it. Ports `PM_DNS_PORT`, `PM_SPN_PORT`, and `PM_SPLIT_TUN_PORT` then use normal
+connection processing instead of the driver's port-based special handling. This
+is independent of `--no-inbound-udp-pid-fallback` and has no monitor opt-out flag.
+
+The driver reads this value once at load. When started by another controller,
+an absent/invalid value or any DWORD other than `1` preserves special handling.
+See [the driver setting documentation](../windows_kext/IGNORE_SPECIAL_PORTS.md).
+
 ## Connection thread IDs
 
 Displayed `CONN` records include `tid=...`. The monitor queries the driver's

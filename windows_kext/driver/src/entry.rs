@@ -381,7 +381,7 @@ pub unsafe extern "system" fn driver_entry(
         }
     };
 
-    // Read the setting once before any packet classification. Registry changes
+    // Read the settings once before any packet classification. Registry changes
     // take effect only after the driver is loaded again.
     if let Err(status) = unsafe { crate::registry_settings::initialize(registry_path) } {
         DISPATCH_GATE.close();

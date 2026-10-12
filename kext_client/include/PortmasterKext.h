@@ -176,7 +176,8 @@ public:
     // Installs a new demand-start kernel service and starts it. Fails if a
     // PortmasterKext service already exists instead of taking ownership of an
     // independently managed driver instance. sys_path must be absolute.
-    // Writes the inbound UDP cache-miss PID fallback setting before driver startup.
+    // Writes the inbound UDP cache-miss PID fallback setting and IgnoreSpecialPorts=1
+    // before driver startup.
     bool Install(const std::wstring& sys_path, std::string& error,
                  bool inbound_udp_pid_fallback = true);
 

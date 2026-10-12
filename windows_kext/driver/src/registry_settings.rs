@@ -2,11 +2,18 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use windows_sys::Win32::System::Registry::REG_DWORD;
 
 static INBOUND_UDP_PID_FALLBACK_ENABLED: AtomicBool = AtomicBool::new(false);
+static IGNORE_SPECIAL_PORTS: AtomicBool = AtomicBool::new(false);
 
 /// The value is read once during DriverEntry and stays fixed until driver unload.
 #[inline]
 pub(crate) fn inbound_udp_pid_fallback_enabled() -> bool {
     INBOUND_UDP_PID_FALLBACK_ENABLED.load(Ordering::Relaxed)
+}
+
+/// The value is read once during DriverEntry and stays fixed until driver unload.
+#[inline]
+pub(crate) fn ignore_special_ports() -> bool {
+    IGNORE_SPECIAL_PORTS.load(Ordering::Relaxed)
 }
 
 fn dword_enabled(value_type: u32, data: &[u8]) -> bool {
@@ -18,7 +25,7 @@ pub(crate) use kernel::initialize;
 
 #[cfg(not(test))]
 mod kernel {
-    use super::{dword_enabled, INBOUND_UDP_PID_FALLBACK_ENABLED};
+    use super::{dword_enabled, IGNORE_SPECIAL_PORTS, INBOUND_UDP_PID_FALLBACK_ENABLED};
     use alloc::vec::Vec;
     use core::{mem::size_of, ptr, sync::atomic::Ordering};
     use windows_sys::{
@@ -39,8 +46,6 @@ mod kernel {
             },
         },
     };
-
-    const VALUE_NAME: &str = "EnableInboundUdpCacheMissPidFallback";
 
     // KEY_VALUE_PARTIAL_INFORMATION with room for exactly one DWORD.
     #[repr(C)]
@@ -63,8 +68,8 @@ mod kernel {
         }
     }
 
-    /// Reads the setting once before WFP is activated. Missing/inaccessible keys
-    /// and invalid values leave the option disabled. No registry handle or
+    /// Reads the settings once before WFP is activated. Missing/inaccessible keys
+    /// and invalid values leave the options disabled. No registry handle or
     /// subscription is retained after this call.
     ///
     /// # Safety
@@ -92,15 +97,18 @@ mod kernel {
         };
         parameters_path.extend_from_slice(&suffix);
 
-        let enabled = read_enabled(&parameters_path);
+        let enabled = read_enabled(&parameters_path, "EnableInboundUdpCacheMissPidFallback");
         INBOUND_UDP_PID_FALLBACK_ENABLED.store(enabled, Ordering::Relaxed);
         crate::info!("EnableInboundUdpCacheMissPidFallback={}", u8::from(enabled));
+        let ignore_special_ports = read_enabled(&parameters_path, "IgnoreSpecialPorts");
+        IGNORE_SPECIAL_PORTS.store(ignore_special_ports, Ordering::Relaxed);
+        crate::info!("IgnoreSpecialPorts={}", u8::from(ignore_special_ports));
         Ok(())
     }
 
-    fn read_enabled(parameters_path: &[u16]) -> bool {
+    fn read_enabled(parameters_path: &[u16], value_name: &str) -> bool {
         let path = unicode_string(parameters_path);
-        let value_name_buffer: Vec<u16> = VALUE_NAME.encode_utf16().collect();
+        let value_name_buffer: Vec<u16> = value_name.encode_utf16().collect();
         let value_name = unicode_string(&value_name_buffer);
         let attributes = OBJECT_ATTRIBUTES {
             Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
@@ -148,7 +156,13 @@ mod tests {
     };
 
     #[test]
-    fn only_dword_one_enables_fallback() {
+    fn settings_default_to_disabled() {
+        assert!(!super::inbound_udp_pid_fallback_enabled());
+        assert!(!super::ignore_special_ports());
+    }
+
+    #[test]
+    fn only_dword_one_enables_settings() {
         assert!(dword_enabled(REG_DWORD, &1u32.to_le_bytes()));
         for value in [0, 2, 0x100, u32::MAX] {
             assert!(!dword_enabled(REG_DWORD, &value.to_le_bytes()));
@@ -156,14 +170,14 @@ mod tests {
     }
 
     #[test]
-    fn wrong_registry_types_do_not_enable_fallback() {
+    fn wrong_registry_types_do_not_enable_settings() {
         for value_type in [REG_BINARY, REG_DWORD_BIG_ENDIAN, REG_QWORD, REG_SZ] {
             assert!(!dword_enabled(value_type, &1u32.to_le_bytes()));
         }
     }
 
     #[test]
-    fn malformed_dword_lengths_do_not_enable_fallback() {
+    fn malformed_dword_lengths_do_not_enable_settings() {
         for data in [
             &[][..],
             &[1][..],

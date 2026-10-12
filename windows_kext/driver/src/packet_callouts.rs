@@ -9,8 +9,7 @@ use crate::ale_policy::{
     classify_packet_injection, inbound_udp_fallback_pid, PacketInjectionAction,
 };
 use crate::connection::{
-    Connection, ConnectionV4, ConnectionV6, Direction, RedirectInfo, Verdict, PM_DNS_PORT,
-    PM_SPLIT_TUN_PORT, PM_SPN_PORT,
+    fast_track_pm_packets, Connection, ConnectionV4, ConnectionV6, Direction, RedirectInfo, Verdict,
 };
 use crate::connection_cache::ConnectionCache;
 use crate::connection_map::Key;
@@ -151,14 +150,6 @@ impl ConnectionInfo {
             },
         }
     }
-}
-
-#[inline]
-fn fast_track_pm_packets(key: &Key) -> bool {
-    (key.local_port == PM_DNS_PORT
-        || key.local_port == PM_SPN_PORT
-        || key.local_port == PM_SPLIT_TUN_PORT)
-        && key.local_address == key.remote_address
 }
 
 fn ip_packet_layer(
