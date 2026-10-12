@@ -188,7 +188,7 @@ fn inspect_ipv6_packet(
     }
 
     let ip_packet = Ipv6Packet::new_unchecked(packet);
-    let headers = walk_ipv6_headers(packet);
+    let headers = walk_ipv6_headers(packet, permit_fragments);
     if permit_fragments && headers.is_fragment {
         return PacketInspection {
             is_fragment: true,
@@ -348,7 +348,7 @@ fn get_icmpv6_error(
     }
     let end = core::cmp::min(quoted.len(), ip_packet.total_len());
     let quoted = &quoted[..end];
-    let headers = walk_ipv6_headers(quoted);
+    let headers = walk_ipv6_headers(quoted, false);
     if !headers.resolved || headers.is_fragment {
         return None;
     }
@@ -464,6 +464,65 @@ mod tests {
                         assert_eq!(metadata.is_tcp_reset, full.is_tcp_reset);
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn ipv6_fragment_bypass_preserves_full_and_atomic_header_parsing() {
+        // Options -> Fragment -> Options -> TCP.
+        let mut packet = [0u8; IPV6_HEADER_LEN + 3 * 8 + 20];
+        packet[0] = 0x60;
+        packet[4..6].copy_from_slice(&44u16.to_be_bytes());
+        packet[6] = u8::from(IpProtocol::Ipv6Opts);
+        packet[40] = u8::from(IpProtocol::Ipv6Frag);
+        packet[48] = u8::from(IpProtocol::Ipv6Opts);
+        packet[56] = u8::from(IpProtocol::Tcp);
+        packet[64..66].copy_from_slice(&50_000u16.to_be_bytes());
+        packet[66..68].copy_from_slice(&443u16.to_be_bytes());
+        packet[64 + TCP_FLAGS_OFFSET] = TCP_RST_FLAG;
+
+        for bits in [0u16, 1, 8, 9] {
+            packet[50..52].copy_from_slice(&bits.to_be_bytes());
+            for direction in [Direction::Outbound, Direction::Inbound] {
+                let full = inspect_packet(&packet, true, direction).metadata.unwrap();
+                assert_eq!(full.key.protocol, IpProtocol::Tcp);
+                assert_eq!(
+                    full.key.local_port,
+                    if matches!(direction, Direction::Outbound) {
+                        50_000
+                    } else {
+                        443
+                    }
+                );
+                assert!(full.is_tcp_reset);
+                let lazy = super::inspect_packet(&packet, true, direction, true);
+                assert_eq!(lazy.is_fragment, bits != 0);
+                if bits != 0 {
+                    assert!(matches!(
+                        lazy.metadata,
+                        Err(PacketMetadataError::FragmentRequiresReassembly)
+                    ));
+                } else {
+                    let metadata = lazy.metadata.unwrap();
+                    assert!(metadata.key == full.key);
+                    assert_eq!(metadata.is_tcp_reset, full.is_tcp_reset);
+                }
+
+                let truncated = &packet[..56];
+                assert!(matches!(
+                    inspect_packet(truncated, true, direction).metadata,
+                    Err(PacketMetadataError::UnresolvedIpv6Headers)
+                ));
+                let lazy = super::inspect_packet(truncated, true, direction, true);
+                assert!(matches!(
+                    (bits, lazy.metadata),
+                    (0, Err(PacketMetadataError::UnresolvedIpv6Headers))
+                        | (
+                            1 | 8 | 9,
+                            Err(PacketMetadataError::FragmentRequiresReassembly)
+                        )
+                ));
             }
         }
     }

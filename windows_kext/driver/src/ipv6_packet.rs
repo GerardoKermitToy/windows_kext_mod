@@ -33,8 +33,9 @@ pub(crate) struct Ipv6Headers {
 /// The walker understands Hop-by-Hop Options, Routing, Fragment and Destination
 /// Options headers. An exact chain of `MAX_IPV6_EXT_HEADERS` is accepted when
 /// the eighth header points to an upper-layer protocol; a ninth extension
-/// header remains unresolved.
-pub(crate) fn walk_ipv6_headers(packet: &[u8]) -> Ipv6Headers {
+/// header remains unresolved. With `stop_at_fragment`, a non-atomic Fragment
+/// header ends the walk with `is_fragment = true` and `resolved = false`.
+pub(crate) fn walk_ipv6_headers(packet: &[u8], stop_at_fragment: bool) -> Ipv6Headers {
     let mut result = Ipv6Headers {
         protocol: IpProtocol::Unknown(0),
         transport_offset: IPV6_HEADER_LEN,
@@ -72,12 +73,14 @@ pub(crate) fn walk_ipv6_headers(packet: &[u8]) -> Ipv6Headers {
                     break;
                 };
 
+                protocol = IpProtocol::from(header[0]);
+                offset = end;
                 if fragment.frag_offset() != 0 || fragment.more_frags() {
                     result.is_fragment = true;
+                    if stop_at_fragment {
+                        break;
+                    }
                 }
-
-                protocol = IpProtocol::from(header[0]);
-                offset += 8;
             }
             IpProtocol::HopByHop | IpProtocol::Ipv6Route | IpProtocol::Ipv6Opts => {
                 if extension_count >= MAX_IPV6_EXT_HEADERS {
@@ -180,7 +183,7 @@ fn transport_context(packet: &[u8]) -> Result<TransportContext, Ipv6TransportErr
     if ip_packet.payload_len() == 0 && packet.len() > IPV6_HEADER_LEN {
         return Err(Ipv6TransportError::InvalidPacket);
     }
-    let headers = walk_ipv6_headers(&packet[..total_len]);
+    let headers = walk_ipv6_headers(&packet[..total_len], false);
     if !headers.resolved || headers.transport_offset > total_len {
         return Err(Ipv6TransportError::UnresolvedHeaders);
     }
@@ -393,7 +396,7 @@ mod tests {
     #[test]
     fn resolves_exactly_eight_extension_headers() {
         let packet = options_chain(MAX_IPV6_EXT_HEADERS);
-        let headers = walk_ipv6_headers(&packet);
+        let headers = walk_ipv6_headers(&packet, false);
 
         assert!(headers.resolved);
         assert_eq!(headers.protocol, IpProtocol::Udp);
@@ -406,7 +409,7 @@ mod tests {
     #[test]
     fn rejects_a_ninth_extension_header() {
         let packet = options_chain(MAX_IPV6_EXT_HEADERS + 1);
-        let headers = walk_ipv6_headers(&packet);
+        let headers = walk_ipv6_headers(&packet, false);
 
         assert!(!headers.resolved);
         assert_eq!(headers.protocol, IpProtocol::Ipv6Opts);
@@ -424,7 +427,7 @@ mod tests {
         );
         packet[IPV6_HEADER_LEN] = u8::from(IpProtocol::Udp);
 
-        let atomic = walk_ipv6_headers(&packet);
+        let atomic = walk_ipv6_headers(&packet, false);
         assert!(atomic.resolved);
         assert!(!atomic.is_fragment);
         assert_eq!(atomic.protocol, IpProtocol::Udp);
@@ -433,7 +436,47 @@ mod tests {
         // The M bit is in byte three of the complete Fragment header, not in
         // the Next Header/Reserved pair at bytes zero and one.
         packet[IPV6_HEADER_LEN + 3] = 1;
-        assert!(walk_ipv6_headers(&packet).is_fragment);
+        assert!(walk_ipv6_headers(&packet, false).is_fragment);
+    }
+
+    #[test]
+    fn stops_at_non_atomic_fragments_only_when_requested() {
+        // Options -> Fragment -> Options -> UDP.
+        let mut packet = options_chain(3);
+        packet[IPV6_HEADER_LEN] = u8::from(IpProtocol::Ipv6Frag);
+        let fragment_offset = IPV6_HEADER_LEN + 8;
+        let fragment_end = fragment_offset + 8;
+
+        for bits in [0u16, 1, 8, 9] {
+            packet[fragment_offset + 2..fragment_offset + 4].copy_from_slice(&bits.to_be_bytes());
+            for stop_at_fragment in [false, true] {
+                let headers = walk_ipv6_headers(&packet, stop_at_fragment);
+                let stopped = stop_at_fragment && bits != 0;
+                assert_eq!(headers.is_fragment, bits != 0);
+                assert_eq!(headers.resolved, !stopped);
+                assert_eq!(
+                    headers.transport_offset,
+                    if stopped {
+                        fragment_end
+                    } else {
+                        fragment_end + 8
+                    }
+                );
+                assert_eq!(
+                    headers.protocol,
+                    if stopped {
+                        IpProtocol::Ipv6Opts
+                    } else {
+                        IpProtocol::Udp
+                    }
+                );
+
+                let truncated = walk_ipv6_headers(&packet[..fragment_end], stop_at_fragment);
+                assert_eq!(truncated.is_fragment, bits != 0);
+                assert!(!truncated.resolved);
+                assert_eq!(truncated.transport_offset, fragment_end);
+            }
+        }
     }
 
     #[test]
@@ -526,7 +569,7 @@ mod tests {
     #[test]
     fn recalculates_checksum_from_transport_offset() {
         let mut packet = options_chain(2);
-        let headers = walk_ipv6_headers(&packet);
+        let headers = walk_ipv6_headers(&packet, false);
         let checksum_offset = headers.transport_offset + 6;
         packet[checksum_offset] = 0;
         packet[checksum_offset + 1] = 0;
