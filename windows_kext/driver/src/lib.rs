@@ -37,6 +37,7 @@ mod packet_callouts;
 mod packet_metadata;
 #[cfg(not(test))]
 mod packet_util;
+mod registry_settings;
 #[cfg(not(test))]
 mod stream_callouts;
 mod tcp_closure_cache;

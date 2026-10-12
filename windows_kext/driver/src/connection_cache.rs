@@ -131,6 +131,43 @@ impl ConnectionCache {
         self.register_connection_with_lifecycle(key, process_id, direction, false, 0)
     }
 
+    /// Registers a new exact inbound UDP tuple using only the donor's PID.
+    /// A concurrent exact registration wins unchanged: heuristic attribution must
+    /// not overwrite its owner, verdict, thread ID or lifecycle.
+    pub fn register_inbound_udp_fallback_connection(
+        &self,
+        key: &Key,
+        process_id: u64,
+    ) -> Result<ConnectionRegistration, String> {
+        let result = if key.is_ipv6() {
+            let mut connection =
+                ConnectionV6::from_untracked_key(key, process_id, Direction::Inbound)?;
+            connection.extra.idle_expiration = true;
+            self.connections_v6
+                .write_lock()
+                .insert_if_absent_with(connection, |_| {})
+                .map_err(|(_, instance_id)| instance_id)
+        } else {
+            let mut connection =
+                ConnectionV4::from_untracked_key(key, process_id, Direction::Inbound)?;
+            connection.extra.idle_expiration = true;
+            self.connections_v4
+                .write_lock()
+                .insert_if_absent_with(connection, |_| {})
+                .map_err(|(_, instance_id)| instance_id)
+        };
+        Ok(match result {
+            Ok(instance_id) => ConnectionRegistration {
+                inserted: true,
+                instance_id,
+            },
+            Err(instance_id) => ConnectionRegistration {
+                inserted: false,
+                instance_id,
+            },
+        })
+    }
+
     /// Registers PID and TID together under the existing connection-map lock.
     /// UDP is promoted to native lifecycle only after endpoint association.
     pub fn register_ale_connection(
@@ -413,6 +450,28 @@ impl ConnectionCache {
         None
     }
 
+    /// Looks up UDP process attribution without requiring the remote port. This
+    /// returns only a PID snapshot, never another connection's instance or policy.
+    pub fn find_active_udp_pid(&self, key: &Key) -> Option<u64> {
+        if key.protocol != IpProtocol::Udp {
+            return None;
+        }
+
+        if key.is_ipv6() {
+            self.connections_v6.read_lock().find_active_udp_pid(
+                key.local_address,
+                key.local_port,
+                key.remote_address,
+            )
+        } else {
+            self.connections_v4.read_lock().find_active_udp_pid(
+                key.local_address,
+                key.local_port,
+                key.remote_address,
+            )
+        }
+    }
+
     /// Reads a live IPv4 connection. Ended entries are not current connection
     /// state and are ignored by ALE and update paths.
     pub fn read_connection_v4<T>(
@@ -692,7 +751,7 @@ impl ConnectionCache {
 mod tests {
     use super::ConnectionCache;
     use crate::{
-        connection::{Direction, Verdict, PM_DNS_PORT},
+        connection::{Connection, Direction, Verdict, PM_DNS_PORT},
         connection_map::Key,
     };
     use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Address, Ipv6Address};
@@ -736,6 +795,172 @@ mod tests {
             cache.read_connection_v6(tuple, |conn| Some((conn.process_id, conn.thread_id)))
         } else {
             cache.read_connection_v4(tuple, |conn| Some((conn.process_id, conn.thread_id)))
+        }
+    }
+
+    #[test]
+    fn udp_pid_fallback_selects_family_and_does_not_create_missing_tuple() {
+        for mut donor in connect_thread_keys() {
+            let cache = ConnectionCache::new();
+            cache
+                .register_connection(&donor, 123, Direction::Outbound)
+                .unwrap();
+            let mut incoming = donor;
+            incoming.remote_port += 1;
+            let expected = (donor.protocol == IpProtocol::Udp).then_some(123);
+            assert_eq!(cache.find_active_udp_pid(&incoming), expected);
+            assert_eq!(saved_identity(&cache, &incoming), None);
+
+            donor.local_port += 1;
+            assert_eq!(cache.find_active_udp_pid(&donor), None);
+        }
+    }
+
+    fn saved_verdict(cache: &ConnectionCache, tuple: &Key) -> Option<Verdict> {
+        if tuple.is_ipv6() {
+            cache.read_connection_v6(tuple, |conn| Some(conn.verdict))
+        } else {
+            cache.read_connection_v4(tuple, |conn| Some(conn.verdict))
+        }
+    }
+
+    #[test]
+    fn inbound_udp_fallback_registers_own_cacheable_tuple_without_donor_policy() {
+        for donor in connect_thread_keys()
+            .into_iter()
+            .filter(|key| key.protocol == IpProtocol::Udp)
+        {
+            let cache = ConnectionCache::new();
+            let original = cache
+                .register_connection(&donor, 123, Direction::Outbound)
+                .unwrap();
+            assert!(cache
+                .update_connection_instance(donor, original.instance_id, Verdict::PermanentBlock)
+                .is_some());
+            let incoming = Key {
+                remote_port: donor.remote_port + 1,
+                ..donor
+            };
+            let pid = cache.find_active_udp_pid(&incoming).unwrap();
+            let fallback = cache
+                .register_inbound_udp_fallback_connection(&incoming, pid)
+                .unwrap();
+
+            assert!(fallback.inserted);
+            assert_ne!(fallback.instance_id, original.instance_id);
+            assert_eq!(saved_identity(&cache, &incoming), Some((123, 0)));
+            assert_eq!(
+                cache.is_outbound_connection_instance(&incoming, fallback.instance_id),
+                Some(false)
+            );
+            assert_eq!(
+                cache.get_untracked_connection_instance_id(&incoming),
+                Some(fallback.instance_id)
+            );
+            assert!(matches!(saved_verdict(&cache, &incoming), Some(Verdict::Undecided)));
+            assert!(cache
+                .update_connection_instance(incoming, fallback.instance_id, Verdict::PermanentAccept)
+                .is_some());
+            assert!(matches!(saved_verdict(&cache, &incoming), Some(Verdict::PermanentAccept)));
+            assert!(matches!(saved_verdict(&cache, &donor), Some(Verdict::PermanentBlock)));
+        }
+    }
+
+    #[test]
+    fn inbound_udp_fallback_preserves_concurrent_native_registration() {
+        for tuple in connect_thread_keys()
+            .into_iter()
+            .filter(|key| key.protocol == IpProtocol::Udp)
+        {
+            let cache = ConnectionCache::new();
+            let native = cache
+                .register_ale_connection(&tuple, 456, 7890, Direction::Outbound)
+                .unwrap();
+            assert!(cache.mark_connection_instance_tracked(&tuple, native.instance_id));
+            assert!(cache
+                .update_connection_instance(tuple, native.instance_id, Verdict::PermanentBlock)
+                .is_some());
+            let fallback = cache
+                .register_inbound_udp_fallback_connection(&tuple, 123)
+                .unwrap();
+
+            assert!(!fallback.inserted);
+            assert_eq!(fallback.instance_id, native.instance_id);
+            assert_eq!(saved_identity(&cache, &tuple), Some((456, 7890)));
+            assert!(matches!(saved_verdict(&cache, &tuple), Some(Verdict::PermanentBlock)));
+            assert_eq!(cache.get_untracked_connection_instance_id(&tuple), None);
+            assert_eq!(cache.is_outbound_connection_instance(&tuple, native.instance_id), Some(true));
+        }
+    }
+
+    #[test]
+    fn inbound_udp_fallback_deduplicates_live_tuple_and_isolates_reused_generation() {
+        for tuple in connect_thread_keys()
+            .into_iter()
+            .filter(|key| key.protocol == IpProtocol::Udp)
+        {
+            let cache = ConnectionCache::new();
+            let original = cache
+                .register_inbound_udp_fallback_connection(&tuple, 123)
+                .unwrap();
+            let repeated = cache
+                .register_inbound_udp_fallback_connection(&tuple, 456)
+                .unwrap();
+            assert!(!repeated.inserted);
+            assert_eq!(repeated.instance_id, original.instance_id);
+            assert_eq!(saved_identity(&cache, &tuple), Some((123, 0)));
+
+            if tuple.is_ipv6() {
+                cache.end_connection_instance_v6(tuple, original.instance_id).unwrap();
+            } else {
+                cache.end_connection_instance_v4(tuple, original.instance_id).unwrap();
+            }
+            let replacement = cache
+                .register_inbound_udp_fallback_connection(&tuple, 456)
+                .unwrap();
+            assert!(replacement.inserted);
+            assert_ne!(replacement.instance_id, original.instance_id);
+            assert!(cache
+                .update_connection_instance(tuple, original.instance_id, Verdict::PermanentAccept)
+                .is_none());
+            assert!(matches!(saved_verdict(&cache, &tuple), Some(Verdict::Undecided)));
+            assert_eq!(saved_identity(&cache, &tuple), Some((456, 0)));
+        }
+    }
+
+    #[test]
+    fn inbound_udp_fallback_expires_on_inactivity_until_endpoint_association() {
+        for tuple in connect_thread_keys()
+            .into_iter()
+            .filter(|key| key.protocol == IpProtocol::Udp)
+        {
+            let cache = ConnectionCache::new();
+            let fallback = cache
+                .register_inbound_udp_fallback_connection(&tuple, 123)
+                .unwrap();
+            let (ended_v4, ended_v6) = cache.end_inactive_untracked_connections();
+            assert_eq!(ended_v4.len() + ended_v6.len(), 1);
+            assert_eq!(cache.get_connection_instance_id(&tuple), None);
+
+            let tracked = cache
+                .register_inbound_udp_fallback_connection(&tuple, 123)
+                .unwrap();
+            assert_ne!(tracked.instance_id, fallback.instance_id);
+            assert!(cache.mark_connection_instance_tracked(&tuple, tracked.instance_id));
+            if tuple.is_ipv6() {
+                cache.read_connection_v6(&tuple, |conn| {
+                    conn.set_last_accessed_time(0);
+                    Some(())
+                });
+            } else {
+                cache.read_connection_v4(&tuple, |conn| {
+                    conn.set_last_accessed_time(0);
+                    Some(())
+                });
+            }
+            let (ended_v4, ended_v6) = cache.end_inactive_untracked_connections();
+            assert!(ended_v4.is_empty() && ended_v6.is_empty());
+            assert_eq!(cache.get_connection_instance_id(&tuple), Some(tracked.instance_id));
         }
     }
 

@@ -71,6 +71,22 @@ pub(crate) fn classify_packet_injection(
     }
 }
 
+/// A missing inbound UDP tuple may borrow only process attribution, and only
+/// from the first live match. Unknown/System attribution still needs native ALE
+/// authorization. Callers invoke this only after the normal cache lookup misses.
+#[inline]
+pub(crate) fn inbound_udp_fallback_pid(
+    protocol: IpProtocol,
+    enabled: bool,
+    lookup: impl FnOnce() -> Option<u64>,
+) -> Option<u64> {
+    if !enabled || protocol != IpProtocol::Udp {
+        return None;
+    }
+
+    lookup().filter(|pid| !matches!(*pid, 0 | 4))
+}
+
 /// Returns whether an ALE indication has the signature of a final TCP
 /// reauthorization racing endpoint closure.
 pub(crate) fn can_reuse_ended_tcp_policy(reauthorize: bool, protocol: IpProtocol) -> bool {
@@ -187,13 +203,44 @@ pub(crate) fn self_injected_packet_needs_accept_authorization(
 mod tests {
     use super::{
         can_reuse_ended_tcp_policy, classify_ale_injection, classify_packet_injection,
-        self_injected_endpoint_identifies_socket, self_injected_packet_needs_accept_authorization,
-        should_capture_ale_packet, should_permit_ale_tcp_reset,
-        should_skip_cross_direction_ale_clone, should_skip_injected_outbound_flow,
-        AleInjectionAction, InjectionStatus, PacketInjectionAction,
+        inbound_udp_fallback_pid, self_injected_endpoint_identifies_socket,
+        self_injected_packet_needs_accept_authorization, should_capture_ale_packet,
+        should_permit_ale_tcp_reset, should_skip_cross_direction_ale_clone,
+        should_skip_injected_outbound_flow, AleInjectionAction, InjectionStatus,
+        PacketInjectionAction,
     };
     use crate::connection::Direction;
     use smoltcp::wire::IpProtocol;
+
+    #[test]
+    fn inbound_udp_fallback_does_not_lookup_when_disabled_or_not_udp() {
+        for protocol in [IpProtocol::Udp, IpProtocol::Tcp, IpProtocol::Icmp] {
+            for enabled in [false, true] {
+                let mut calls = 0;
+                let pid = inbound_udp_fallback_pid(protocol, enabled, || {
+                    calls += 1;
+                    Some(123)
+                });
+                let allowed = enabled && protocol == IpProtocol::Udp;
+                assert_eq!(calls, usize::from(allowed));
+                assert_eq!(pid, allowed.then_some(123));
+            }
+        }
+    }
+
+    #[test]
+    fn inbound_udp_fallback_leaves_missing_unknown_and_system_pid_to_ale() {
+        for pid in [None, Some(0), Some(4)] {
+            assert_eq!(
+                inbound_udp_fallback_pid(IpProtocol::Udp, true, || pid),
+                None
+            );
+        }
+        assert_eq!(
+            inbound_udp_fallback_pid(IpProtocol::Udp, true, || Some(123)),
+            Some(123),
+        );
+    }
 
     #[test]
     fn packet_injection_short_circuits_only_proven_network_self() {

@@ -5,7 +5,9 @@ use wdk::filter_engine::layer;
 use wdk::filter_engine::net_buffer::{NetBufferList, NetBufferListClones, NetBufferListIter};
 use wdk::filter_engine::packet::InjectInfo;
 
-use crate::ale_policy::{classify_packet_injection, PacketInjectionAction};
+use crate::ale_policy::{
+    classify_packet_injection, inbound_udp_fallback_pid, PacketInjectionAction,
+};
 use crate::connection::{
     Connection, ConnectionV4, ConnectionV6, Direction, RedirectInfo, Verdict, PM_DNS_PORT,
     PM_SPLIT_TUN_PORT, PM_SPN_PORT,
@@ -523,11 +525,33 @@ fn ip_packet_layer(
                     }
                 }
             } else if matches!(direction, Direction::Inbound) {
-                // No connection exists yet. Let WFP continue to
-                // ALE_AUTH_RECV_ACCEPT, where the owning PID is available and the
-                // TCP/UDP connection will be pended and sent to Portmaster.
-                data.action_permit();
-                return;
+                let fallback_pid = inbound_udp_fallback_pid(
+                    key.protocol,
+                    crate::registry_settings::inbound_udp_pid_fallback_enabled(),
+                    || device.connection_cache.find_active_udp_pid(&key),
+                );
+                let Some(pid) = fallback_pid else {
+                    // Preserve native ALE authorization when the option is off,
+                    // no live UDP match exists, or its PID is unknown/System.
+                    data.action_permit();
+                    return;
+                };
+
+                // Borrow only the PID. The exact tuple gets its own cache instance
+                // and policy; a concurrent registration keeps its existing state.
+                let registration = match device
+                    .connection_cache
+                    .register_inbound_udp_fallback_connection(&key, pid)
+                {
+                    Ok(registration) => registration,
+                    Err(err) => {
+                        crate::err!("failed to register inbound UDP fallback connection: {}", err);
+                        data.action_permit();
+                        return;
+                    }
+                };
+                process_id = pid;
+                connection_instance_id = Some(registration.instance_id);
             } else if injected_by_other {
                 // A foreign network injector can emit a packet after the native
                 // application endpoint has already closed. It has no trustworthy

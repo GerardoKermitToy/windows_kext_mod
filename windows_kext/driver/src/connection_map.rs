@@ -412,19 +412,19 @@ const UNTRACKED_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 fn should_expire_untracked<T: Connection>(connection: &T, cutoff: u64) -> bool {
     !connection.has_ended()
         && !connection.has_native_lifecycle()
-        && matches!(connection.get_direction(), Direction::Outbound)
+        && connection.allows_untracked_expiration()
         && connection.get_last_accessed_time() < cutoff
 }
 
-/// Refreshes the only connections whose lifetime depends on packet activity.
-/// Native WFP state retires tracked connections, while inbound fallbacks wait for
-/// endpoint closure, so reading the system clock and storing a timestamp for either
-/// category cannot affect cleanup.
+/// Refreshes only entries whose untracked lifetime depends on packet activity.
+/// Native WFP state retires tracked connections, while ordinary inbound ALE state
+/// waits for endpoint closure. Heuristic inbound packet-layer fallbacks may expire
+/// until a real endpoint is associated.
 #[inline]
 fn refresh_untracked_activity<T: Connection>(connection: &T) {
     if !connection.has_ended()
         && !connection.has_native_lifecycle()
-        && matches!(connection.get_direction(), Direction::Outbound)
+        && connection.allows_untracked_expiration()
     {
         connection.set_last_accessed_time(get_monotonic_timestamp_ms());
     }
@@ -664,6 +664,27 @@ impl<T: Connection + Clone> ConnectionMap<T> {
         }
 
         None
+    }
+
+    /// Returns the PID of the first live UDP entry with these addresses and local
+    /// port, ignoring the remote port. Attribution alone must not refresh another
+    /// connection's activity or borrow its verdict/lifetime.
+    pub(crate) fn find_active_udp_pid(
+        &self,
+        local_address: IpAddress,
+        local_port: u16,
+        remote_address: IpAddress,
+    ) -> Option<u64> {
+        self.0
+            .get(&(IpProtocol::Udp, local_port))?
+            .values()
+            .flat_map(ConnectionBucket::iter)
+            .find(|conn| {
+                !conn.has_ended()
+                    && conn.get_local_address() == local_address
+                    && conn.get_remote_address() == remote_address
+            })
+            .map(Connection::get_process_id)
     }
 
     /// Reads the best live connection matching `key`.
@@ -909,11 +930,12 @@ impl<T: Connection + Clone> ConnectionMap<T> {
         None
     }
 
-    /// Ends outbound fallback entries not observed for one minute.
+    /// Ends idle-expirable fallback entries not observed for one minute.
     ///
     /// Native endpoint and flow callbacks remain authoritative for tracked state.
-    /// Inbound fallbacks are not idle-expired: after ALE authorizes their flow, a
-    /// later packet might not revisit ALE and must continue to find cached policy.
+    /// Ordinary inbound ALE state is not idle-expired: an authorized flow might not
+    /// revisit ALE and must continue to find cached policy. Heuristic inbound
+    /// packet-layer entries may expire until associated with a real endpoint.
     pub fn end_inactive_untracked_connections(&mut self) -> Vec<T> {
         let now = get_monotonic_timestamp_ms();
         let cutoff = now.saturating_sub(UNTRACKED_IDLE_TIMEOUT.as_millis() as u64);
@@ -1064,6 +1086,128 @@ mod tests {
 
     fn read_process_id_v6(conn: &ConnectionV6) -> Option<u64> {
         Some(conn.process_id)
+    }
+
+    #[test]
+    fn udp_pid_fallback_ignores_remote_port_and_skips_ended_entries() {
+        let donor = key([198, 51, 100, 20], 100);
+        let mut incoming = donor;
+        incoming.remote_port = 200;
+        let mut map = ConnectionMap::new();
+        map.add(ended(&donor, 10));
+        map.add(live(&donor, 20));
+        map.add(live(&incoming, 30));
+
+        assert_eq!(
+            map.find_active_udp_pid(
+                incoming.local_address,
+                incoming.local_port,
+                incoming.remote_address,
+            ),
+            Some(20),
+        );
+        assert_eq!(map.read(&incoming, read_process_id), Some(30));
+    }
+
+    #[test]
+    fn udp_pid_fallback_requires_both_addresses_local_port_and_udp() {
+        let tuple = key([198, 51, 100, 20], 100);
+        let mut other_local = tuple;
+        other_local.local_address = IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 2));
+        let mut other_remote = tuple;
+        other_remote.remote_address = IpAddress::Ipv4(Ipv4Address::new(198, 51, 100, 21));
+        let mut other_port = tuple;
+        other_port.local_port += 1;
+        let mut tcp = tuple;
+        tcp.protocol = IpProtocol::Tcp;
+        let mut map = ConnectionMap::new();
+        for (candidate, pid) in [
+            (other_local, 10),
+            (other_remote, 20),
+            (other_port, 30),
+            (tcp, 40),
+        ] {
+            map.add(live(&candidate, pid));
+        }
+        map.add(ended(&tuple, 50));
+
+        assert_eq!(
+            map.find_active_udp_pid(tuple.local_address, tuple.local_port, tuple.remote_address),
+            None,
+        );
+        map.add(live(&tuple, 60));
+        assert_eq!(
+            map.find_active_udp_pid(tuple.local_address, tuple.local_port, tuple.remote_address),
+            Some(60),
+        );
+    }
+
+    #[test]
+    fn udp_pid_fallback_returns_first_match_even_for_unknown_or_system_pid() {
+        for pid in [0, 4, 123] {
+            let first = key([198, 51, 100, 20], 100);
+            let mut second = first;
+            second.remote_port = 200;
+            let mut map = ConnectionMap::new();
+            map.add(live(&second, 999));
+            map.add(live(&first, pid));
+
+            assert_eq!(
+                map.find_active_udp_pid(
+                    first.local_address,
+                    first.local_port,
+                    first.remote_address
+                ),
+                Some(pid),
+            );
+        }
+    }
+
+    #[test]
+    fn udp_pid_fallback_does_not_refresh_donor_activity() {
+        let tuple = key([198, 51, 100, 20], 100);
+        let conn = untracked(&tuple, 123);
+        conn.set_last_accessed_time(1);
+        let mut map = ConnectionMap::new();
+        map.add(conn);
+
+        assert_eq!(
+            map.find_active_udp_pid(tuple.local_address, tuple.local_port, tuple.remote_address),
+            Some(123),
+        );
+        assert_eq!(
+            map.bucket(&tuple)
+                .unwrap()
+                .iter()
+                .next()
+                .unwrap()
+                .get_last_accessed_time(),
+            1,
+        );
+    }
+
+    #[test]
+    fn udp_pid_fallback_supports_ipv6_and_skips_ended_entries() {
+        let tuple = key_v6(
+            [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+            100,
+        );
+        let mut incoming = tuple;
+        incoming.remote_port = 200;
+        let mut map = ConnectionMap::new();
+        let mut old = live_v6(&tuple, 10);
+        old.end(1);
+        map.add(old);
+        map.add(live_v6(&tuple, 20));
+
+        assert_eq!(
+            map.find_active_udp_pid(
+                incoming.local_address,
+                incoming.local_port,
+                incoming.remote_address
+            ),
+            Some(20),
+        );
     }
 
     #[test]
@@ -1449,6 +1593,20 @@ mod tests {
         map.add(untracked(&tuple, 10));
 
         assert_eq!(map.read(&tuple, read_process_id), Some(10));
+        assert!(map.end_inactive_untracked_connections().is_empty());
+        assert_eq!(map.get_count(), 1);
+    }
+
+    #[test]
+    fn packet_lookup_refreshes_inbound_packet_fallback_activity() {
+        let tuple = key([203, 0, 113, 8], 443);
+        let mut connection =
+            ConnectionV4::from_untracked_key(&tuple, 20, Direction::Inbound).expect("IPv4 key");
+        connection.extra.idle_expiration = true;
+        let mut map = ConnectionMap::new();
+        map.add(connection);
+
+        assert_eq!(map.read(&tuple, read_process_id), Some(20));
         assert!(map.end_inactive_untracked_connections().is_empty());
         assert_eq!(map.get_count(), 1);
     }

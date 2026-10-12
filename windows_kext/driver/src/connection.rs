@@ -132,9 +132,11 @@ pub struct ConnectionExtra {
     pub(crate) end_timestamp: u64,
     pub(crate) direction: Direction,
     /// True when a native WFP endpoint or flow can identify this exact cache
-    /// generation and report when it ends. Outbound packet-layer fallback entries
-    /// have no such identity and are expired by periodic cleanup instead.
+    /// generation and report when it ends.
     pub(crate) native_lifecycle: bool,
+    /// Packet-layer fallbacks may expire on inactivity until a real endpoint is
+    /// associated. Ordinary inbound ALE state must wait for socket closure.
+    pub(crate) idle_expiration: bool,
 }
 
 pub trait Connection {
@@ -236,6 +238,8 @@ pub trait Connection {
     fn set_last_accessed_time(&self, timestamp: u64);
     /// Returns whether native WFP state can report this connection's end.
     fn has_native_lifecycle(&self) -> bool;
+    /// Returns whether an untracked entry may expire on packet inactivity.
+    fn allows_untracked_expiration(&self) -> bool;
     /// Marks a fallback entry as owned by a native WFP lifecycle association.
     fn mark_native_lifecycle(&mut self);
 }
@@ -323,6 +327,7 @@ impl ConnectionV4 {
                 direction,
                 end_timestamp: 0,
                 native_lifecycle,
+                idle_expiration: matches!(direction, Direction::Outbound),
             },
         })
     }
@@ -463,6 +468,10 @@ impl Connection for ConnectionV4 {
         self.extra.native_lifecycle
     }
 
+    fn allows_untracked_expiration(&self) -> bool {
+        self.extra.idle_expiration
+    }
+
     fn mark_native_lifecycle(&mut self) {
         self.extra.native_lifecycle = true;
     }
@@ -532,6 +541,7 @@ impl ConnectionV6 {
                 direction,
                 end_timestamp: 0,
                 native_lifecycle,
+                idle_expiration: matches!(direction, Direction::Outbound),
             },
         })
     }
@@ -669,6 +679,10 @@ impl Connection for ConnectionV6 {
 
     fn has_native_lifecycle(&self) -> bool {
         self.extra.native_lifecycle
+    }
+
+    fn allows_untracked_expiration(&self) -> bool {
+        self.extra.idle_expiration
     }
 
     fn mark_native_lifecycle(&mut self) {

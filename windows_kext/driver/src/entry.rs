@@ -381,6 +381,17 @@ pub unsafe extern "system" fn driver_entry(
         }
     };
 
+    // Read the setting once before any packet classification. Registry changes
+    // take effect only after the driver is loaded again.
+    if let Err(status) = unsafe { crate::registry_settings::initialize(registry_path) } {
+        DISPATCH_GATE.close();
+        DISPATCH_GATE.wait_for_all();
+        DISPATCH_GATE.wait_for_lifetime();
+        wdk::callback_barrier::CALLBACK_BARRIER.close_all_and_wait();
+        err!("driver_entry: failed to initialize registry settings: {}", status);
+        return windows_sys::Win32::Foundation::STATUS_FAILED_DRIVER_ENTRY;
+    }
+
     // Initialize device.
     let device = match device::Device::new(&driver) {
         Ok(device) => Box::new(device),

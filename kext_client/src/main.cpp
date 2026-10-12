@@ -57,6 +57,7 @@ struct Options {
     bool send_verdicts = true;
     bool show_payload = false;     // --payload: dump packet bytes as hex
     bool memory_stats = false;     // --memory-stats: send PrintMemoryStats command
+    bool inbound_udp_pid_fallback = true;
     bool help = false;
 
     // Alternate verdict for connections matching alt_match_ip / alt_match_port.
@@ -212,6 +213,9 @@ void PrintUsage() {
         "                   and do not suppress logs or warnings.\n"
         "\n"
         "Behaviour:\n"
+        "  --no-inbound-udp-pid-fallback\n"
+        "                   write EnableInboundUdpCacheMissPidFallback=0 before load.\n"
+        "                   Default: 1; the driver reads it once at startup.\n"
         "  --verdict-delay-ms N\n"
         "                   wait N ms before each automatic verdict (default 0).\n"
         "                   N: 0..4294967295. Events are still read while waiting.\n"
@@ -316,6 +320,8 @@ bool ParseArgs(int argc, wchar_t** argv, Options& opt) {
         } else if (a == L"--no-conn") {
             opt.show_connections = false;
             opt.show_ends = false;
+        } else if (a == L"--no-inbound-udp-pid-fallback") {
+            opt.inbound_udp_pid_fallback = false;
         } else if (a == L"--no-verdicts") {
             opt.send_verdicts = false;
         } else if (a == L"--suspend-pid-on-verdict-delay") {
@@ -614,7 +620,7 @@ int wmain(int argc, wchar_t** argv) {
     SetConsoleCtrlHandler(ConsoleHandler, TRUE);
 
     std::string error;
-    if (!driver.Install(sys_path, error)) {
+    if (!driver.Install(sys_path, error, opt.inbound_udp_pid_fallback)) {
         std::printf("\nERROR: install failed: %s\n", error.c_str());
         return 1;
     }

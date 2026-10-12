@@ -765,10 +765,10 @@ impl Device {
                 let _perf_span = wdk::perf::Span::new(wdk::perf::Operation::Cleanup, 0);
                 wdk::dbg!("CleanEndedConnections command");
                 self.connection_cache.clean_ended_connections();
-                // An outbound packet-layer fallback has no native endpoint identity
-                // and can therefore receive no exact closure callback. End it after
-                // one inactive minute and emit the same lifecycle event as native WFP
-                // teardown. Tracked and inbound connections remain exempt.
+                // Packet-layer fallbacks without native endpoint identity may end
+                // after one inactive minute, including heuristic inbound UDP state.
+                // Emit the same lifecycle event as native WFP teardown. Tracked and
+                // ordinary inbound ALE connections remain exempt.
                 crate::ale_callouts::expire_inactive_untracked_connections(self);
                 crate::ale_callouts::expire_unestablished_tcp_connections(self);
                 // Reconcile endpoint and flow bookkeeping for connection instances

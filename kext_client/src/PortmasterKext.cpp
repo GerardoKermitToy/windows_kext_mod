@@ -213,7 +213,8 @@ Driver::~Driver() {
     Cleanup();
 }
 
-bool Driver::Install(const std::wstring& sys_path, std::string& error) {
+bool Driver::Install(const std::wstring& sys_path, std::string& error,
+                     bool inbound_udp_pid_fallback) {
     scm_ = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CREATE_SERVICE);
     if (scm_ == nullptr) {
         error = "OpenSCManager failed (Administrator required): " + LastErrorText(GetLastError());
@@ -240,6 +241,31 @@ bool Driver::Install(const std::wstring& sys_path, std::string& error) {
         return false;
     }
     service_created_ = true;
+
+    // Publish the selected packet-layer inbound UDP attribution setting before
+    // the driver's initial registry read. A failed write must not start it with a
+    // stale/default setting; the existing service_created_ cleanup still applies.
+    const std::wstring parameters_path =
+        L"SYSTEM\\CurrentControlSet\\Services\\" + service_name_ + L"\\Parameters";
+    HKEY parameters = nullptr;
+    LSTATUS registry_status = RegCreateKeyExW(
+        HKEY_LOCAL_MACHINE, parameters_path.c_str(), 0, nullptr,
+        REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, nullptr, &parameters, nullptr);
+    if (registry_status != ERROR_SUCCESS) {
+        error = "RegCreateKeyEx for driver Parameters failed: " + LastErrorText(registry_status);
+        CloseServiceHandle(service);
+        return false;
+    }
+    const DWORD enabled = inbound_udp_pid_fallback ? 1u : 0u;
+    registry_status = RegSetValueExW(
+        parameters, L"EnableInboundUdpCacheMissPidFallback", 0, REG_DWORD,
+        reinterpret_cast<const BYTE*>(&enabled), sizeof(enabled));
+    RegCloseKey(parameters);
+    if (registry_status != ERROR_SUCCESS) {
+        error = "RegSetValueEx for inbound UDP PID fallback failed: " + LastErrorText(registry_status);
+        CloseServiceHandle(service);
+        return false;
+    }
 
     if (StartServiceW(service, 0, nullptr) == 0) {
         const DWORD err = GetLastError();
