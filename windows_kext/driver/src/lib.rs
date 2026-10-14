@@ -22,6 +22,8 @@ mod common;
 mod connection;
 mod connection_cache;
 mod connection_map;
+#[cfg(all(target_arch = "x86_64", any(target_feature = "sse4.2", test)))]
+mod cpu_features;
 #[cfg(not(test))]
 mod device;
 #[cfg(not(test))]

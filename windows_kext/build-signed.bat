@@ -5,6 +5,7 @@ REM rc.exe, link.exe and signtool must be on PATH -
 REM that is what vcvarsall.bat sets up. Running the script outside that
 REM environment fails with "cannot find path".
 setlocal
+set "RUSTFLAGS=-C panic=abort -C target-feature=+sse4.2"
 
 set VCVARS=C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvarsall.bat
 if not exist "%VCVARS%" (

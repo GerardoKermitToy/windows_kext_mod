@@ -330,15 +330,18 @@ pub fn get_device() -> Option<&'static device::Device> {
     unsafe { DEVICE.load(Ordering::Acquire).as_ref() }
 }
 
-// DriverEntry is the entry point of the driver (main function). Will be called when driver is loaded.
-// Name should not be changed
+// Driver initialization. SSE4.2 builds reach this only after the baseline CPU
+// feature gate; other builds export it directly as DriverEntry.
 ///
 /// # Safety
 ///
 /// `driver_object` and `registry_path` must be the live kernel objects supplied
 /// by the I/O manager for this DriverEntry invocation and remain valid for the
 /// duration required by the WDM initialization contract.
-#[export_name = "DriverEntry"]
+#[cfg_attr(
+    not(all(target_arch = "x86_64", target_feature = "sse4.2")),
+    export_name = "DriverEntry"
+)]
 pub unsafe extern "system" fn driver_entry(
     driver_object: *mut windows_sys::Wdk::Foundation::DRIVER_OBJECT,
     registry_path: *mut windows_sys::Win32::Foundation::UNICODE_STRING,
