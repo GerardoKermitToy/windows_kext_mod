@@ -1,5 +1,32 @@
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 use windows_sys::Win32::System::Registry::REG_DWORD;
+
+const PARAMETERS_SUFFIX: &[u16] = &ascii_utf16(b"\\Parameters");
+const INBOUND_UDP_PID_FALLBACK_VALUE: &[u16] =
+    &ascii_utf16(b"EnableInboundUdpCacheMissPidFallback");
+const IGNORE_SPECIAL_PORTS_VALUE: &[u16] = &ascii_utf16(b"IgnoreSpecialPorts");
+
+const fn ascii_utf16<const N: usize>(text: &[u8; N]) -> [u16; N] {
+    let mut buffer = [0; N];
+    let mut index = 0;
+    while index < N {
+        assert!(text[index].is_ascii());
+        buffer[index] = text[index] as u16;
+        index += 1;
+    }
+    buffer
+}
+
+fn build_parameters_path(path: &[u16]) -> Option<Vec<u16>> {
+    if path.len() > usize::from(u16::MAX) / 2 - PARAMETERS_SUFFIX.len() {
+        return None;
+    }
+    let mut parameters_path = Vec::with_capacity(path.len() + PARAMETERS_SUFFIX.len());
+    parameters_path.extend_from_slice(path);
+    parameters_path.extend_from_slice(PARAMETERS_SUFFIX);
+    Some(parameters_path)
+}
 
 static INBOUND_UDP_PID_FALLBACK_ENABLED: AtomicBool = AtomicBool::new(false);
 static IGNORE_SPECIAL_PORTS: AtomicBool = AtomicBool::new(false);
@@ -25,8 +52,10 @@ pub(crate) use kernel::initialize;
 
 #[cfg(not(test))]
 mod kernel {
-    use super::{dword_enabled, IGNORE_SPECIAL_PORTS, INBOUND_UDP_PID_FALLBACK_ENABLED};
-    use alloc::vec::Vec;
+    use super::{
+        build_parameters_path, dword_enabled, IGNORE_SPECIAL_PORTS, IGNORE_SPECIAL_PORTS_VALUE,
+        INBOUND_UDP_PID_FALLBACK_ENABLED, INBOUND_UDP_PID_FALLBACK_VALUE,
+    };
     use core::{mem::size_of, ptr, sync::atomic::Ordering};
     use windows_sys::{
         Wdk::{
@@ -88,28 +117,22 @@ mod kernel {
         {
             return Err(STATUS_INVALID_PARAMETER);
         }
-        let suffix: Vec<u16> = "\\Parameters".encode_utf16().collect();
-        if usize::from(path.Length) + suffix.len() * 2 > usize::from(u16::MAX) {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        let mut parameters_path = unsafe {
-            core::slice::from_raw_parts(path.Buffer, usize::from(path.Length) / 2).to_vec()
-        };
-        parameters_path.extend_from_slice(&suffix);
+        let path =
+            unsafe { core::slice::from_raw_parts(path.Buffer, usize::from(path.Length) / 2) };
+        let parameters_path = build_parameters_path(path).ok_or(STATUS_INVALID_PARAMETER)?;
 
-        let enabled = read_enabled(&parameters_path, "EnableInboundUdpCacheMissPidFallback");
+        let enabled = read_enabled(&parameters_path, INBOUND_UDP_PID_FALLBACK_VALUE);
         INBOUND_UDP_PID_FALLBACK_ENABLED.store(enabled, Ordering::Relaxed);
         crate::info!("EnableInboundUdpCacheMissPidFallback={}", u8::from(enabled));
-        let ignore_special_ports = read_enabled(&parameters_path, "IgnoreSpecialPorts");
+        let ignore_special_ports = read_enabled(&parameters_path, IGNORE_SPECIAL_PORTS_VALUE);
         IGNORE_SPECIAL_PORTS.store(ignore_special_ports, Ordering::Relaxed);
         crate::info!("IgnoreSpecialPorts={}", u8::from(ignore_special_ports));
         Ok(())
     }
 
-    fn read_enabled(parameters_path: &[u16], value_name: &str) -> bool {
+    fn read_enabled(parameters_path: &[u16], value_name: &[u16]) -> bool {
         let path = unicode_string(parameters_path);
-        let value_name_buffer: Vec<u16> = value_name.encode_utf16().collect();
-        let value_name = unicode_string(&value_name_buffer);
+        let value_name = unicode_string(value_name);
         let attributes = OBJECT_ATTRIBUTES {
             Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
             RootDirectory: ptr::null_mut(),
@@ -150,10 +173,58 @@ mod kernel {
 
 #[cfg(test)]
 mod tests {
-    use super::dword_enabled;
+    use super::{
+        build_parameters_path, dword_enabled, IGNORE_SPECIAL_PORTS_VALUE,
+        INBOUND_UDP_PID_FALLBACK_VALUE, PARAMETERS_SUFFIX,
+    };
     use windows_sys::Win32::System::Registry::{
         REG_BINARY, REG_DWORD, REG_DWORD_BIG_ENDIAN, REG_QWORD, REG_SZ,
     };
+
+    #[test]
+    fn fixed_registry_strings_preserve_utf16_contents() {
+        assert_eq!(
+            String::from_utf16(PARAMETERS_SUFFIX).unwrap(),
+            "\\Parameters"
+        );
+        assert_eq!(
+            String::from_utf16(INBOUND_UDP_PID_FALLBACK_VALUE).unwrap(),
+            "EnableInboundUdpCacheMissPidFallback"
+        );
+        assert_eq!(
+            String::from_utf16(IGNORE_SPECIAL_PORTS_VALUE).unwrap(),
+            "IgnoreSpecialPorts"
+        );
+    }
+
+    #[test]
+    fn parameters_path_preserves_original_utf16_units() {
+        let original = [0x005c, 0x0061, 0xd83d, 0xde80, 0x03c0];
+        let parameters_path = build_parameters_path(&original).unwrap();
+
+        assert_eq!(&parameters_path[..original.len()], &original);
+        assert_eq!(&parameters_path[original.len()..], PARAMETERS_SUFFIX);
+        assert_eq!(parameters_path.capacity(), parameters_path.len());
+    }
+
+    #[test]
+    fn parameters_path_accepts_maximum_unicode_string_length() {
+        let max_units = usize::from(u16::MAX) / 2;
+        let original = alloc::vec![u16::from(b'a'); max_units - PARAMETERS_SUFFIX.len()];
+        let parameters_path = build_parameters_path(&original).unwrap();
+
+        assert_eq!(parameters_path.len(), max_units);
+        assert_eq!(&parameters_path[..original.len()], original.as_slice());
+        assert_eq!(&parameters_path[original.len()..], PARAMETERS_SUFFIX);
+    }
+
+    #[test]
+    fn parameters_path_rejects_unicode_string_length_overflow() {
+        let max_units = usize::from(u16::MAX) / 2;
+        let original = alloc::vec![u16::from(b'a'); max_units - PARAMETERS_SUFFIX.len() + 1];
+
+        assert!(build_parameters_path(&original).is_none());
+    }
 
     #[test]
     fn settings_default_to_disabled() {

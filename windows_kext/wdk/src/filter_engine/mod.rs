@@ -66,7 +66,7 @@ impl FilterEngine {
                 filter_engine_handle = handle;
             }
             Err(code) => {
-                return Err(format!("failed to initialize filter engine {}", code).to_owned());
+                return Err(format!("failed to initialize filter engine {}", code));
             }
         }
 

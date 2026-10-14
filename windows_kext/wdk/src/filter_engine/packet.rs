@@ -392,6 +392,18 @@ fn resolve_compartment_id(compartment_id: Option<u32>) -> COMPARTMENT_ID {
         .unwrap_or(UNSPECIFIED_COMPARTMENT_ID)
 }
 
+#[inline]
+fn capture_ale_control_data<'a>(
+    inbound: bool,
+    get_control_data: impl FnOnce() -> Option<&'a [u8]>,
+) -> Option<Box<[u8]>> {
+    // Only outbound transport-send injection consumes control data.
+    if inbound {
+        return None;
+    }
+    get_control_data().map(|cd| cd.to_vec().into_boxed_slice())
+}
+
 impl TransportPacketList {
     /// Packet bytes exposed to user space. Inbound ALE clones start at the IP
     /// header for reinjection, but connection events are transport-layer records.
@@ -548,9 +560,7 @@ impl Injector {
         interface_index: u32,
         sub_interface_index: u32,
     ) -> Result<TransportPacketList, String> {
-        let control_data = callout_data
-            .get_control_data()
-            .map(|cd| cd.to_vec().into_boxed_slice());
+        let control_data = capture_ale_control_data(inbound, || callout_data.get_control_data());
 
         let address_length = if ipv6 { 16 } else { 4 };
         if remote_ip_slice.len() != address_length {
@@ -1108,10 +1118,10 @@ unsafe extern "system" fn free_transport_packet(
 #[cfg(test)]
 mod tests {
     use super::{
-        has_live_network_injection_context, is_recaptured_network_completion, packet_injection_origin,
-        reclaim_immediate_injection_failure, resolve_compartment_id,
-        InjectionCompletion, InjectionPath, PacketInjectionOrigin, TransportProtocol,
-        UNSPECIFIED_COMPARTMENT_ID,
+        capture_ale_control_data, has_live_network_injection_context,
+        is_recaptured_network_completion, packet_injection_origin,
+        reclaim_immediate_injection_failure, resolve_compartment_id, InjectionCompletion,
+        InjectionPath, PacketInjectionOrigin, TransportProtocol, UNSPECIFIED_COMPARTMENT_ID,
     };
     use crate::ffi::FWPS_PACKET_INJECTION_STATE;
     use alloc::{boxed::Box, sync::Arc};
@@ -1276,6 +1286,31 @@ mod tests {
             assert!(!protocol.uses_network_send_for_ale(false, true));
             assert!(!protocol.uses_network_send_for_ale(true, false));
         }
+    }
+
+    #[test]
+    fn inbound_ale_does_not_read_control_data() {
+        let control_data =
+            capture_ale_control_data(true, || panic!("inbound ALE must not read control data"));
+
+        assert!(control_data.is_none());
+    }
+
+    #[test]
+    fn outbound_ale_preserves_absent_control_data() {
+        assert!(capture_ale_control_data(false, || None).is_none());
+    }
+
+    #[test]
+    fn outbound_ale_control_data_is_independently_owned() {
+        let mut original = alloc::vec![1, 2, 3, 4];
+        let control_data = capture_ale_control_data(false, || Some(original.as_slice())).unwrap();
+
+        assert_eq!(control_data.as_ref(), original.as_slice());
+        assert_ne!(control_data.as_ptr(), original.as_ptr());
+        original.fill(0);
+        drop(original);
+        assert_eq!(control_data.as_ref(), &[1, 2, 3, 4]);
     }
 
     #[test]

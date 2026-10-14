@@ -325,16 +325,9 @@ pub struct BandwidthValueV4 {
 }
 
 impl BandwidthValueV4 {
-    fn get_size(&self) -> usize {
-        get_combined_size!(
-            self.local_ip,
-            self.local_port,
-            self.remote_ip,
-            self.remote_port,
-            self.transmitted_bytes,
-            self.received_bytes
-        )
-    }
+    const SERIALIZED_SIZE: usize = 2 * core::mem::size_of::<[u8; 4]>()
+        + 2 * core::mem::size_of::<u16>()
+        + 2 * core::mem::size_of::<u64>();
 }
 
 impl PushBytes for BandwidthValueV4 {
@@ -358,16 +351,9 @@ pub struct BandwidthValueV6 {
 }
 
 impl BandwidthValueV6 {
-    fn get_size(&self) -> usize {
-        get_combined_size!(
-            self.local_ip,
-            self.local_port,
-            self.remote_ip,
-            self.remote_port,
-            self.transmitted_bytes,
-            self.received_bytes
-        )
-    }
+    const SERIALIZED_SIZE: usize = 2 * core::mem::size_of::<[u8; 16]>()
+        + 2 * core::mem::size_of::<u16>()
+        + 2 * core::mem::size_of::<u64>();
 }
 
 impl PushBytes for BandwidthValueV6 {
@@ -381,38 +367,158 @@ impl PushBytes for BandwidthValueV6 {
     }
 }
 
-pub fn bandiwth_stats_array_v4(protocol: u8, values: Vec<BandwidthValueV4>) -> Info {
-    let mut size = get_combined_size!(protocol, values.len() as u32);
-
-    if !values.is_empty() {
-        size += values[0].get_size() * values.len();
-    }
+pub fn bandiwth_stats_array_v4<I>(protocol: u8, values: I) -> Info
+where
+    I: IntoIterator<Item = BandwidthValueV4>,
+    I::IntoIter: ExactSizeIterator,
+{
+    let values = values.into_iter();
+    let count = values.len();
+    let size =
+        get_combined_size!(protocol, count as u32) + BandwidthValueV4::SERIALIZED_SIZE * count;
 
     let mut info = Info::new(InfoType::BandwidthStatsV4, size);
     let vec = &mut info.0;
     push_bytes!(vec, protocol);
-    push_bytes!(vec, values.len() as u32);
+    push_bytes!(vec, count as u32);
     for v in values {
         push_bytes!(vec, v);
     }
     info
 }
 
-pub fn bandiwth_stats_array_v6(protocol: u8, values: Vec<BandwidthValueV6>) -> Info {
-    let mut size = get_combined_size!(protocol, values.len() as u32);
-
-    if !values.is_empty() {
-        size += values[0].get_size() * values.len();
-    }
+pub fn bandiwth_stats_array_v6<I>(protocol: u8, values: I) -> Info
+where
+    I: IntoIterator<Item = BandwidthValueV6>,
+    I::IntoIter: ExactSizeIterator,
+{
+    let values = values.into_iter();
+    let count = values.len();
+    let size =
+        get_combined_size!(protocol, count as u32) + BandwidthValueV6::SERIALIZED_SIZE * count;
 
     let mut info = Info::new(InfoType::BandwidthStatsV6, size);
     let vec = &mut info.0;
     push_bytes!(vec, protocol);
-    push_bytes!(vec, values.len() as u32);
+    push_bytes!(vec, count as u32);
     for v in values {
         push_bytes!(vec, v);
     }
     info
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        bandiwth_stats_array_v4, bandiwth_stats_array_v6, BandwidthValueV4, BandwidthValueV6,
+    };
+    use alloc::{collections::BTreeMap, vec};
+    use core::cell::Cell;
+
+    #[test]
+    fn empty_bandwidth_iterators_preserve_wire_headers() {
+        let v4 = bandiwth_stats_array_v4(17, core::iter::empty::<BandwidthValueV4>());
+        let v6 = bandiwth_stats_array_v6(6, core::iter::empty::<BandwidthValueV6>());
+
+        assert_eq!(v4.as_bytes(), &[5, 5, 0, 0, 0, 17, 0, 0, 0, 0]);
+        assert_eq!(v6.as_bytes(), &[6, 5, 0, 0, 0, 6, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn bandwidth_v4_iterator_preserves_field_order_and_little_endian() {
+        let info = bandiwth_stats_array_v4(
+            17,
+            [BandwidthValueV4 {
+                local_ip: [1, 2, 3, 4],
+                local_port: 0x1234,
+                remote_ip: [5, 6, 7, 8],
+                remote_port: 0x5678,
+                transmitted_bytes: 0x0102_0304_0506_0708,
+                received_bytes: 0x1112_1314_1516_1718,
+            }],
+        );
+
+        assert_eq!(
+            info.as_bytes(),
+            &[
+                5, 33, 0, 0, 0, 17, 1, 0, 0, 0, 1, 2, 3, 4, 0x34, 0x12, 5, 6, 7, 8, 0x78, 0x56, 8,
+                7, 6, 5, 4, 3, 2, 1, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11,
+            ]
+        );
+        info.assert_size();
+    }
+
+    #[test]
+    fn bandwidth_v6_vec_preserves_field_order_and_little_endian() {
+        let info = bandiwth_stats_array_v6(
+            6,
+            vec![BandwidthValueV6 {
+                local_ip: [1; 16],
+                local_port: 0x1234,
+                remote_ip: [2; 16],
+                remote_port: 0x5678,
+                transmitted_bytes: 0x0102_0304_0506_0708,
+                received_bytes: 0x1112_1314_1516_1718,
+            }],
+        );
+        let mut expected = vec![6, 57, 0, 0, 0, 6, 1, 0, 0, 0];
+        expected.extend_from_slice(&[1; 16]);
+        expected.extend_from_slice(&[0x34, 0x12]);
+        expected.extend_from_slice(&[2; 16]);
+        expected.extend_from_slice(&[0x78, 0x56]);
+        expected.extend_from_slice(&[8, 7, 6, 5, 4, 3, 2, 1]);
+        expected.extend_from_slice(&[0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11]);
+
+        assert_eq!(info.as_bytes(), expected.as_slice());
+        info.assert_size();
+    }
+
+    #[test]
+    fn bandwidth_serializes_owned_map_once_in_key_order() {
+        let stats = BTreeMap::from([(2u8, 20u64), (1, 10)]);
+        let visited = Cell::new(0);
+        let values = stats.into_iter().map(|(id, bytes)| {
+            visited.set(visited.get() + 1);
+            BandwidthValueV4 {
+                local_ip: [id; 4],
+                local_port: 0,
+                remote_ip: [0; 4],
+                remote_port: 0,
+                transmitted_bytes: bytes,
+                received_bytes: 0,
+            }
+        });
+        assert_eq!(visited.get(), 0);
+
+        let info = bandiwth_stats_array_v4(6, values);
+        let bytes = info.as_bytes();
+        assert_eq!(visited.get(), 2);
+        assert_eq!(bytes.len(), 10 + 28 * 2);
+        assert_eq!(&bytes[..10], &[5, 61, 0, 0, 0, 6, 2, 0, 0, 0]);
+        assert_eq!(&bytes[10..14], &[1; 4]);
+        assert_eq!(&bytes[38..42], &[2; 4]);
+        assert_eq!(&bytes[22..30], &10u64.to_le_bytes());
+        assert_eq!(&bytes[50..58], &20u64.to_le_bytes());
+        info.assert_size();
+    }
+
+    #[test]
+    fn bandwidth_v6_iterator_serializes_full_u32_count() {
+        let count = 300;
+        let values = (0..count).map(|_| BandwidthValueV6 {
+            local_ip: [0; 16],
+            local_port: 0,
+            remote_ip: [0; 16],
+            remote_port: 0,
+            transmitted_bytes: 0,
+            received_bytes: 0,
+        });
+        let info = bandiwth_stats_array_v6(17, values);
+
+        assert_eq!(info.as_bytes().len(), 10 + 52 * count);
+        assert_eq!(&info.as_bytes()[6..10], &(count as u32).to_le_bytes());
+        info.assert_size();
+    }
 }
 
 #[cfg(test)]

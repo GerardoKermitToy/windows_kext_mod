@@ -45,17 +45,14 @@ impl Bandwidth {
             core::mem::take(&mut *stats_map)
         };
 
-        let mut values = alloc::vec::Vec::with_capacity(stats_map.len());
-        for (key, value) in stats_map {
-            values.push(BandwidthValueV4 {
-                local_ip: key.local_ip.0,
-                local_port: key.local_port,
-                remote_ip: key.remote_ip.0,
-                remote_port: key.remote_port,
-                transmitted_bytes: value.transmitted_bytes as u64,
-                received_bytes: value.received_bytes as u64,
-            });
-        }
+        let values = stats_map.into_iter().map(|(key, value)| BandwidthValueV4 {
+            local_ip: key.local_ip.0,
+            local_port: key.local_port,
+            remote_ip: key.remote_ip.0,
+            remote_port: key.remote_port,
+            transmitted_bytes: value.transmitted_bytes as u64,
+            received_bytes: value.received_bytes as u64,
+        });
         Some(protocol::info::bandiwth_stats_array_v4(
             u8::from(IpProtocol::Tcp),
             values,
@@ -71,17 +68,14 @@ impl Bandwidth {
             core::mem::take(&mut *stats_map)
         };
 
-        let mut values = alloc::vec::Vec::with_capacity(stats_map.len());
-        for (key, value) in stats_map {
-            values.push(BandwidthValueV6 {
-                local_ip: key.local_ip.0,
-                local_port: key.local_port,
-                remote_ip: key.remote_ip.0,
-                remote_port: key.remote_port,
-                transmitted_bytes: value.transmitted_bytes as u64,
-                received_bytes: value.received_bytes as u64,
-            });
-        }
+        let values = stats_map.into_iter().map(|(key, value)| BandwidthValueV6 {
+            local_ip: key.local_ip.0,
+            local_port: key.local_port,
+            remote_ip: key.remote_ip.0,
+            remote_port: key.remote_port,
+            transmitted_bytes: value.transmitted_bytes as u64,
+            received_bytes: value.received_bytes as u64,
+        });
         Some(protocol::info::bandiwth_stats_array_v6(
             u8::from(IpProtocol::Tcp),
             values,
@@ -97,17 +91,14 @@ impl Bandwidth {
             core::mem::take(&mut *stats_map)
         };
 
-        let mut values = alloc::vec::Vec::with_capacity(stats_map.len());
-        for (key, value) in stats_map {
-            values.push(BandwidthValueV4 {
-                local_ip: key.local_ip.0,
-                local_port: key.local_port,
-                remote_ip: key.remote_ip.0,
-                remote_port: key.remote_port,
-                transmitted_bytes: value.transmitted_bytes as u64,
-                received_bytes: value.received_bytes as u64,
-            });
-        }
+        let values = stats_map.into_iter().map(|(key, value)| BandwidthValueV4 {
+            local_ip: key.local_ip.0,
+            local_port: key.local_port,
+            remote_ip: key.remote_ip.0,
+            remote_port: key.remote_port,
+            transmitted_bytes: value.transmitted_bytes as u64,
+            received_bytes: value.received_bytes as u64,
+        });
         Some(protocol::info::bandiwth_stats_array_v4(
             u8::from(IpProtocol::Udp),
             values,
@@ -123,17 +114,14 @@ impl Bandwidth {
             core::mem::take(&mut *stats_map)
         };
 
-        let mut values = alloc::vec::Vec::with_capacity(stats_map.len());
-        for (key, value) in stats_map {
-            values.push(BandwidthValueV6 {
-                local_ip: key.local_ip.0,
-                local_port: key.local_port,
-                remote_ip: key.remote_ip.0,
-                remote_port: key.remote_port,
-                transmitted_bytes: value.transmitted_bytes as u64,
-                received_bytes: value.received_bytes as u64,
-            });
-        }
+        let values = stats_map.into_iter().map(|(key, value)| BandwidthValueV6 {
+            local_ip: key.local_ip.0,
+            local_port: key.local_port,
+            remote_ip: key.remote_ip.0,
+            remote_port: key.remote_port,
+            transmitted_bytes: value.transmitted_bytes as u64,
+            received_bytes: value.received_bytes as u64,
+        });
         Some(protocol::info::bandiwth_stats_array_v6(
             u8::from(IpProtocol::Udp),
             values,
