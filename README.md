@@ -14,7 +14,7 @@ The modifications change the internal implementation without changing the API ex
 - command IDs, payload layouts, and verdict values;
 - IOCTL values and responses.
 
-A client written for the original Portmaster Windows Kernel Extension can communicate with this modified driver without protocol changes. Unless stated otherwise, references to "the driver" below mean this modified, API-compatible implementation.
+A client written for the original Portmaster Windows Kernel Extension can communicate with this modified driver without protocol changes. The optional [`IOCTL_GET_THREAD_ID`](#ioctl_get_thread_id) is an additive extension: existing IOCTL values and responses and all command/event layouts remain unchanged. Unless stated otherwise, references to "the driver" below mean this modified, API-compatible implementation.
 
 The driver and its user-mode controller operate as one system:
 
@@ -22,9 +22,9 @@ The driver and its user-mode controller operate as one system:
 - `windows_kext/protocol` — the source of truth for the binary protocol;
 - `windows_kext/wdk` and `windows_kext/c_helper` — wrappers around WDK, KMDF, WFP, and NDIS;
 - `windows_kext/kextinterface` — the Go implementation of the client protocol;
-- `kext_client` — the C++ client and the `kext_monitor.exe` diagnostic tool.
+- `kext_client` — the C++ client library.
 
-The packet path through WFP is described in detail in [windows_kext/PacketFlow.md](windows_kext/PacketFlow.md). This document defines the complete external driver API: the control device, `ReadFile`/`WriteFile`, IOCTLs, commands, events, and enumeration values. Internal Rust functions and the `kext_monitor` named-pipe protocol are not part of the driver API.
+The packet path through WFP is described in detail in [windows_kext/PacketFlow.md](windows_kext/PacketFlow.md). This document defines the complete external driver API: the control device, `ReadFile`/`WriteFile`, IOCTLs, commands, events, and enumeration values. Internal Rust functions are not part of the driver API.
 
 ## Key properties
 
@@ -39,6 +39,54 @@ The driver creates 16 WFP callouts:
 A new packet without a permanent cached decision is blocked and retained until the user-mode process responds. User mode receives a `ConnectionIpv4` or `ConnectionIpv6` event with a unique request ID and responds with a `Verdict` command. An accepted packet clone is then returned to the network stack asynchronously through a WFP injection API.
 
 `Permanent*` in a verdict name means that the decision remains cached for the lifetime of that specific connection-cache instance. It does not create a global firewall rule. A new connection that reuses the same five-tuple after the old connection ends must receive a new decision.
+
+## Registry settings
+
+The driver supports two optional `REG_DWORD` values under:
+
+```text
+HKLM\SYSTEM\CurrentControlSet\Services\PortmasterKext\Parameters
+```
+
+Only a DWORD value of exactly `1` enables an option. A missing value, a different registry type, malformed data, or any other DWORD value leaves it disabled. Both options are read **once in `DriverEntry`, before WFP filtering starts**. The driver does not monitor registry changes; a change takes effect only after unloading and reloading the driver, not after reopening the device or clearing the cache.
+
+| Value name | Driver default when absent |
+|---|---:|
+| `EnableInboundUdpCacheMissPidFallback` | `0` (disabled) |
+| `IgnoreSpecialPorts` | `0` (disabled) |
+
+These registry options do not add commands or change the driver wire protocol.
+
+### `EnableInboundUdpCacheMissPidFallback`
+
+With this option enabled, an inbound IPv4 or IPv6 UDP packet that misses the normal connection-cache lookup can borrow a PID from the first active UDP entry matching `(local_ip, local_port, remote_ip)` in the same IP family. The donor's `remote_port` is ignored. If several entries match, the first active match is used; this is heuristic PID attribution, not proof of the packet's socket owner.
+
+If no match exists, or the selected PID is `0` or `4`, the packet proceeds to native `ALE_AUTH_RECV_ACCEPT` authorization. Disabling the option preserves this ALE path for inbound UDP cache misses. Exact cache hits are unchanged.
+
+A successful fallback creates a separate inbound cache entry for the packet's **exact five-tuple**, with the borrowed PID, TID `0`, and its own initially `Undecided` policy and connection-instance ID. It does not copy the donor's verdict or lifetime, and it does not overwrite an exact entry registered concurrently. The user-mode decision request contains network-layer bytes (`payload_layer = 3`); a `PermanentAccept` or another permanent verdict is cached for this new exact instance, so later packets with the same tuple can reuse it in either direction.
+
+Until associated with a native UDP endpoint, the heuristic entry is eligible for expiration after 60 seconds of inactivity during `CleanEndedConnections`. Once native lifecycle tracking is attached, endpoint closure governs its lifetime instead.
+
+See [windows_kext/INBOUND_UDP_PID_FALLBACK.md](windows_kext/INBOUND_UDP_PID_FALLBACK.md) for matching and cache-lifecycle details.
+
+### `IgnoreSpecialPorts`
+
+Despite its name, setting this option to `1` does **not** exempt traffic on special ports from filtering. It disables the historical port-based packet bypasses and reverse-redirect cache lookup. Such packets use ordinary exact-tuple cache lookup and policy handling instead of receiving an implicit exception or being matched to another connection through the special-port reverse lookup.
+
+When `IgnoreSpecialPorts = 0`, the following historical shortcuts remain active for IPv4 and IPv6:
+
+| Shortcut | Condition |
+|---|---|
+| Automatic packet permit | Local and remote IP addresses are equal, and the **local port** is `53` (DNS), `717` (tunnel), or `719` (split tunnel) |
+| DNS reverse-redirect lookup | The **remote port** is `53` and the remote address is the IP family's loopback address |
+| Tunnel reverse-redirect lookup | The **remote port** is `717` and local and remote IP addresses are equal |
+| Split-tunnel reverse-redirect lookup | The **remote port** is `719` and local and remote IP addresses are equal |
+
+The port conditions can match TCP or UDP and apply in either packet direction. They use the cache-normalized local/remote endpoints, not fixed source/destination positions: the local port is the source port outbound and the destination port inbound. There is no blanket bypass for all traffic whose remote port is one of these special ports. Reverse lookup searches redirect aliases within the same protocol/local-port cache group.
+
+Explicit redirect verdicts remain available with `IgnoreSpecialPorts = 1`, including forward address/port rewriting, but special-port reverse-redirect lookup is disabled; clients relying on the historical reply-matching behavior must account for this setting.
+
+See [windows_kext/IGNORE_SPECIAL_PORTS.md](windows_kext/IGNORE_SPECIAL_PORTS.md) for the affected ports and matching rules.
 
 ## Device access
 
@@ -70,7 +118,7 @@ HANDLE device = CreateFileW(
     nullptr);
 ```
 
-Use a single reader thread. `ReadFile`, `WriteFile`, and both IOCTL handlers require `PASSIVE_LEVEL` inside the driver.
+Use a single reader thread. `ReadFile`, `WriteFile`, and all IOCTL handlers require `PASSIVE_LEVEL` inside the driver.
 
 ## Wire-format conventions
 
@@ -176,6 +224,8 @@ In a connection event, this is the effective direction of the packet being decid
 | `4` | Transport/ALE | Transport-layer bytes; the initial outbound TCP connect normally has no captured payload |
 
 A connection event is a decision request, not a guarantee of one event per logical connection. While a decision is temporary or the connection remains `Undecided`, multiple packets with the same five-tuple can receive distinct IDs. A WFP indication containing multiple `NET_BUFFER` objects is split into one event and one request ID per packet. Every nonzero ID should receive exactly one `Verdict`, even when a UI or display filter hides the event.
+
+Thread IDs are not included in the connection-event payload. To obtain the captured TID for an event's `id`, query [`IOCTL_GET_THREAD_ID`](#ioctl_get_thread_id) before sending that request's verdict.
 
 A successful `WriteFile` for a verdict means that the driver accepted the command; it does not confirm delivery of the reinjected packet. WFP injection completes asynchronously, and a final injection failure is written to the driver's log ring. Independent UDP reinjections do not form a FIFO contract, so this API does not guarantee the delivery order of accepted UDP datagrams.
 
@@ -332,7 +382,7 @@ Payload:
 | `10` | `Failed` | Fail closed, representing a persistent policy-decision failure |
 | `11` | `RedirectSplitTunnel` | Redirect TCP/UDP traffic to the local address on port `719` |
 
-Redirect verdicts are cached for the connection. Outbound packets receive a rewritten destination address and port with recalculated IP/TCP/UDP checksums. Reverse traffic is rewritten back so that the application continues to observe the original remote endpoint. Redirects are meaningful only for a live TCP/UDP cache instance. If redirect state is unavailable or a packet cannot be rewritten safely, the packet is dropped and an error is recorded in the log ring.
+Redirect verdicts are cached for the connection. Outbound packets receive a rewritten destination address and port with recalculated IP/TCP/UDP checksums. With `IgnoreSpecialPorts = 0`, the historical reverse-redirect lookup allows reply traffic to be rewritten back so that the application continues to observe the original remote endpoint. `IgnoreSpecialPorts = 1` disables this lookup, as described in [Registry settings](#ignorespecialports). Redirects are meaningful only for a live TCP/UDP cache instance. If redirect state is unavailable or a packet cannot be rewritten safely, the packet is dropped and an error is recorded in the log ring.
 
 For a stateless packet with no connection instance, such as some ICMP traffic or externally injected traffic observed after the original endpoint closed, the verdict applies only to the specified request ID. Even `PermanentAccept` does not create a persistent entry for later stateless packets.
 
@@ -404,16 +454,16 @@ The statistics are generated as log lines and do not enter the output stream by 
 Performs periodic state maintenance:
 
 - removes ended history after its 60-second grace period;
-- ends outbound fallback connections without native lifecycle identity after 60 seconds of inactivity and emits their end events;
+- ends untracked packet-layer fallback connections, including heuristic inbound UDP entries created by `EnableInboundUdpCacheMissPidFallback`, after 60 seconds of inactivity and emits their end events;
 - ends local TCP authorizations that have not reached `FLOW_ESTABLISHED` within 10 seconds;
 - reconciles stale UDP endpoint and flow registrations;
 - removes expired ICMP echo mappings.
 
-The production client and `kext_monitor` send this command every 30 seconds. The driver does not run this periodic sweep autonomously.
+The user-mode client is responsible for sending this command periodically. The driver does not run this periodic sweep autonomously.
 
 ## IOCTL API
 
-Both control codes use:
+All control codes use:
 
 ```text
 CTL_CODE(40000, function, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
@@ -425,6 +475,7 @@ The device handle must therefore have both read and write access.
 |---|---:|---:|---:|---|
 | `IOCTL_VERSION` | `0x9C40E000` | None | Exactly 4 bytes | Wire-interface version |
 | `IOCTL_SHUTDOWN_REQUEST` | `0x9C40E004` | None | None | Final driver shutdown |
+| `IOCTL_GET_THREAD_ID` | `0x9C40E008` | 8-byte request ID | Exactly 8 bytes | Captured thread ID for a CONN request, or `0` |
 
 ### `IOCTL_VERSION`
 
@@ -434,21 +485,51 @@ Returns the four raw bytes stored in `windows_kext/kextinterface/version.txt`. T
 
 Performs the same operation as the `Shutdown` command. The IOCTL provides a convenient out-of-band final request while an overlapped read is waiting. It has no output.
 
+### `IOCTL_GET_THREAD_ID`
+
+Uses function number `0x802`:
+
+```text
+CTL_CODE(40000, 0x802, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
+```
+
+Returns the Windows thread ID captured for the request `id` from a `ConnectionIpv4` or `ConnectionIpv6` event. This is the same ID used by the `Verdict` command, also named `external_connection_id` in some client headers; it is not a PID or the driver's internal connection-instance ID.
+
+| Buffer | Offset | Size | Field |
+|---|---:|---:|---|
+| Input | `0` | 8 | `id` (`u64` LE) |
+| Output | `0` | 8 | `thread_id` (`u64` LE) |
+
+A successful request returns exactly eight bytes. The value is `0` if the ID is unknown, `0`, already completed or retired, or has no attributed TID. A missing TID is a successful result, not an IOCTL error.
+
+- Input shorter than eight bytes fails with `STATUS_INVALID_PARAMETER`.
+- With valid input, output shorter than eight bytes fails with `STATUS_BUFFER_TOO_SMALL`.
+- Both failures report zero returned bytes, without partial output.
+- Larger input buffers are accepted; only the first eight bytes are read. Larger output buffers still receive exactly eight bytes.
+
+**Query before sending or scheduling the verdict.** The driver snapshots the exact live connection generation's TID when publishing CONN and retains it while the request is pending or its verdict is being applied. The snapshot is discarded when verdict processing finishes, the request is retired, or the pending cache is cleared. Outbound UDP requests retained after socket closure keep their snapshot until the verdict finishes, even though they are detached from the ended connection. Reusing the same connection tuple cannot redirect an old request ID to a replacement connection's TID.
+
+The saved TID originates from outbound TCP/UDP ALE authorization, excluding PID `0`, PID `4`, and the user-mode controller that owns the driver handle. It is not the thread that calls the IOCTL, nor necessarily the thread that sent each subsequent packet. Requests without that attribution return `0`; the connection-event wire format remains unchanged.
+
+The handler performs one indexed `BTreeMap<id, thread_id>` lookup (`O(log N)`) under the existing packet-cache lock. It does not search packet or connection arrays, allocate memory, or write a log record per query.
+
+This IOCTL is an extension of the modified driver, not a requirement for original Portmaster API compatibility. A driver without this extension can reject it with `STATUS_NOT_IMPLEMENTED`; clients should still send the required verdict if the optional query fails. The C++ wrapper is `Driver::GetThreadId(id, thread_id, error)`.
+
 An unknown IOCTL completes with `STATUS_NOT_IMPLEMENTED`.
 
 ## Recommended client lifecycle
 
-1. Install and start the kernel-driver service, or use an already installed release driver.
+1. Configure any [registry settings](#registry-settings) before starting the kernel-driver service, or use an already installed release driver.
 2. Open `\\.\PortmasterKext` with `GENERIC_READ | GENERIC_WRITE`, share mode `0`, and `FILE_FLAG_OVERLAPPED`.
 3. Check `IOCTL_VERSION` before beginning protocol communication.
 4. Start one persistent overlapped read and assemble records independently of read boundaries.
-5. Respond to every nonzero connection request ID. Display filters must not suppress verdicts.
+5. If a thread ID is needed, query `IOCTL_GET_THREAD_ID` using the event's `id` before sending or scheduling its verdict. Respond to every nonzero connection request ID, even if the optional query fails. Display filters must not suppress verdicts.
 6. Send `CleanEndedConnections` periodically and request logs or bandwidth statistics as needed.
 7. To terminate, issue `IOCTL_SHUTDOWN_REQUEST` or the `Shutdown` command.
 8. Wait for and reap the pending read, then close the device handle.
 9. Stop the service only after closing the handle. A non-PnP driver cannot finish unloading while its control device remains open.
 
-Do not forcibly terminate a controller with an open handle and then expect `sc stop` to complete: the service can remain in `STOP_PENDING`. Diagnostic runs should always use a bounded `--duration`.
+Do not forcibly terminate a controller with an open handle and then expect `sc stop` to complete: the service can remain in `STOP_PENDING`.
 
 ## C++ API (`kext_client`)
 
@@ -459,11 +540,12 @@ The [kext_client/include/PortmasterKext.h](kext_client/include/PortmasterKext.h)
 | Method | Purpose |
 |---|---|
 | `Driver(service_name)` | Constructs a controller; the default name is `PortmasterKext` |
-| `Install(sys_path, error)` | Creates and starts a demand-start kernel service using an absolute path; an existing service is treated as a conflict |
+| `Install(sys_path, error, inbound_udp_pid_fallback = true)` | Creates and starts a demand-start kernel service using an absolute path; writes `EnableInboundUdpCacheMissPidFallback` from the optional argument and always writes `IgnoreSpecialPorts = 1` before loading; an existing service is treated as a conflict |
 | `Open(error)` | Opens the overlapped device handle and starts the named-pipe bridge server |
 | `Run(handlers, poll_interval_ms)` | Reads and dispatches events until `Stop`; calls `on_poll` at the requested interval |
 | `Stop()` | Signals `Run` and submits the shutdown IOCTL once |
 | `GetVersion(out, error)` | Calls `IOCTL_VERSION` |
+| `GetThreadId(id, thread_id, error)` | Calls `IOCTL_GET_THREAD_ID`; returns `true` on success and writes the captured TID or `0` to `thread_id` |
 | `RequestShutdown(error)` | Calls `IOCTL_SHUTDOWN_REQUEST` |
 | `SendVerdict(id, verdict, error)` | Encodes and sends a `Verdict` command |
 | `RequestLogs(error)` | Sends `GetLogs` |
@@ -513,14 +595,6 @@ Build the C++ client with:
 ```bat
 C:\portmaster_v3\kext_client\build.bat
 ```
-
-Always use `--duration` for a bounded smoke test. The monitor creates, starts, stops, and removes its driver service automatically:
-
-```bat
-C:\portmaster_v3\kext_client\build\kext_monitor.exe --duration 10 C:\portmaster_v3\windows_kext\portmaster-kext.sys
-```
-
-By default, the monitor responds to every nonzero request ID with `PermanentAccept`. `--no-verdicts` intentionally stalls pending traffic, while global block, drop, or redirect verdicts can disconnect the machine. Apply those verdicts only with a narrow `--match` and a bounded `--duration`. Run `kext_monitor.exe --help` for the complete option list.
 
 ## License
 
