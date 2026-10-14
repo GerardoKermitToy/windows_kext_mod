@@ -1,4 +1,5 @@
 use alloc::string::{String, ToString};
+use core::mem::MaybeUninit;
 use smoltcp::wire::{IPV4_HEADER_LEN, IPV6_HEADER_LEN};
 use wdk::filter_engine::callout_data::CalloutData;
 use wdk::filter_engine::layer;
@@ -14,8 +15,8 @@ use crate::connection::{
 use crate::connection_cache::ConnectionCache;
 use crate::connection_map::Key;
 use crate::device::{Device, Packet};
-use crate::packet_metadata::IcmpError;
-use crate::packet_util::{inspect_packet, recalc_header_checksums, Redirect};
+use crate::packet_metadata::{IcmpError, PacketInspector, PacketMetadataError};
+use crate::packet_util::{packet_reader, recalc_header_checksums, Redirect};
 
 struct PacketLayerFields {
     interface_index: usize,
@@ -234,32 +235,29 @@ fn ip_packet_layer(
                 return;
             }
         }
-        let inspection = inspect_packet(&nbl, ipv6, direction, permit_fragments);
-        // Individual fragments bypass transport parsing and reach reassembly.
-        // Preserve the indication-wide bypass based on the first NBL.
-        if permit_fragments && inspection.is_fragment {
-            data.action_permit();
-            return;
-        }
-        first = false;
-
-        // A failed first probe used to retry on the normal pass. Keep that chance
-        // for transient NDIS materialization failures without rereading on success.
-        let metadata = inspection.metadata.or_else(|err| {
-            if permit_fragments {
-                inspect_packet(&nbl, ipv6, direction, false).metadata
-            } else {
-                Err(err)
+        let mut storage = MaybeUninit::uninit();
+        let mut reader = packet_reader(&nbl, &mut storage);
+        let mut inspection = PacketInspector::new(&mut reader, ipv6, direction, permit_fragments);
+        // Resolve fragment status and key in one pass. Individual fragments still
+        // bypass transport parsing and preserve the indication-wide first-NBL
+        // permit; do not call a separate header accessor on every normal packet.
+        let key = match inspection.key() {
+            Err(PacketMetadataError::FragmentRequiresReassembly) if permit_fragments => {
+                data.action_permit();
+                return;
             }
-        });
-        let packet_metadata = match metadata {
-            Ok(metadata) => metadata,
+            // Keep the old first probe's one retry after a real failure only.
+            Err(_) if permit_fragments => inspection.retry_key(),
+            result => result,
+        };
+        let mut key = match key {
+            Ok(key) => key,
             Err(err) => {
                 crate::err!("failed to get key from nbl: {}", err);
                 return;
             }
         };
-        let mut key = packet_metadata.key;
+        first = false;
 
         if fast_track_pm_packets(&key) {
             data.action_permit();
@@ -285,7 +283,8 @@ fn ip_packet_layer(
 
         // Resets never need a userspace verdict, but cached redirects must
         // rewrite their tuple below, even after the sending endpoint closes.
-        if packet_metadata.is_tcp_reset
+        if key.protocol == smoltcp::wire::IpProtocol::Tcp
+            && inspection.is_tcp_reset()
             && connection_info
                 .as_ref()
                 .and_then(|info| info.redirect_info.as_ref())
@@ -294,6 +293,14 @@ fn ip_packet_layer(
             data.action_permit();
             return;
         }
+
+        let icmp_metadata = if !transport_protocol {
+            inspection.icmp_metadata(&key)
+        } else {
+            Default::default()
+        };
+        drop(inspection);
+        drop(reader);
 
         let mut process_id = 0;
         let mut thread_id = 0;
@@ -329,8 +336,8 @@ fn ip_packet_layer(
         // replies use their identifier and sequence number.
         if !transport_protocol {
             match direction {
-                Direction::Outbound if !packet_metadata.is_local_icmp_error => {
-                    if let Some(echo) = packet_metadata.icmp_echo {
+                Direction::Outbound if !icmp_metadata.is_local_error => {
+                    if let Some(echo) = icmp_metadata.echo {
                         if !echo.is_request {
                             // WFP reports a loopback reply as OUTBOUND, so its source
                             // is the request's remote address. Match the reversed key,
@@ -386,7 +393,7 @@ fn ip_packet_layer(
                 _ => {
                     // Attribute only: the outer ICMP key, verdict and lifetime
                     // must not become those of the quoted connection.
-                    let request = match packet_metadata.icmp_error {
+                    let request = match icmp_metadata.error {
                         Some(IcmpError::Transport(
                             protocol,
                             remote_address,
@@ -423,8 +430,8 @@ fn ip_packet_layer(
                         Some(IcmpError::Echo(address, identifier, sequence)) => {
                             Some((address, identifier, sequence))
                         }
-                        None => packet_metadata
-                            .icmp_echo
+                        None => icmp_metadata
+                            .echo
                             .filter(|echo| !echo.is_request)
                             .map(|echo| (key.remote_address, echo.identifier, echo.sequence)),
                     };
@@ -536,7 +543,10 @@ fn ip_packet_layer(
                 {
                     Ok(registration) => registration,
                     Err(err) => {
-                        crate::err!("failed to register inbound UDP fallback connection: {}", err);
+                        crate::err!(
+                            "failed to register inbound UDP fallback connection: {}",
+                            err
+                        );
                         data.action_permit();
                         return;
                     }
@@ -616,7 +626,7 @@ fn ip_packet_layer(
         };
 
         // Preserve outbound reinjection; only userspace sees a local error as inbound.
-        if packet_metadata.is_local_icmp_error {
+        if icmp_metadata.is_local_error {
             effective_direction = Direction::Inbound;
         }
         if let Some(pending) = device.publish_pending_packet(

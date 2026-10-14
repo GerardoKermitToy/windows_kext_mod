@@ -1,8 +1,8 @@
 use core::fmt;
 
 use smoltcp::wire::{
-    IpAddress, IpProtocol, Ipv6Address, Ipv6ExtHeader, Ipv6FragmentHeader, Ipv6Packet, TcpPacket,
-    UdpPacket, IPV6_HEADER_LEN,
+    IpAddress, IpProtocol, Ipv6Address, Ipv6ExtHeader, Ipv6Packet, TcpPacket, UdpPacket,
+    IPV6_HEADER_LEN,
 };
 
 /// Maximum number of IPv6 extension headers followed before a packet is
@@ -27,6 +27,45 @@ pub(crate) struct Ipv6Headers {
     pub(crate) resolved: bool,
 }
 
+/// A read-only packet source. A prefix is requested only when its fields are
+/// needed; readers may cache it without copying contiguous packet storage.
+pub(crate) trait PacketData {
+    fn len(&self) -> usize;
+    fn prefix(&mut self, length: usize) -> Option<&[u8]>;
+
+    #[inline]
+    fn byte(&mut self, offset: usize) -> Option<u8> {
+        self.prefix(offset.checked_add(1)?)?.get(offset).copied()
+    }
+}
+
+impl<R: PacketData + ?Sized> PacketData for &mut R {
+    #[inline]
+    fn len(&self) -> usize {
+        (**self).len()
+    }
+
+    #[inline]
+    fn prefix(&mut self, length: usize) -> Option<&[u8]> {
+        (**self).prefix(length)
+    }
+
+    #[inline]
+    fn byte(&mut self, offset: usize) -> Option<u8> {
+        (**self).byte(offset)
+    }
+}
+
+impl PacketData for &[u8] {
+    fn len(&self) -> usize {
+        <[u8]>::len(self)
+    }
+
+    fn prefix(&mut self, length: usize) -> Option<&[u8]> {
+        self.get(..length)
+    }
+}
+
 /// Walks the supported IPv6 extension headers and returns the upper-layer
 /// protocol and offset. `packet` must begin at the IPv6 base header.
 ///
@@ -35,7 +74,15 @@ pub(crate) struct Ipv6Headers {
 /// the eighth header points to an upper-layer protocol; a ninth extension
 /// header remains unresolved. With `stop_at_fragment`, a non-atomic Fragment
 /// header ends the walk with `is_fragment = true` and `resolved = false`.
-pub(crate) fn walk_ipv6_headers(packet: &[u8], stop_at_fragment: bool) -> Ipv6Headers {
+pub(crate) fn walk_ipv6_headers(mut packet: &[u8], stop_at_fragment: bool) -> Ipv6Headers {
+    walk_ipv6_headers_reader(&mut packet, stop_at_fragment, true)
+}
+
+pub(crate) fn walk_ipv6_headers_reader(
+    packet: &mut impl PacketData,
+    stop_at_fragment: bool,
+    inspect_routing_header: bool,
+) -> Ipv6Headers {
     let mut result = Ipv6Headers {
         protocol: IpProtocol::Unknown(0),
         transport_offset: IPV6_HEADER_LEN,
@@ -44,11 +91,11 @@ pub(crate) fn walk_ipv6_headers(packet: &[u8], stop_at_fragment: bool) -> Ipv6He
         resolved: false,
     };
 
-    if packet.len() < IPV6_HEADER_LEN {
+    let Some(base_header) = packet.prefix(IPV6_HEADER_LEN) else {
         return result;
-    }
+    };
 
-    let mut protocol = Ipv6Packet::new_unchecked(packet).next_header();
+    let mut protocol = Ipv6Packet::new_unchecked(base_header).next_header();
     let mut offset = IPV6_HEADER_LEN;
     let mut extension_count = 0;
 
@@ -60,22 +107,18 @@ pub(crate) fn walk_ipv6_headers(packet: &[u8], stop_at_fragment: bool) -> Ipv6He
                 }
                 extension_count += 1;
 
-                // The complete Fragment header is eight bytes. smoltcp's
-                // Ipv6FragmentHeader models only the six bytes after Next Header
-                // and Reserved, so pass exactly that sub-slice to it.
-                let Some(end) = offset.checked_add(8) else {
+                // Require the complete eight-byte header to be present, but
+                // only Next Header and the fragment bits need to be read.
+                let Some(end) = offset.checked_add(8).filter(|end| *end <= packet.len()) else {
                     break;
                 };
-                let Some(header) = packet.get(offset..end) else {
+                let Some(prefix) = packet.prefix(offset + 4) else {
                     break;
                 };
-                let Ok(fragment) = Ipv6FragmentHeader::new_checked(&header[2..]) else {
-                    break;
-                };
-
-                protocol = IpProtocol::from(header[0]);
+                let fragment_bits = u16::from_be_bytes([prefix[offset + 2], prefix[offset + 3]]);
+                protocol = IpProtocol::from(prefix[offset]);
                 offset = end;
-                if fragment.frag_offset() != 0 || fragment.more_frags() {
+                if fragment_bits & 0xfff9 != 0 {
                     result.is_fragment = true;
                     if stop_at_fragment {
                         break;
@@ -88,29 +131,36 @@ pub(crate) fn walk_ipv6_headers(packet: &[u8], stop_at_fragment: bool) -> Ipv6He
                 }
                 extension_count += 1;
 
-                let Some(rest) = packet.get(offset..) else {
+                let Some(end) = offset.checked_add(2) else {
                     break;
                 };
-                let Ok(extension) = Ipv6ExtHeader::new_checked(rest) else {
+                let Some(prefix) = packet.prefix(end) else {
                     break;
                 };
-
-                // A checksum pseudo-header uses the final destination when a
-                // Routing header is active. Generic routing types encode that
-                // address differently, so checksum rewriting is rejected below
-                // unless Segments Left is zero and the base destination is final.
-                if protocol == IpProtocol::Ipv6Route
-                    && rest.get(3).copied().unwrap_or_default() != 0
-                {
-                    result.active_routing_header = true;
-                }
-
+                let extension = Ipv6ExtHeader::new_unchecked(&prefix[offset..end]);
+                let next_header = extension.next_header();
                 // Hdr Ext Len counts eight-octet units after the first eight.
                 let length = (extension.header_len() as usize + 1) * 8;
-                protocol = extension.next_header();
-                let Some(next_offset) = offset.checked_add(length) else {
+                // Preserve the checked-header contract without materializing its
+                // uninterpreted body: the whole declared header must be present.
+                let Some(next_offset) = offset
+                    .checked_add(length)
+                    .filter(|end| *end <= packet.len())
+                else {
                     break;
                 };
+
+                // Only checksum rewriting needs Segments Left. Its packet source
+                // is already a slice; metadata inspection does not read options
+                // bodies or routing addresses.
+                if inspect_routing_header && protocol == IpProtocol::Ipv6Route {
+                    result.active_routing_header |= offset
+                        .checked_add(4)
+                        .and_then(|end| packet.prefix(end))
+                        .is_some_and(|prefix| prefix[offset + 3] != 0);
+                }
+
+                protocol = next_header;
                 offset = next_offset;
             }
             _ => {

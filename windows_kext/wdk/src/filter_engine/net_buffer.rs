@@ -14,7 +14,7 @@ use crate::{
         FwpsAllocateNetBufferAndNetBufferList0, FwpsFreeNetBufferList0,
         NdisAdvanceNetBufferDataStart, NdisAllocateNetBufferListPool, NdisFreeNetBufferListPool,
         NdisGetDataBuffer, NdisRetreatNetBufferDataStart, NDIS_HANDLE, NDIS_OBJECT_TYPE_DEFAULT,
-        NET_BUFFER_LIST, NET_BUFFER_LIST_POOL_PARAMETERS,
+        NET_BUFFER, NET_BUFFER_LIST, NET_BUFFER_LIST_POOL_PARAMETERS,
         NET_BUFFER_LIST_POOL_PARAMETERS_REVISION_1,
     },
     utils::check_ntstatus,
@@ -38,47 +38,162 @@ pub enum NetBufferListClones {
 // mutable Rust access to it between those phases.
 unsafe impl Send for NetBufferList {}
 
-// Testable counterpart of NdisGetDataBuffer's prefix/materialization contract.
-//
-// SAFETY: A non-null reader result must contain `length` initialized bytes valid
-// until `inspect` returns. A null result may leave storage partially initialized.
-// The reader must not retain storage or mutate/free the returned bytes during inspection.
-#[inline]
-unsafe fn inspect_prefix<const N: usize, R>(
+/// A bounded, on-demand view of the first net buffer. Construction does not read
+/// packet data. Contiguous prefixes are borrowed from NDIS; split MDLs use the
+/// caller's scratch buffer without moving it. Previously read prefixes are reused.
+pub struct NetBufferReader<'nbl, 'storage, const N: usize> {
+    nb: &'nbl NET_BUFFER,
     data_length: usize,
-    fallback_length: usize,
-    mut read: impl FnMut(usize, *mut u8) -> *mut u8,
-    inspect: impl for<'bytes> FnOnce(&'bytes [u8]) -> R,
-) -> Result<R, ()> {
-    const { assert!(N <= 128, "packet inspection must fit the kernel stack") };
-    if N == 0 {
-        return Ok(inspect(&[]));
-    }
-    let length = core::cmp::min(data_length, N);
-    if length == 0 {
-        return Err(());
+    prefix: PacketPrefix<'storage, N>,
+}
+
+impl<const N: usize> NetBufferReader<'_, '_, N> {
+    pub fn len(&self) -> usize {
+        core::cmp::min(self.data_length, N)
     }
 
-    let mut storage = MaybeUninit::<[u8; N]>::uninit();
-    let storage = storage.as_mut_ptr().cast::<u8>();
-    let ptr = read(length, storage);
-    if !ptr.is_null() {
-        // SAFETY: The reader contract initialized the complete successful prefix.
-        return Ok(inspect(unsafe { core::slice::from_raw_parts(ptr, length) }));
+    /// Reads a single field byte directly when its storage is already available.
+    #[inline]
+    pub fn byte(&mut self, offset: usize) -> Result<u8, ()> {
+        if let Some(byte) = self.prefix.cached_byte(offset) {
+            return Ok(byte);
+        }
+        let length = offset.checked_add(1).ok_or(())?;
+        self.prefix(length).map(|packet| packet[offset])
     }
 
-    let fallback_length = core::cmp::min(length, fallback_length);
-    if fallback_length == 0 || fallback_length == length {
-        return Err(());
+    pub fn prefix(&mut self, length: usize) -> Result<&[u8], ()> {
+        let nb = self.nb;
+        // SAFETY: The reader's construction contract keeps the NB and MDLs live
+        // and unmodified. NDIS initializes all requested bytes on success.
+        unsafe {
+            self.prefix
+                .read_with_span(self.data_length, length, |length, storage| {
+                    let ptr = NdisGetDataBuffer(nb, length as u32, storage, 1, 0);
+                    let native_span = if !ptr.is_null() && ptr != storage {
+                        // With byte alignment, a native NDIS result starts at
+                        // CurrentMdlOffset in the already mapped current MDL.
+                        // Its remaining bytes can be borrowed lazily too, without
+                        // another NDIS call or touching the next MDL.
+                        nb.CurrentMdl.as_ref().map_or(length, |mdl| {
+                            mdl.ByteCount.saturating_sub(nb.CurrentMdlOffset) as usize
+                        })
+                    } else {
+                        length
+                    };
+                    (ptr, native_span)
+                })
+        }
     }
-    let ptr = read(fallback_length, storage);
-    if ptr.is_null() {
-        return Err(());
+}
+
+struct PacketPrefix<'storage, const N: usize> {
+    storage: &'storage mut MaybeUninit<[u8; N]>,
+    native: *mut u8,
+    length: usize,
+}
+
+impl<'storage, const N: usize> PacketPrefix<'storage, N> {
+    fn new(storage: &'storage mut MaybeUninit<[u8; N]>) -> Self {
+        const { assert!(N <= 128, "packet inspection must fit the kernel stack") };
+        Self {
+            storage,
+            native: core::ptr::null_mut(),
+            length: 0,
+        }
     }
-    // SAFETY: Only the successful shorter read is exposed, never the failed tail.
-    Ok(inspect(unsafe {
-        core::slice::from_raw_parts(ptr, fallback_length)
-    }))
+
+    #[inline]
+    fn cached_byte(&self, offset: usize) -> Option<u8> {
+        if offset >= self.length {
+            return None;
+        }
+        let ptr = if self.native.is_null() {
+            self.storage.as_ptr().cast::<u8>()
+        } else {
+            self.native.cast_const()
+        };
+        // SAFETY: A complete read or native span covers `self.length` bytes,
+        // remains live, and cannot be mutated while this cache is borrowed.
+        Some(unsafe { *ptr.add(offset) })
+    }
+
+    #[cfg(test)]
+    unsafe fn read(
+        &mut self,
+        data_length: usize,
+        length: usize,
+        mut read: impl FnMut(usize, *mut u8) -> *mut u8,
+    ) -> Result<&[u8], ()> {
+        // SAFETY: The test reader guarantees the same contract for exactly the
+        // requested prefix, without extending its native span.
+        unsafe {
+            self.read_with_span(data_length, length, |length, storage| {
+                (read(length, storage), length)
+            })
+        }
+    }
+
+    // SAFETY: A successful native result must cover both the requested prefix
+    // and its reported contiguous span, remaining live and unmodified for this
+    // cache's lifetime. A scratch result must initialize `length` bytes; its
+    // span is ignored. Null may leave scratch partially initialized. The reader
+    // must not retain scratch storage.
+    #[inline]
+    unsafe fn read_with_span(
+        &mut self,
+        data_length: usize,
+        length: usize,
+        mut read: impl FnMut(usize, *mut u8) -> (*mut u8, usize),
+    ) -> Result<&[u8], ()> {
+        if length > N || length > data_length {
+            return Err(());
+        }
+        if length == 0 {
+            return Ok(&[]);
+        }
+        if length > self.length {
+            let storage = self.storage.as_mut_ptr().cast::<u8>();
+            let (mut ptr, mut native_span) = read(length, storage);
+            if ptr.is_null() {
+                // The eager reader's fallback retried transient NDIS failures.
+                // Keep one recovery attempt without reading any extra bytes.
+                (ptr, native_span) = read(length, storage);
+            }
+            if ptr.is_null() {
+                // A failed expansion may have overwritten scratch bytes. Never
+                // expose them as an earlier successful prefix. A native prefix
+                // is unaffected because NDIS only writes into scratch storage.
+                if self.native.is_null() {
+                    self.length = 0;
+                }
+                return Err(());
+            }
+            // Keep the scratch/native distinction explicit; moving the reader
+            // must not copy or invalidate the caller's borrowed scratch buffer.
+            self.native = if ptr == storage {
+                core::ptr::null_mut()
+            } else {
+                ptr
+            };
+            self.length = if self.native.is_null() {
+                length
+            } else {
+                core::cmp::max(
+                    length,
+                    core::cmp::min(native_span, core::cmp::min(data_length, N)),
+                )
+            };
+        }
+        let ptr = if self.native.is_null() {
+            self.storage.as_ptr().cast::<u8>()
+        } else {
+            self.native.cast_const()
+        };
+        // SAFETY: Only a complete successful read sets `self.length`; no mutable
+        // access to the cache or its scratch buffer can coexist with this slice.
+        Ok(unsafe { core::slice::from_raw_parts(ptr, length) })
+    }
 }
 
 impl NetBufferList {
@@ -191,41 +306,28 @@ impl NetBufferList {
         }
     }
 
-    /// Inspects a bounded prefix without copying an already contiguous NDIS buffer.
-    /// For a split MDL, NDIS fills the temporary storage instead. The prefix cannot
-    /// escape `inspect`, and only the successful read's initialized bytes are exposed.
+    /// Creates a lazy, bounded reader without reading or changing the packet.
     ///
     /// # Safety
     ///
-    /// The inspected packet bytes must remain unmodified until `inspect` returns.
-    /// In particular, the callback must not mutate an alias of caller-owned backing
-    /// storage, retreat/advance the native buffer, free it, or submit it for injection.
-    pub unsafe fn inspect_bytes_up_to<const N: usize, R>(
-        &self,
-        fallback_length: usize,
-        inspect: impl for<'bytes> FnOnce(&'bytes [u8]) -> R,
-    ) -> Result<R, ()> {
-        const { assert!(N <= 128, "packet inspection must fit the kernel stack") };
-        if N == 0 {
-            return Ok(inspect(&[]));
-        }
-
-        // SAFETY: The wrapper's construction contract keeps this NBL and its MDLs
-        // live and synchronized. NDIS either returns a native contiguous prefix or
-        // initializes the requested bytes in `storage`; a null result is never read.
+    /// The native buffer and its packet bytes must remain live and unmodified
+    /// while the reader or any slice borrowed from it is in use. In particular,
+    /// do not mutate backing storage through an alias, retreat/advance the buffer,
+    /// free it, or submit it for injection during that interval.
+    pub unsafe fn reader<'nbl, 'storage, const N: usize>(
+        &'nbl self,
+        storage: &'storage mut MaybeUninit<[u8; N]>,
+    ) -> Result<NetBufferReader<'nbl, 'storage, N>, ()> {
+        // SAFETY: The wrapper's construction contract keeps the NBL and first NB
+        // live and synchronized; the caller extends that contract to the reader.
         unsafe {
-            let Some(nbl) = self.nbl.as_ref() else {
-                return Err(());
-            };
-            let Some(nb) = nbl.Header.first_net_buffer.as_ref() else {
-                return Err(());
-            };
-            inspect_prefix::<N, _>(
-                nb.nbSize.DataLength as usize,
-                fallback_length,
-                |length, storage| NdisGetDataBuffer(nb, length as u32, storage, 1, 0),
-                inspect,
-            )
+            let nbl = self.nbl.as_ref().ok_or(())?;
+            let nb = nbl.Header.first_net_buffer.as_ref().ok_or(())?;
+            Ok(NetBufferReader {
+                nb,
+                data_length: nb.nbSize.DataLength as usize,
+                prefix: PacketPrefix::new(storage),
+            })
         }
     }
 
@@ -657,166 +759,355 @@ impl Drop for NetworkAllocator {
 
 #[cfg(test)]
 mod tests {
-    use super::inspect_prefix;
+    use super::PacketPrefix;
 
     #[test]
-    fn contiguous_prefix_is_inspected_in_place_once() {
-        let mut native = [0x5au8; 200];
-        let native_ptr = native.as_mut_ptr();
-        let mut calls = 0;
-        // SAFETY: The native array covers every requested prefix and outlives inspection.
-        let result = unsafe {
-            inspect_prefix::<128, _>(
-                native.len(),
-                34,
-                |length, _storage| {
-                    calls += 1;
-                    assert_eq!(length, 128);
-                    native_ptr
-                },
-                |bytes| {
-                    assert_eq!(bytes.as_ptr(), native_ptr);
-                    assert_eq!(bytes, &[0x5a; 128]);
-                    bytes.len()
-                },
-            )
-        };
-        assert_eq!(result, Ok(128));
-        assert_eq!(calls, 1);
-    }
+    fn reader_state_borrows_scratch_storage_without_embedding_it() {
+        use core::mem::{size_of, MaybeUninit};
 
-    #[test]
-    fn materialized_prefix_exposes_only_the_first_buffer_length() {
-        let mut calls = 0;
-        // SAFETY: The reader initializes exactly the requested bytes in supplied storage.
-        let result = unsafe {
-            inspect_prefix::<128, _>(
-                28,
-                34,
-                |length, storage| {
-                    calls += 1;
-                    assert_eq!(length, 28);
-                    core::ptr::write_bytes(storage, 0x37, length);
-                    storage
-                },
-                |bytes| {
-                    assert_eq!(bytes, &[0x37; 28]);
-                    bytes.len()
-                },
-            )
-        };
-        assert_eq!(result, Ok(28));
-        assert_eq!(calls, 1);
-    }
-
-    #[test]
-    fn failed_full_read_retries_the_same_storage_and_hides_the_tail() {
-        for fallback in [34, 40] {
-            let mut lengths = Vec::new();
-            let mut first_storage = core::ptr::null_mut();
-            let mut inspections = 0;
-            // SAFETY: A failed read's partial storage is never read; the retry fully
-            // initializes its shorter successful prefix and returns that storage.
-            let result = unsafe {
-                inspect_prefix::<128, _>(
-                    200,
-                    fallback,
-                    |length, storage| {
-                        lengths.push(length);
-                        if lengths.len() == 1 {
-                            first_storage = storage;
-                            core::ptr::write_bytes(storage, 0xaa, 8);
-                            core::ptr::null_mut()
-                        } else {
-                            assert_eq!(storage, first_storage);
-                            core::ptr::write_bytes(storage, 0x19, length);
-                            storage
-                        }
-                    },
-                    |bytes| {
-                        inspections += 1;
-                        assert_eq!(bytes.len(), fallback);
-                        assert!(bytes.iter().all(|byte| *byte == 0x19));
-                    },
-                )
-            };
-            assert_eq!(result, Ok(()));
-            assert_eq!(lengths, [128, fallback]);
-            assert_eq!(inspections, 1);
+        assert_eq!(size_of::<PacketPrefix<'_, 128>>(), 3 * size_of::<usize>());
+        let mut storage = MaybeUninit::new([0xa5; 128]);
+        let storage_ptr = storage.as_mut_ptr().cast::<u8>();
+        let mut cache = PacketPrefix::new(&mut storage);
+        // SAFETY: The borrowed array covers the complete requested range.
+        unsafe {
+            let bytes = cache
+                .read(128, 24, |length, ptr| {
+                    assert_eq!(ptr, storage_ptr);
+                    core::ptr::write_bytes(ptr, 0x37, length);
+                    ptr
+                })
+                .unwrap();
+            assert_eq!(bytes.as_ptr(), storage_ptr);
+            let mut moved = cache;
+            let bytes = moved.read(128, 24, |_, _| panic!("cached read")).unwrap();
+            assert_eq!(bytes.as_ptr(), storage_ptr);
+            assert_eq!(bytes, &[0x37; 24]);
         }
     }
 
     #[test]
-    fn fallback_can_return_a_native_prefix_without_copying() {
+    fn a_native_read_does_not_write_caller_scratch_storage() {
         let mut native = [0x42; 40];
         let native_ptr = native.as_mut_ptr();
-        let mut lengths = Vec::new();
-        // SAFETY: The failed full read returns null; the successful fallback returns
-        // a live array covering all 40 requested bytes.
-        let result = unsafe {
-            inspect_prefix::<128, _>(
-                128,
-                40,
-                |length, _storage| {
-                    lengths.push(length);
-                    if length == 40 {
-                        native_ptr
-                    } else {
-                        core::ptr::null_mut()
-                    }
-                },
-                |bytes| {
-                    assert_eq!(bytes.as_ptr(), native_ptr);
-                    assert_eq!(bytes, &[0x42; 40]);
-                },
-            )
-        };
-        assert_eq!(result, Ok(()));
-        assert_eq!(lengths, [128, 40]);
+        let mut storage = core::mem::MaybeUninit::new([0xa5; 128]);
+        let mut cache = PacketPrefix::new(&mut storage);
+        // SAFETY: Native data covers the request and outlives the reader.
+        unsafe {
+            let bytes = cache.read(40, 24, |_, _| native_ptr).unwrap();
+            assert_eq!(bytes.as_ptr(), native_ptr);
+        }
+        drop(cache);
+        // SAFETY: The whole array was initialized before the native-only read.
+        assert_eq!(unsafe { storage.assume_init_ref() }, &[0xa5; 128]);
     }
 
     #[test]
-    fn failed_reads_never_invoke_the_inspector() {
-        for (data_length, fallback, expected_calls) in [
-            (0, 34, 0),
-            (200, 0, 1),
-            (200, 128, 1),
-            (200, 256, 1),
-            (20, 34, 1),
-            (200, 34, 2),
-        ] {
-            let mut calls = 0;
-            // SAFETY: Null reader results make no bytes available for inspection.
-            let result = unsafe {
-                inspect_prefix::<128, _>(
-                    data_length,
-                    fallback,
-                    |_length, _storage| {
-                        calls += 1;
-                        core::ptr::null_mut()
-                    },
-                    |_| -> () { panic!("failed prefix must not be inspected") },
-                )
-            };
-            assert_eq!(result, Err(()));
-            assert_eq!(calls, expected_calls);
+    fn cached_byte_obeys_native_and_scratch_bounds() {
+        let mut native = [0x42; 160];
+        let native_ptr = native.as_mut_ptr();
+        for use_native in [false, true] {
+            let mut storage = core::mem::MaybeUninit::uninit();
+            let mut cache = PacketPrefix::<128>::new(&mut storage);
+            assert_eq!(cache.cached_byte(0), None);
+            // SAFETY: The native array covers the span. Scratch is initialized
+            // only through the requested prefix, never through its span hint.
+            unsafe {
+                cache
+                    .read_with_span(160, 24, |length, storage| {
+                        if use_native {
+                            (native_ptr, 160)
+                        } else {
+                            core::ptr::write_bytes(storage, 0x37, length);
+                            (storage, 160)
+                        }
+                    })
+                    .unwrap();
+                let limit = if use_native { 128 } else { 24 };
+                for offset in 0..limit {
+                    assert_eq!(
+                        cache.cached_byte(offset),
+                        Some(if use_native { 0x42 } else { 0x37 })
+                    );
+                }
+                assert_eq!(cache.cached_byte(limit), None);
+                assert_eq!(cache.cached_byte(usize::MAX), None);
+                assert_eq!(
+                    cache
+                        .read_with_span(160, 128, |_, storage| {
+                            core::ptr::write_bytes(storage, 0, 10);
+                            (core::ptr::null_mut(), 0)
+                        })
+                        .is_err(),
+                    !use_native
+                );
+                // A native byte is unchanged; a failed scratch expansion must
+                // not expose even the previously initialized cache bytes.
+                assert_eq!(
+                    cache.cached_byte(0),
+                    if use_native { Some(0x42) } else { None }
+                );
+            }
         }
     }
 
     #[test]
-    fn zero_capacity_invokes_the_inspector_without_reading() {
-        // SAFETY: A zero-capacity inspection never invokes the reader.
-        let result = unsafe {
-            inspect_prefix::<0, _>(
-                200,
-                34,
-                |_, _| panic!("zero-capacity read"),
-                |bytes| {
-                    assert!(bytes.is_empty());
-                    7
-                },
-            )
-        };
-        assert_eq!(result, Ok(7));
+    fn contiguous_prefix_is_read_on_demand_and_reused_without_copying() {
+        let mut native = [0x5au8; 200];
+        let native_ptr = native.as_mut_ptr();
+        let mut storage = core::mem::MaybeUninit::uninit();
+        let mut cache = PacketPrefix::<128>::new(&mut storage);
+        let mut lengths = Vec::new();
+        // SAFETY: The native array covers every requested prefix and outlives the cache.
+        unsafe {
+            for length in [20, 20, 8, 24, 24, 34, 20] {
+                let bytes = cache
+                    .read(native.len(), length, |length, _storage| {
+                        lengths.push(length);
+                        native_ptr
+                    })
+                    .unwrap();
+                assert_eq!(bytes.as_ptr(), native_ptr);
+                assert_eq!(bytes, &native[..length]);
+            }
+        }
+        assert_eq!(lengths, [20, 24, 34]);
+    }
+
+    #[test]
+    fn fields_in_the_same_native_mdl_need_only_one_ndis_read() {
+        let mut native = [0x5au8; 200];
+        let native_ptr = native.as_mut_ptr();
+        for data_length in [28, 200] {
+            let mut storage = core::mem::MaybeUninit::uninit();
+            let mut cache = PacketPrefix::<128>::new(&mut storage);
+            let mut reads = Vec::new();
+            // SAFETY: The array covers the complete reported native span.
+            unsafe {
+                for length in [20, 24, 28] {
+                    let bytes = cache
+                        .read_with_span(data_length, length, |length, _| {
+                            reads.push(length);
+                            (native_ptr, native.len())
+                        })
+                        .unwrap();
+                    assert_eq!(bytes.as_ptr(), native_ptr);
+                    assert_eq!(bytes, &native[..length]);
+                }
+                if data_length == 200 {
+                    for length in [34, 74, 128] {
+                        assert_eq!(
+                            cache.read_with_span(data_length, length, |_, _| panic!(
+                                "already mapped native span"
+                            )),
+                            Ok(&native[..length])
+                        );
+                    }
+                }
+                let limit = core::cmp::min(data_length, 128);
+                assert!(cache
+                    .read_with_span(data_length, limit + 1, |_, _| panic!(
+                        "read beyond NB/capacity"
+                    ))
+                    .is_err());
+            }
+            assert_eq!(reads, [20]);
+        }
+    }
+
+    #[test]
+    fn a_native_span_hint_never_exposes_uninitialized_scratch_bytes() {
+        let mut storage = core::mem::MaybeUninit::uninit();
+        let mut cache = PacketPrefix::<128>::new(&mut storage);
+        let mut reads = Vec::new();
+        // SAFETY: A successful scratch result initializes only the requested
+        // prefix, and its deliberately oversized span hint must be ignored.
+        unsafe {
+            for length in [20, 24] {
+                let bytes = cache
+                    .read_with_span(200, length, |length, storage| {
+                        reads.push(length);
+                        core::ptr::write_bytes(storage, 0x37, length);
+                        (storage, 200)
+                    })
+                    .unwrap();
+                assert_eq!(bytes, &vec![0x37; length]);
+            }
+        }
+        assert_eq!(reads, [20, 24]);
+    }
+
+    #[test]
+    fn materialized_prefix_survives_moving_the_reader() {
+        let mut storage = core::mem::MaybeUninit::uninit();
+        let mut cache = PacketPrefix::<128>::new(&mut storage);
+        // SAFETY: Each successful read initializes the complete requested prefix.
+        unsafe {
+            assert_eq!(
+                cache.read(28, 24, |length, storage| {
+                    core::ptr::write_bytes(storage, 0x37, length);
+                    storage
+                }),
+                Ok(&[0x37; 24][..])
+            );
+            let mut moved = cache;
+            assert_eq!(
+                moved.read(28, 24, |_, _| panic!(
+                    "cached prefix must not be read again"
+                )),
+                Ok(&[0x37; 24][..])
+            );
+            assert!(moved
+                .read(28, 29, |_, _| panic!("read past the first NB"))
+                .is_err());
+            assert_eq!(
+                moved.read(28, 28, |length, storage| {
+                    core::ptr::write_bytes(storage, 0x19, length);
+                    storage
+                }),
+                Ok(&[0x19; 28][..])
+            );
+        }
+    }
+
+    #[test]
+    fn transient_expansion_retries_once_without_extra_lookahead() {
+        for length in [28, 34, 48, 54] {
+            let mut storage = core::mem::MaybeUninit::uninit();
+            let mut cache = PacketPrefix::<128>::new(&mut storage);
+            let mut reads = Vec::new();
+            // SAFETY: Only successful reads initialize the requested prefix.
+            unsafe {
+                cache
+                    .read(
+                        160,
+                        if length >= 48 { 44 } else { 24 },
+                        |length, storage| {
+                            core::ptr::write_bytes(storage, 0x19, length);
+                            storage
+                        },
+                    )
+                    .unwrap();
+                let bytes = cache
+                    .read(160, length, |length, storage| {
+                        reads.push(length);
+                        if reads.len() == 1 {
+                            core::ptr::write_bytes(storage, 0xaa, 4);
+                            core::ptr::null_mut()
+                        } else {
+                            core::ptr::write_bytes(storage, 0x37, length);
+                            storage
+                        }
+                    })
+                    .unwrap();
+                assert_eq!(bytes, &vec![0x37; length]);
+                assert_eq!(reads, [length, length]);
+                assert_eq!(
+                    cache.read(160, length, |_, _| panic!("cached retry")),
+                    Ok(&vec![0x37; length][..])
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn failed_expansion_invalidates_scratch_but_never_exposes_its_tail() {
+        let mut storage = core::mem::MaybeUninit::uninit();
+        let mut cache = PacketPrefix::<128>::new(&mut storage);
+        let mut lengths = Vec::new();
+        // SAFETY: Only successful reads initialize the full requested prefix.
+        unsafe {
+            cache
+                .read(200, 20, |length, storage| {
+                    core::ptr::write_bytes(storage, 0x37, length);
+                    storage
+                })
+                .unwrap();
+            assert!(cache
+                .read(200, 34, |length, storage| {
+                    lengths.push(length);
+                    core::ptr::write_bytes(storage, 0xaa, 8);
+                    core::ptr::null_mut()
+                })
+                .is_err());
+            let bytes = cache
+                .read(200, 20, |length, storage| {
+                    lengths.push(length);
+                    core::ptr::write_bytes(storage, 0x19, length);
+                    storage
+                })
+                .unwrap();
+            assert_eq!(bytes, &[0x19; 20]);
+        }
+        assert_eq!(lengths, [34, 34, 20]);
+    }
+
+    #[test]
+    fn failed_expansion_preserves_an_unmodified_native_prefix() {
+        let mut native = [0x42; 40];
+        let native_ptr = native.as_mut_ptr();
+        let mut storage = core::mem::MaybeUninit::uninit();
+        let mut cache = PacketPrefix::<128>::new(&mut storage);
+        // SAFETY: The native array remains live and unmodified; the failed read
+        // writes only scratch storage and never exposes it.
+        unsafe {
+            cache.read(200, 20, |_, _| native_ptr).unwrap();
+            assert!(cache
+                .read(200, 34, |_, storage| {
+                    core::ptr::write_bytes(storage, 0xaa, 8);
+                    core::ptr::null_mut()
+                })
+                .is_err());
+            let bytes = cache
+                .read(200, 20, |_, _| panic!("native prefix is still valid"))
+                .unwrap();
+            assert_eq!(bytes.as_ptr(), native_ptr);
+            assert_eq!(bytes, &[0x42; 20]);
+        }
+    }
+
+    #[test]
+    fn invalid_lengths_and_empty_requests_do_not_read_packet_data() {
+        let mut storage = core::mem::MaybeUninit::uninit();
+        let mut cache = PacketPrefix::<128>::new(&mut storage);
+        // SAFETY: None of these requests invokes the reader.
+        unsafe {
+            assert_eq!(cache.read(200, 0, |_, _| panic!("empty read")), Ok(&[][..]));
+            for (data_length, length) in [(0, 1), (20, 24), (200, 129), (200, usize::MAX)] {
+                assert!(cache
+                    .read(data_length, length, |_, _| panic!("out-of-bounds read"))
+                    .is_err());
+            }
+            let mut empty_storage = core::mem::MaybeUninit::uninit();
+            let mut empty = PacketPrefix::<0>::new(&mut empty_storage);
+            assert_eq!(empty.read(200, 0, |_, _| panic!("empty read")), Ok(&[][..]));
+            assert!(empty
+                .read(200, 1, |_, _| panic!("zero-capacity read"))
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn native_and_scratch_prefixes_can_replace_each_other() {
+        let mut native = [0x42; 80];
+        let native_ptr = native.as_mut_ptr();
+        let mut storage = core::mem::MaybeUninit::uninit();
+        let mut cache = PacketPrefix::<128>::new(&mut storage);
+        // SAFETY: Native storage outlives the cache; scratch reads initialize all bytes.
+        unsafe {
+            cache.read(80, 20, |_, _| native_ptr).unwrap();
+            assert_eq!(
+                cache.read(80, 24, |length, storage| {
+                    core::ptr::write_bytes(storage, 0x19, length);
+                    storage
+                }),
+                Ok(&[0x19; 24][..])
+            );
+            assert_eq!(cache.read(80, 34, |_, _| native_ptr), Ok(&[0x42; 34][..]));
+            assert_eq!(
+                cache.read(80, 24, |_, _| panic!("cached prefix")),
+                Ok(&[0x42; 24][..])
+            );
+        }
     }
 }

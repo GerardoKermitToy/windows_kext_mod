@@ -1,10 +1,15 @@
 use core::fmt;
 
 use smoltcp::wire::{
-    IpAddress, IpProtocol, Ipv4Address, Ipv4Packet, Ipv6Packet, IPV4_HEADER_LEN, IPV6_HEADER_LEN,
+    IpAddress, IpProtocol, Ipv4Address, Ipv4Packet, Ipv6Address, Ipv6Packet, IPV4_HEADER_LEN,
+    IPV6_HEADER_LEN,
 };
 
-use crate::{connection::Direction, connection_map::Key, ipv6_packet::walk_ipv6_headers};
+use crate::{
+    connection::Direction,
+    connection_map::Key,
+    ipv6_packet::{walk_ipv6_headers_reader, PacketData},
+};
 
 /// Prefix large enough for the IPv6 base header, the bounded extension-header
 /// chain and every transport field inspected by the packet callout.
@@ -58,195 +63,500 @@ pub(crate) enum IcmpError {
     Echo(IpAddress, u16, u16),
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct PacketMetadata {
-    pub(crate) key: Key,
-    pub(crate) icmp_echo: Option<IcmpEcho>,
-    pub(crate) icmp_error: Option<IcmpError>,
-    pub(crate) is_local_icmp_error: bool,
-    pub(crate) is_tcp_reset: bool,
+#[derive(Clone, Copy, Default)]
+pub(crate) struct IcmpMetadata {
+    pub(crate) echo: Option<IcmpEcho>,
+    pub(crate) error: Option<IcmpError>,
+    pub(crate) is_local_error: bool,
 }
 
+// Keep this cache register-sized: fragment/key/RST checks must not copy IP
+// addresses or compute ICMP validation fields. The bounded IPv6 walker advances
+// through at most eight 2048-byte extension headers, so its offset fits in u16.
 #[derive(Clone, Copy)]
-pub(crate) struct PacketInspection {
-    pub(crate) is_fragment: bool,
-    pub(crate) metadata: Result<PacketMetadata, PacketMetadataError>,
+struct HeaderInspection {
+    protocol: IpProtocol,
+    transport_offset: u16,
+    is_fragment: bool,
+    valid_tcp_flags: bool,
+    error: Option<PacketMetadataError>,
 }
 
-impl PacketInspection {
-    pub(crate) const fn unreadable() -> Self {
+impl HeaderInspection {
+    fn unreadable() -> Self {
         Self {
+            protocol: IpProtocol::Unknown(0),
+            transport_offset: 0,
             is_fragment: false,
-            metadata: Err(PacketMetadataError::UnreadablePacket),
+            valid_tcp_flags: false,
+            error: Some(PacketMetadataError::UnreadablePacket),
         }
     }
 }
 
-/// Parses the packet callout's metadata from one bounded prefix. When the first
-/// NBL can bypass policy as an individual fragment, stop before parsing its key
-/// or transport fields; reassembled indications still need that metadata.
-pub(crate) fn inspect_packet(
+/// Packet-callout fields are resolved on demand. The reader is borrowed in the
+/// callout, and the caller owns the key: neither packet storage nor a second key
+/// is copied into this inspector. TCP flags and ICMP quotes remain lazy.
+pub(crate) struct PacketInspector<R> {
+    reader: R,
+    ipv6: bool,
+    direction: Direction,
+    permit_fragments: bool,
+    header: Option<HeaderInspection>,
+    tcp_reset: Option<bool>,
+}
+
+impl<R: PacketData> PacketInspector<R> {
+    pub(crate) fn new(reader: R, ipv6: bool, direction: Direction, permit_fragments: bool) -> Self {
+        Self {
+            reader,
+            ipv6,
+            direction,
+            permit_fragments,
+            header: None,
+            tcp_reset: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn is_fragment(&mut self) -> bool {
+        self.header().is_fragment
+    }
+
+    #[inline]
+    pub(crate) fn key(&mut self) -> Result<Key, PacketMetadataError> {
+        self.read_key()
+    }
+
+    // Preserve the first probe's single retry on an actual read/parse failure.
+    pub(crate) fn retry_key(&mut self) -> Result<Key, PacketMetadataError> {
+        self.permit_fragments = false;
+        self.header = None;
+        self.tcp_reset = None;
+        self.key()
+    }
+
+    pub(crate) fn icmp_metadata(&mut self, key: &Key) -> IcmpMetadata {
+        self.read_icmp_metadata(key).unwrap_or_default()
+    }
+
+    #[inline]
+    pub(crate) fn is_tcp_reset(&mut self) -> bool {
+        if let Some(reset) = self.tcp_reset {
+            return reset;
+        }
+        let header = self.header();
+        let offset = usize::from(header.transport_offset);
+        let reset = header.error.is_none()
+            && header.protocol == IpProtocol::Tcp
+            && header.valid_tcp_flags
+            && self
+                .reader
+                .byte(offset + TCP_FLAGS_OFFSET)
+                .is_some_and(|flags| flags & TCP_RST_FLAG != 0);
+        self.tcp_reset = Some(reset);
+        reset
+    }
+
+    #[inline(always)]
+    fn header(&mut self) -> HeaderInspection {
+        // Keep cache hits out of the reader/walker's stack frame. In particular,
+        // the RST accessor after a key lookup only loads this small value.
+        match self.header {
+            Some(header) => header,
+            None => self.read_header(),
+        }
+    }
+
+    fn read_header(&mut self) -> HeaderInspection {
+        let base_length = if self.ipv6 {
+            IPV6_HEADER_LEN
+        } else {
+            IPV4_HEADER_LEN
+        };
+        // Four bytes of lookahead keep the ordinary IP+ports path to one NDIS
+        // call rather than doubling its cost just to learn the protocol/IHL.
+        let initial_length = core::cmp::min(self.reader.len(), base_length + 4);
+        let header = if initial_length >= base_length {
+            self.reader
+                .prefix(initial_length)
+                .map(|packet| Self::parse_base_header(packet, self.ipv6, self.permit_fragments))
+        } else {
+            None
+        }
+        .or_else(|| {
+            self.reader
+                .prefix(base_length)
+                .map(|packet| Self::parse_base_header(packet, self.ipv6, self.permit_fragments))
+        })
+        .unwrap_or_else(HeaderInspection::unreadable);
+        let header = self.resolve_ipv6_header(header);
+        self.header = Some(header);
+        header
+    }
+
+    fn resolve_ipv6_header(&mut self, mut header: HeaderInspection) -> HeaderInspection {
+        if self.ipv6
+            && header.error.is_none()
+            && matches!(
+                header.protocol,
+                IpProtocol::HopByHop
+                    | IpProtocol::Ipv6Route
+                    | IpProtocol::Ipv6Frag
+                    | IpProtocol::Ipv6Opts
+            )
+        {
+            let headers = walk_ipv6_headers_reader(&mut self.reader, self.permit_fragments, false);
+            header.protocol = headers.protocol;
+            header.transport_offset = headers.transport_offset as u16;
+            header.is_fragment = headers.is_fragment;
+            header.error = if self.permit_fragments && headers.is_fragment {
+                Some(PacketMetadataError::FragmentRequiresReassembly)
+            } else if !headers.resolved {
+                Some(PacketMetadataError::UnresolvedIpv6Headers)
+            } else {
+                None
+            };
+        }
+        header
+    }
+
+    #[inline(always)]
+    fn parse_base_header(packet: &[u8], ipv6: bool, permit_fragments: bool) -> HeaderInspection {
+        if ipv6 {
+            HeaderInspection {
+                protocol: IpProtocol::from(packet[6]),
+                transport_offset: IPV6_HEADER_LEN as u16,
+                is_fragment: false,
+                valid_tcp_flags: true,
+                error: None,
+            }
+        } else {
+            let ip_packet = Ipv4Packet::new_unchecked(packet);
+            let is_fragment = ip_packet.frag_offset() != 0 || ip_packet.more_frags();
+            let raw_offset = usize::from(ip_packet.header_len());
+            HeaderInspection {
+                protocol: IpProtocol::from(packet[9]),
+                transport_offset: core::cmp::max(raw_offset, IPV4_HEADER_LEN) as u16,
+                is_fragment,
+                valid_tcp_flags: (IPV4_HEADER_LEN..=IPV4_MAX_HEADER_LEN).contains(&raw_offset),
+                error: (permit_fragments && is_fragment)
+                    .then_some(PacketMetadataError::FragmentRequiresReassembly),
+            }
+        }
+    }
+
+    #[inline]
+    fn read_key(&mut self) -> Result<Key, PacketMetadataError> {
+        if self.header.is_none() {
+            let base_length = if self.ipv6 {
+                IPV6_HEADER_LEN
+            } else {
+                IPV4_HEADER_LEN
+            };
+            let initial_length = core::cmp::min(self.reader.len(), base_length + 4);
+            let packet = if initial_length >= base_length {
+                self.reader.prefix(initial_length)
+            } else {
+                None
+            };
+            if let Some(packet) = packet {
+                let header = Self::parse_base_header(packet, self.ipv6, self.permit_fragments);
+                self.header = Some(header);
+                if let Some(error) = header.error {
+                    return Err(error);
+                }
+                let extension = self.ipv6
+                    && matches!(
+                        header.protocol,
+                        IpProtocol::HopByHop
+                            | IpProtocol::Ipv6Route
+                            | IpProtocol::Ipv6Frag
+                            | IpProtocol::Ipv6Opts
+                    );
+                let key_end = if matches!(header.protocol, IpProtocol::Tcp | IpProtocol::Udp) {
+                    usize::from(header.transport_offset) + 4
+                } else if self.ipv6 {
+                    IPV6_HEADER_LEN
+                } else {
+                    IPV4_HEADER_LEN + 4
+                };
+                if !extension && packet.len() >= key_end {
+                    // The common path parses the key from the first read itself,
+                    // not through another cached-prefix lookup or header call.
+                    return Ok(Self::parse_key(packet, self.ipv6, self.direction, header));
+                }
+                if extension {
+                    let header = self.resolve_ipv6_header(header);
+                    self.header = Some(header);
+                }
+            } else {
+                // A short fallback must still detect fragments, and the key's
+                // mandatory bytes may recover on the subsequent read below.
+                let header = self
+                    .reader
+                    .prefix(base_length)
+                    .map(|packet| Self::parse_base_header(packet, self.ipv6, self.permit_fragments))
+                    .unwrap_or_else(HeaderInspection::unreadable);
+                let header = self.resolve_ipv6_header(header);
+                self.header = Some(header);
+            }
+        }
+        let header = self.header();
+        if let Some(error) = header.error {
+            return Err(error);
+        }
+        // Preserve the IPv4 key contract even for protocols without ports.
+        let length = if self.ipv6 {
+            IPV6_HEADER_LEN
+        } else {
+            IPV4_HEADER_LEN + 4
+        };
+        let packet = self
+            .reader
+            .prefix(length)
+            .ok_or(PacketMetadataError::UnreadablePacket)?;
+        let (source, destination) = Self::key_addresses(packet, self.ipv6);
+        let offset = usize::from(header.transport_offset);
+        let ports = if matches!(header.protocol, IpProtocol::Tcp | IpProtocol::Udp) {
+            if let Some(transport) = packet.get(offset..offset + 4) {
+                get_ports(transport, header.protocol)
+            } else if offset + 4 > self.reader.len() {
+                (0, 0)
+            } else {
+                // Present but unreadable ports must not produce a cache-miss key.
+                self.reader
+                    .prefix(offset + 4)
+                    .map(|packet| get_ports(&packet[offset..], header.protocol))
+                    .ok_or(PacketMetadataError::UnreadablePacket)?
+            }
+        } else {
+            (0, 0)
+        };
+        Ok(build_key(
+            self.direction,
+            header.protocol,
+            source,
+            ports.0,
+            destination,
+            ports.1,
+        ))
+    }
+
+    #[inline(always)]
+    fn parse_key(packet: &[u8], ipv6: bool, direction: Direction, header: HeaderInspection) -> Key {
+        let (source, destination) = Self::key_addresses(packet, ipv6);
+        let transport = packet
+            .get(usize::from(header.transport_offset)..)
+            .unwrap_or_default();
+        let (source_port, destination_port) = get_ports(transport, header.protocol);
+        build_key(
+            direction,
+            header.protocol,
+            source,
+            source_port,
+            destination,
+            destination_port,
+        )
+    }
+
+    #[inline(always)]
+    fn key_addresses(packet: &[u8], ipv6: bool) -> (IpAddress, IpAddress) {
+        // Both callers already require a complete base header. Read its known
+        // address ranges without separate IP packet accessor call frames.
+        if ipv6 {
+            (
+                IpAddress::Ipv6(Ipv6Address::from_bytes(&packet[8..24])),
+                IpAddress::Ipv6(Ipv6Address::from_bytes(&packet[24..40])),
+            )
+        } else {
+            (
+                IpAddress::Ipv4(Ipv4Address::from_bytes(&packet[12..16])),
+                IpAddress::Ipv4(Ipv4Address::from_bytes(&packet[16..20])),
+            )
+        }
+    }
+
+    fn read_icmp_metadata(&mut self, key: &Key) -> Option<IcmpMetadata> {
+        let header = self.header();
+        if header.error.is_some()
+            || header.protocol
+                != if self.ipv6 {
+                    IpProtocol::Icmpv6
+                } else {
+                    IpProtocol::Icmp
+                }
+        {
+            return None;
+        }
+        let offset = usize::from(header.transport_offset);
+        let end = offset + ICMP_HEADER_LEN;
+        let packet = self.reader.prefix(end)?;
+        let transport = &packet[offset..];
+        let echo = get_icmp_echo(transport, self.ipv6);
+        // Version and declared length matter only for ICMP error attribution,
+        // not for the common TCP/UDP key or fragment path.
+        let (packet_end, valid_error) = if self.ipv6 {
+            let ip_packet = Ipv6Packet::new_unchecked(packet);
+            (
+                ip_packet.total_len(),
+                ip_packet.version() == 6 && matches!(transport[0], 1..=4),
+            )
+        } else {
+            let ip_packet = Ipv4Packet::new_unchecked(packet);
+            (
+                usize::from(ip_packet.total_len()),
+                ip_packet.version() == 4
+                    && usize::from(ip_packet.header_len()) >= IPV4_HEADER_LEN
+                    && matches!(transport[0], 3 | 11 | 12),
+            )
+        };
+        let is_error = valid_error && packet_end >= end;
+        let is_local_error = is_error
+            && matches!(self.direction, Direction::Outbound)
+            && key.local_address == key.remote_address;
+        let error = if is_error && (matches!(self.direction, Direction::Inbound) || is_local_error)
+        {
+            self.read_icmp_error(key, end, packet_end)
+        } else {
+            None
+        };
+        Some(IcmpMetadata {
+            echo,
+            error,
+            is_local_error,
+        })
+    }
+
+    fn read_icmp_error(
+        &mut self,
+        key: &Key,
+        quote_offset: usize,
+        packet_end: usize,
+    ) -> Option<IcmpError> {
+        let outer_end = core::cmp::min(self.reader.len(), packet_end);
+        let mut quote = PacketWindow {
+            reader: &mut self.reader,
+            start: quote_offset,
+            end: outer_end,
+        };
+        let base_length = if self.ipv6 {
+            IPV6_HEADER_LEN
+        } else {
+            IPV4_HEADER_LEN
+        };
+        let quoted = quote.prefix(base_length)?;
+        let (protocol, offset) = if self.ipv6 {
+            let ip_packet = Ipv6Packet::new_unchecked(quoted);
+            if ip_packet.version() != 6
+                || IpAddress::Ipv6(ip_packet.src_addr()) != key.local_address
+            {
+                return None;
+            }
+            let total_len = ip_packet.total_len();
+            quote.end = core::cmp::min(quote.end, quote_offset.checked_add(total_len)?);
+            let headers = walk_ipv6_headers_reader(&mut quote, false, false);
+            if !headers.resolved || headers.is_fragment {
+                return None;
+            }
+            (headers.protocol, headers.transport_offset)
+        } else {
+            let ip_packet = Ipv4Packet::new_unchecked(quoted);
+            let offset = usize::from(ip_packet.header_len());
+            if ip_packet.version() != 4
+                || offset < IPV4_HEADER_LEN
+                || IpAddress::Ipv4(ip_packet.src_addr()) != key.local_address
+                || ip_packet.frag_offset() != 0
+            {
+                return None;
+            }
+            let protocol = ip_packet.next_header();
+            let total_len = usize::from(ip_packet.total_len());
+            quote.end = core::cmp::min(quote.end, quote_offset.checked_add(total_len)?);
+            (protocol, offset)
+        };
+        let transport_length = match protocol {
+            IpProtocol::Tcp | IpProtocol::Udp => 4,
+            IpProtocol::Icmp if !self.ipv6 => ICMP_HEADER_LEN,
+            IpProtocol::Icmpv6 if self.ipv6 => ICMP_HEADER_LEN,
+            _ => return None,
+        };
+        let quoted = quote.prefix(offset.checked_add(transport_length)?)?;
+        get_icmp_error(
+            protocol,
+            key.local_address,
+            if self.ipv6 {
+                IpAddress::Ipv6(Ipv6Packet::new_unchecked(quoted).dst_addr())
+            } else {
+                IpAddress::Ipv4(Ipv4Packet::new_unchecked(quoted).dst_addr())
+            },
+            &quoted[offset..],
+        )
+    }
+}
+
+struct PacketWindow<'reader, R> {
+    reader: &'reader mut R,
+    start: usize,
+    end: usize,
+}
+
+impl<R: PacketData> PacketData for PacketWindow<'_, R> {
+    fn len(&self) -> usize {
+        self.end.saturating_sub(self.start)
+    }
+
+    fn prefix(&mut self, length: usize) -> Option<&[u8]> {
+        let end = self.start.checked_add(length)?;
+        if end > self.end {
+            return None;
+        }
+        self.reader.prefix(end)?.get(self.start..end)
+    }
+}
+
+#[cfg(test)]
+#[path = "../tests/fixtures/packet_metadata_original.rs"]
+mod original;
+
+#[cfg(test)]
+struct PacketMetadata {
+    key: Key,
+    icmp_echo: Option<IcmpEcho>,
+    icmp_error: Option<IcmpError>,
+    is_local_icmp_error: bool,
+    is_tcp_reset: bool,
+}
+
+#[cfg(test)]
+struct PacketInspection {
+    is_fragment: bool,
+    metadata: Result<PacketMetadata, PacketMetadataError>,
+}
+
+#[cfg(test)]
+fn inspect_packet(
     packet: &[u8],
     ipv6: bool,
     direction: Direction,
     permit_fragments: bool,
 ) -> PacketInspection {
-    if ipv6 {
-        inspect_ipv6_packet(packet, direction, permit_fragments)
-    } else {
-        inspect_ipv4_packet(packet, direction, permit_fragments)
-    }
-}
-
-fn inspect_ipv4_packet(
-    packet: &[u8],
-    direction: Direction,
-    permit_fragments: bool,
-) -> PacketInspection {
-    if packet.len() < IPV4_HEADER_LEN {
-        return PacketInspection::unreadable();
-    }
-
-    let ip_packet = Ipv4Packet::new_unchecked(packet);
-    let is_fragment = ip_packet.frag_offset() != 0 || ip_packet.more_frags();
-    if permit_fragments && is_fragment {
-        return PacketInspection {
-            is_fragment,
-            metadata: Err(PacketMetadataError::FragmentRequiresReassembly),
-        };
-    }
-
-    // Preserve the existing key contract: four bytes beyond the base header
-    // must be readable even for a protocol that does not use ports.
-    if packet.len() < IPV4_HEADER_LEN + 4 {
-        return PacketInspection {
-            is_fragment,
-            metadata: Err(PacketMetadataError::UnreadablePacket),
-        };
-    }
-
-    let protocol = ip_packet.next_header();
-    let raw_transport_offset = ip_packet.header_len() as usize;
-    let transport_offset = core::cmp::max(raw_transport_offset, IPV4_HEADER_LEN);
-    let transport = packet.get(transport_offset..).unwrap_or_default();
-    let (source_port, destination_port) = get_ports(transport, protocol);
-    let key = build_key(
-        direction,
-        protocol,
-        IpAddress::Ipv4(ip_packet.src_addr()),
-        source_port,
-        IpAddress::Ipv4(ip_packet.dst_addr()),
-        destination_port,
-    );
-
-    let (icmp_echo, icmp_error, is_local_icmp_error) =
-        if protocol == IpProtocol::Icmp && transport.len() >= ICMP_HEADER_LEN {
-            let echo = get_icmp_echo(transport, false);
-            let is_error = matches!(transport[0], 3 | 11 | 12)
-                && ip_packet.version() == 4
-                && raw_transport_offset >= IPV4_HEADER_LEN
-                && usize::from(ip_packet.total_len()) >= raw_transport_offset + ICMP_HEADER_LEN;
-            let local_error = is_error
-                && matches!(direction, Direction::Outbound)
-                && key.local_address == key.remote_address;
-            let error = if is_error && (matches!(direction, Direction::Inbound) || local_error) {
-                let end = core::cmp::min(packet.len(), usize::from(ip_packet.total_len()));
-                packet
-                    .get(raw_transport_offset..end)
-                    .and_then(|transport| get_icmpv4_error(transport, ip_packet.dst_addr()))
-            } else {
-                None
-            };
-            (echo, error, local_error)
-        } else {
-            (None, None, false)
-        };
-
-    let is_tcp_reset = protocol == IpProtocol::Tcp
-        && (IPV4_HEADER_LEN..=IPV4_MAX_HEADER_LEN).contains(&raw_transport_offset)
-        && has_tcp_reset(packet, raw_transport_offset);
-
+    let mut inspector = PacketInspector::new(packet, ipv6, direction, permit_fragments);
+    let key = inspector.key();
+    let is_fragment = inspector.is_fragment();
+    let metadata = key.map(|key| {
+        let icmp = inspector.icmp_metadata(&key);
+        PacketMetadata {
+            key,
+            icmp_echo: icmp.echo,
+            icmp_error: icmp.error,
+            is_local_icmp_error: icmp.is_local_error,
+            is_tcp_reset: inspector.is_tcp_reset(),
+        }
+    });
     PacketInspection {
         is_fragment,
-        metadata: Ok(PacketMetadata {
-            key,
-            icmp_echo,
-            icmp_error,
-            is_local_icmp_error,
-            is_tcp_reset,
-        }),
-    }
-}
-
-fn inspect_ipv6_packet(
-    packet: &[u8],
-    direction: Direction,
-    permit_fragments: bool,
-) -> PacketInspection {
-    if packet.len() < IPV6_HEADER_LEN {
-        return PacketInspection::unreadable();
-    }
-
-    let ip_packet = Ipv6Packet::new_unchecked(packet);
-    let headers = walk_ipv6_headers(packet, permit_fragments);
-    if permit_fragments && headers.is_fragment {
-        return PacketInspection {
-            is_fragment: true,
-            metadata: Err(PacketMetadataError::FragmentRequiresReassembly),
-        };
-    }
-    if !headers.resolved {
-        return PacketInspection {
-            is_fragment: headers.is_fragment,
-            metadata: Err(PacketMetadataError::UnresolvedIpv6Headers),
-        };
-    }
-
-    let transport = packet.get(headers.transport_offset..).unwrap_or_default();
-    let (source_port, destination_port) = get_ports(transport, headers.protocol);
-    let key = build_key(
-        direction,
-        headers.protocol,
-        IpAddress::Ipv6(ip_packet.src_addr()),
-        source_port,
-        IpAddress::Ipv6(ip_packet.dst_addr()),
-        destination_port,
-    );
-
-    let (icmp_echo, icmp_error, is_local_icmp_error) =
-        if headers.protocol == IpProtocol::Icmpv6 && transport.len() >= ICMP_HEADER_LEN {
-            let echo = get_icmp_echo(transport, true);
-            let is_error = matches!(transport[0], 1..=4)
-                && ip_packet.version() == 6
-                && ip_packet.total_len() >= headers.transport_offset + ICMP_HEADER_LEN;
-            let local_error = is_error
-                && matches!(direction, Direction::Outbound)
-                && key.local_address == key.remote_address;
-            let error = if is_error && (matches!(direction, Direction::Inbound) || local_error) {
-                let end = core::cmp::min(packet.len(), ip_packet.total_len());
-                packet
-                    .get(headers.transport_offset..end)
-                    .and_then(|transport| get_icmpv6_error(transport, ip_packet.dst_addr()))
-            } else {
-                None
-            };
-            (echo, error, local_error)
-        } else {
-            (None, None, false)
-        };
-
-    let is_tcp_reset =
-        headers.protocol == IpProtocol::Tcp && has_tcp_reset(packet, headers.transport_offset);
-
-    PacketInspection {
-        is_fragment: headers.is_fragment,
-        metadata: Ok(PacketMetadata {
-            key,
-            icmp_echo,
-            icmp_error,
-            is_local_icmp_error,
-            is_tcp_reset,
-        }),
+        metadata,
     }
 }
 
@@ -314,52 +624,6 @@ fn get_icmp_echo(transport: &[u8], ipv6: bool) -> Option<IcmpEcho> {
     })
 }
 
-/// Errors quote the original packet, whose destination need not be the router.
-fn get_icmpv4_error(transport: &[u8], local_address: Ipv4Address) -> Option<IcmpError> {
-    let quoted = transport.get(ICMP_HEADER_LEN..)?;
-    quoted.get(..IPV4_HEADER_LEN)?;
-    let ip_packet = Ipv4Packet::new_unchecked(quoted);
-    let offset = usize::from(ip_packet.header_len());
-    if ip_packet.version() != 4
-        || offset < IPV4_HEADER_LEN
-        || ip_packet.src_addr() != local_address
-        || ip_packet.frag_offset() != 0
-    {
-        return None;
-    }
-    let end = core::cmp::min(quoted.len(), usize::from(ip_packet.total_len()));
-    get_icmp_error(
-        ip_packet.next_header(),
-        IpAddress::Ipv4(local_address),
-        IpAddress::Ipv4(ip_packet.dst_addr()),
-        quoted.get(offset..end)?,
-    )
-}
-
-fn get_icmpv6_error(
-    transport: &[u8],
-    local_address: smoltcp::wire::Ipv6Address,
-) -> Option<IcmpError> {
-    let quoted = transport.get(ICMP_HEADER_LEN..)?;
-    quoted.get(..IPV6_HEADER_LEN)?;
-    let ip_packet = Ipv6Packet::new_unchecked(quoted);
-    if ip_packet.version() != 6 || ip_packet.src_addr() != local_address {
-        return None;
-    }
-    let end = core::cmp::min(quoted.len(), ip_packet.total_len());
-    let quoted = &quoted[..end];
-    let headers = walk_ipv6_headers(quoted, false);
-    if !headers.resolved || headers.is_fragment {
-        return None;
-    }
-    get_icmp_error(
-        headers.protocol,
-        IpAddress::Ipv6(local_address),
-        IpAddress::Ipv6(ip_packet.dst_addr()),
-        quoted.get(headers.transport_offset..)?,
-    )
-}
-
 fn get_icmp_error(
     protocol: IpProtocol,
     local_address: IpAddress,
@@ -392,13 +656,6 @@ fn get_icmp_error(
     }
 }
 
-fn has_tcp_reset(packet: &[u8], transport_offset: usize) -> bool {
-    transport_offset
-        .checked_add(TCP_FLAGS_OFFSET)
-        .and_then(|offset| packet.get(offset))
-        .is_some_and(|flags| flags & TCP_RST_FLAG != 0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,6 +667,830 @@ mod tests {
 
     fn inspect_packet(packet: &[u8], ipv6: bool, direction: Direction) -> PacketInspection {
         super::inspect_packet(packet, ipv6, direction, false)
+    }
+
+    struct CountingReader<'packet> {
+        packet: &'packet [u8],
+        cached_length: usize,
+        readable_length: usize,
+        failures: usize,
+        reads: Vec<usize>,
+        requests: Vec<usize>,
+    }
+
+    impl<'packet> CountingReader<'packet> {
+        fn new(packet: &'packet [u8]) -> Self {
+            Self {
+                packet,
+                cached_length: 0,
+                readable_length: MAX_PACKET_INSPECT_LEN,
+                failures: 0,
+                reads: Vec::new(),
+                requests: Vec::new(),
+            }
+        }
+    }
+
+    impl PacketData for CountingReader<'_> {
+        fn len(&self) -> usize {
+            core::cmp::min(self.packet.len(), MAX_PACKET_INSPECT_LEN)
+        }
+
+        fn prefix(&mut self, length: usize) -> Option<&[u8]> {
+            self.requests.push(length);
+            if length > self.len() {
+                return None;
+            }
+            if length > self.cached_length {
+                self.reads.push(length);
+                if self.failures != 0 {
+                    self.failures -= 1;
+                    return None;
+                }
+                if length > self.readable_length {
+                    return None;
+                }
+                self.cached_length = length;
+            }
+            self.packet.get(..length)
+        }
+    }
+
+    fn basic_packet(ipv6: bool, protocol: IpProtocol) -> [u8; 160] {
+        let mut packet = [0u8; 160];
+        let offset = if ipv6 {
+            packet[0] = 0x60;
+            packet[4..6].copy_from_slice(&120u16.to_be_bytes());
+            packet[6] = u8::from(protocol);
+            packet[8..24].copy_from_slice(&Ipv6Address::LOOPBACK.0);
+            packet[24..40].copy_from_slice(&Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2).0);
+            IPV6_HEADER_LEN
+        } else {
+            packet[0] = 0x45;
+            packet[2..4].copy_from_slice(&160u16.to_be_bytes());
+            packet[9] = u8::from(protocol);
+            set_ipv4_endpoints(&mut packet);
+            IPV4_HEADER_LEN
+        };
+        packet[offset..offset + 2].copy_from_slice(&50_000u16.to_be_bytes());
+        packet[offset + 2..offset + 4].copy_from_slice(&443u16.to_be_bytes());
+        packet[offset + TCP_FLAGS_OFFSET] = TCP_RST_FLAG;
+        packet
+    }
+
+    // Measures parser/reader bookkeeping in user mode, not NDIS or total driver
+    // CPU. Ignored so timing noise never affects the regular correctness suite.
+    #[test]
+    #[ignore]
+    fn packet_inspector_microbenchmark() {
+        use core::{hint::black_box, mem::MaybeUninit};
+        use std::time::Instant;
+
+        struct Reader<'packet, 'storage> {
+            packet: &'packet [u8],
+            native: bool,
+            cached_length: usize,
+            storage: &'storage mut MaybeUninit<[u8; MAX_PACKET_INSPECT_LEN]>,
+        }
+
+        impl Reader<'_, '_> {
+            #[inline(never)]
+            fn materialize(&mut self, length: usize) {
+                let packet = black_box(self.packet);
+                self.cached_length = if self.native {
+                    core::cmp::min(packet.len(), MAX_PACKET_INSPECT_LEN)
+                } else {
+                    // SAFETY: The caller has checked both bounds. Only this
+                    // initialized prefix is returned by `prefix` below.
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            packet.as_ptr(),
+                            self.storage.as_mut_ptr().cast::<u8>(),
+                            length,
+                        );
+                    }
+                    length
+                };
+            }
+        }
+
+        impl PacketData for Reader<'_, '_> {
+            fn len(&self) -> usize {
+                core::cmp::min(self.packet.len(), MAX_PACKET_INSPECT_LEN)
+            }
+
+            fn prefix(&mut self, length: usize) -> Option<&[u8]> {
+                if length > self.len() {
+                    return None;
+                }
+                if length > self.cached_length {
+                    self.materialize(length);
+                }
+                if self.native {
+                    self.packet.get(..length)
+                } else {
+                    // SAFETY: A complete materialization covers `length` bytes.
+                    Some(unsafe {
+                        core::slice::from_raw_parts(self.storage.as_ptr().cast::<u8>(), length)
+                    })
+                }
+            }
+
+            fn byte(&mut self, offset: usize) -> Option<u8> {
+                if offset < self.cached_length {
+                    let ptr = if self.native {
+                        self.packet.as_ptr()
+                    } else {
+                        self.storage.as_ptr().cast::<u8>()
+                    };
+                    // SAFETY: The cached range is initialized and still live.
+                    return Some(unsafe { *ptr.add(offset) });
+                }
+                self.prefix(offset.checked_add(1)?)?.get(offset).copied()
+            }
+        }
+
+        #[inline(never)]
+        fn inspect(packet: &[u8], ipv6: bool, direction: Direction, native: bool, eager: bool) {
+            let mut storage = MaybeUninit::uninit();
+            let mut reader = Reader {
+                packet,
+                native,
+                cached_length: 0,
+                storage: &mut storage,
+            };
+            if eager {
+                let length = reader.len();
+                let packet = reader.prefix(length).unwrap();
+                let inspection = original::inspect_packet(packet, ipv6, direction, true);
+                if inspection.is_fragment {
+                    black_box(true);
+                    return;
+                }
+                let metadata = inspection.metadata.unwrap();
+                if metadata.key.protocol == IpProtocol::Tcp {
+                    black_box(metadata.is_tcp_reset);
+                }
+                black_box(metadata.key);
+            } else {
+                let mut inspector = PacketInspector::new(&mut reader, ipv6, direction, true);
+                let key = match inspector.key() {
+                    Err(PacketMetadataError::FragmentRequiresReassembly) => {
+                        black_box(true);
+                        return;
+                    }
+                    result => result.unwrap(),
+                };
+                if key.protocol == IpProtocol::Tcp {
+                    black_box(inspector.is_tcp_reset());
+                }
+                black_box(key);
+            }
+        }
+
+        const ITERATIONS: usize = 2_000_000;
+        for ipv6 in [false, true] {
+            for protocol in [IpProtocol::Udp, IpProtocol::Tcp] {
+                let mut packet = basic_packet(ipv6, protocol);
+                let offset = if ipv6 {
+                    IPV6_HEADER_LEN
+                } else {
+                    IPV4_HEADER_LEN
+                };
+                packet[offset + TCP_FLAGS_OFFSET] = 0x10;
+                for native in [true, false] {
+                    // Alternate the order within each pair so CPU frequency
+                    // drift does not always favor the same implementation.
+                    let mut samples = [[0u128; 7]; 2];
+                    for sample in 0..7 {
+                        for pass in 0..2 {
+                            let mode = (sample + pass) % 2;
+                            let start = Instant::now();
+                            for i in 0..ITERATIONS {
+                                inspect(
+                                    black_box(&packet),
+                                    black_box(ipv6),
+                                    black_box(if i & 1 == 0 {
+                                        Direction::Outbound
+                                    } else {
+                                        Direction::Inbound
+                                    }),
+                                    black_box(native),
+                                    black_box(mode == 0),
+                                );
+                            }
+                            samples[mode][sample] = start.elapsed().as_nanos();
+                        }
+                    }
+                    for (mode, mut samples) in samples.into_iter().enumerate() {
+                        samples.sort_unstable();
+                        println!(
+                            "IPv{} {} {} {}: median {:.2} ns/packet",
+                            if ipv6 { 6 } else { 4 },
+                            protocol,
+                            if native { "native" } else { "scratch" },
+                            if mode == 0 { "original" } else { "optimized" },
+                            samples[3] as f64 / ITERATIONS as f64,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn assert_original_metadata(packet: &[u8], ipv6: bool) {
+        for direction in [Direction::Outbound, Direction::Inbound] {
+            for permit_fragments in [false, true] {
+                let actual = super::inspect_packet(packet, ipv6, direction, permit_fragments);
+                let expected = original::inspect_packet(packet, ipv6, direction, permit_fragments);
+                assert_eq!(actual.is_fragment, expected.is_fragment);
+                match (actual.metadata, expected.metadata) {
+                    (Ok(actual), Ok(expected)) => {
+                        assert!(
+                            actual.key == expected.key,
+                            "key mismatch for IPv{} prefix {}: {} != {}",
+                            if ipv6 { 6 } else { 4 }, packet.len(), actual.key, expected.key,
+                        );
+                        assert_eq!(actual.is_tcp_reset, expected.is_tcp_reset);
+                        assert_eq!(actual.is_local_icmp_error, expected.is_local_icmp_error);
+                        let echo = |echo: IcmpEcho| (echo.is_request, echo.identifier, echo.sequence);
+                        assert_eq!(
+                            actual.icmp_echo.map(echo),
+                            expected.icmp_echo.map(|echo| (echo.is_request, echo.identifier, echo.sequence)),
+                        );
+                        let expected_error = expected.icmp_error.map(|error| match error {
+                            original::IcmpError::Transport(protocol, remote, local_port, remote_port) =>
+                                IcmpError::Transport(protocol, remote, local_port, remote_port),
+                            original::IcmpError::Echo(remote, identifier, sequence) =>
+                                IcmpError::Echo(remote, identifier, sequence),
+                        });
+                        assert!(actual.icmp_error == expected_error, "ICMP quote mismatch: {packet:02x?}");
+                    }
+                    (Err(actual), Err(expected)) => {
+                        let expected = match expected {
+                            original::PacketMetadataError::UnreadablePacket => PacketMetadataError::UnreadablePacket,
+                            original::PacketMetadataError::UnresolvedIpv6Headers => PacketMetadataError::UnresolvedIpv6Headers,
+                            original::PacketMetadataError::FragmentRequiresReassembly => PacketMetadataError::FragmentRequiresReassembly,
+                        };
+                        assert_eq!(actual, expected);
+                    }
+                    (actual, expected) => panic!(
+                        "metadata availability mismatch for IPv{} prefix {}: actual={}, original={}, bytes={packet:02x?}",
+                        if ipv6 { 6 } else { 4 }, packet.len(), actual.is_ok(), expected.is_ok(),
+                    ),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_base_protocol_and_truncation_matches_the_original_parser() {
+        for ipv6 in [false, true] {
+            for protocol in 0..=u8::MAX {
+                let packet = basic_packet(ipv6, IpProtocol::from(protocol));
+                for length in 0..=MAX_PACKET_INSPECT_LEN {
+                    assert_original_metadata(&packet[..length], ipv6);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ipv4_options_fragments_and_declared_lengths_match_the_original_parser() {
+        for version in [0, 4, 6, 15] {
+            for ihl in 0..=15 {
+                for protocol in [
+                    IpProtocol::Tcp,
+                    IpProtocol::Udp,
+                    IpProtocol::Icmp,
+                    IpProtocol::Unknown(47),
+                ] {
+                    let mut packet = basic_packet(false, protocol);
+                    packet[0] = (version << 4) | ihl;
+                    for fragments in [0u16, 1, 0x2000, 0x3fff] {
+                        packet[6..8].copy_from_slice(&fragments.to_be_bytes());
+                        for declared in [0u16, 20, 24, 28, 64, 160, u16::MAX] {
+                            packet[2..4].copy_from_slice(&declared.to_be_bytes());
+                            for length in
+                                [0, 19, 20, 23, 24, 27, 28, 33, 34, 63, 64, 73, 74, 127, 128]
+                            {
+                                assert_original_metadata(&packet[..length], false);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ipv6_extension_chains_match_the_original_parser() {
+        for extension in [
+            IpProtocol::HopByHop,
+            IpProtocol::Ipv6Opts,
+            IpProtocol::Ipv6Route,
+            IpProtocol::Ipv6Frag,
+        ] {
+            for count in 1..=9 {
+                for protocol in [
+                    IpProtocol::Tcp,
+                    IpProtocol::Udp,
+                    IpProtocol::Icmpv6,
+                    IpProtocol::Unknown(47),
+                ] {
+                    for bits in [0u16, 1, 2, 8, 0x8000] {
+                        let mut packet = basic_packet(true, extension);
+                        for index in 0..count {
+                            let offset = IPV6_HEADER_LEN + index * 8;
+                            packet[offset..offset + 8].fill(0);
+                            packet[offset] = u8::from(if index + 1 == count {
+                                protocol
+                            } else {
+                                extension
+                            });
+                            packet[offset + 2..offset + 4].copy_from_slice(&bits.to_be_bytes());
+                        }
+                        let offset = IPV6_HEADER_LEN + count * 8;
+                        packet[offset..offset + 2].copy_from_slice(&50_000u16.to_be_bytes());
+                        packet[offset + 2..offset + 4].copy_from_slice(&443u16.to_be_bytes());
+                        packet[offset + TCP_FLAGS_OFFSET] = TCP_RST_FLAG;
+                        for length in [
+                            39, 40, 41, 42, 43, 44, 47, 48, 51, 52, 55, 56, 63, 64, 127, 128,
+                        ] {
+                            assert_original_metadata(&packet[..length], true);
+                        }
+                    }
+                }
+            }
+        }
+        for extension in [
+            IpProtocol::HopByHop,
+            IpProtocol::Ipv6Opts,
+            IpProtocol::Ipv6Route,
+        ] {
+            let mut packet = basic_packet(true, extension);
+            packet[40] = u8::from(IpProtocol::Tcp);
+            for declared in 0..=u8::MAX {
+                packet[41] = declared;
+                for length in 40..=MAX_PACKET_INSPECT_LEN {
+                    assert_original_metadata(&packet[..length], true);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn icmp_quotes_and_truncation_match_the_original_parser() {
+        let packet = captured_ipv4_network_unreachable();
+        for length in 0..=packet.len().min(MAX_PACKET_INSPECT_LEN) {
+            assert_original_metadata(&packet[..length], false);
+        }
+        for protocol in [IpProtocol::Tcp, IpProtocol::Udp, IpProtocol::Icmpv6] {
+            let packet = ipv6_error_quote(protocol);
+            for length in 0..=packet.len().min(MAX_PACKET_INSPECT_LEN) {
+                assert_original_metadata(&packet[..length], true);
+            }
+        }
+    }
+
+    fn late_ports_packet(ipv6: bool, offset: usize, protocol: IpProtocol) -> [u8; 160] {
+        let mut packet = basic_packet(ipv6, protocol);
+        if ipv6 {
+            packet[6] = u8::from(IpProtocol::Ipv6Opts);
+            packet[40] = u8::from(protocol);
+            packet[41] = ((offset - IPV6_HEADER_LEN) / 8 - 1) as u8;
+            packet[42..offset].fill(0);
+        } else {
+            packet[0] = 0x40 | (offset / 4) as u8;
+        }
+        packet[offset..offset + 2].copy_from_slice(&50_000u16.to_be_bytes());
+        packet[offset + 2..offset + 4].copy_from_slice(&443u16.to_be_bytes());
+        packet[offset + TCP_FLAGS_OFFSET] = TCP_RST_FLAG;
+        packet
+    }
+
+    #[test]
+    fn unreadable_existing_ports_are_errors_not_zero_port_keys() {
+        for (ipv6, offset) in [(false, 24), (false, 60), (true, 48), (true, 56)] {
+            for protocol in [IpProtocol::Tcp, IpProtocol::Udp] {
+                let packet = late_ports_packet(ipv6, offset, protocol);
+                for direction in [Direction::Inbound, Direction::Outbound] {
+                    for permit_fragments in [false, true] {
+                        let mut reader = CountingReader::new(&packet);
+                        reader.readable_length = if ipv6 { 44 } else { 24 };
+                        let mut inspector =
+                            PacketInspector::new(reader, ipv6, direction, permit_fragments);
+                        assert!(matches!(
+                            inspector.key(),
+                            Err(PacketMetadataError::UnreadablePacket)
+                        ));
+                        assert!(matches!(
+                            inspector.retry_key(),
+                            Err(PacketMetadataError::UnreadablePacket)
+                        ));
+                    }
+                }
+                // Actual truncation still has the original zero-port semantics.
+                for length in offset..offset + 4 {
+                    assert_original_metadata(&packet[..length], ipv6);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn first_probe_retry_recovers_the_real_late_transport_key() {
+        struct FailingPorts<'packet> {
+            reader: CountingReader<'packet>,
+            end: usize,
+            fail: bool,
+        }
+        impl PacketData for FailingPorts<'_> {
+            fn len(&self) -> usize {
+                self.reader.len()
+            }
+            fn prefix(&mut self, length: usize) -> Option<&[u8]> {
+                if length == self.end && self.fail {
+                    self.fail = false;
+                    return None;
+                }
+                self.reader.prefix(length)
+            }
+        }
+        for (ipv6, offset) in [(false, 24), (false, 60), (true, 48), (true, 56)] {
+            for protocol in [IpProtocol::Tcp, IpProtocol::Udp] {
+                let packet = late_ports_packet(ipv6, offset, protocol);
+                for direction in [Direction::Inbound, Direction::Outbound] {
+                    let reader = FailingPorts {
+                        reader: CountingReader::new(&packet),
+                        end: offset + 4,
+                        fail: true,
+                    };
+                    let mut inspector = PacketInspector::new(reader, ipv6, direction, true);
+                    assert!(matches!(
+                        inspector.key(),
+                        Err(PacketMetadataError::UnreadablePacket)
+                    ));
+                    let expected = original::inspect_packet(&packet[..128], ipv6, direction, false)
+                        .metadata
+                        .unwrap()
+                        .key;
+                    assert!(inspector.retry_key().unwrap() == expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn borrowed_inspector_contains_no_key_or_packet_buffer() {
+        assert!(core::mem::size_of::<PacketInspector<&mut &[u8]>>() <= 24);
+    }
+
+    #[test]
+    fn tcp_reset_uses_the_borrowed_readers_byte_accessor_once() {
+        struct ByteReader<'packet> {
+            reader: CountingReader<'packet>,
+            offset: usize,
+            flags: Option<u8>,
+            byte_reads: usize,
+        }
+        impl PacketData for ByteReader<'_> {
+            fn len(&self) -> usize {
+                self.reader.len()
+            }
+            fn prefix(&mut self, length: usize) -> Option<&[u8]> {
+                self.reader.prefix(length)
+            }
+            fn byte(&mut self, offset: usize) -> Option<u8> {
+                assert_eq!(offset, self.offset);
+                self.byte_reads += 1;
+                self.flags
+            }
+        }
+        for ipv6 in [false, true] {
+            for flags in [Some(TCP_RST_FLAG), Some(0x10), None] {
+                let packet = basic_packet(ipv6, IpProtocol::Tcp);
+                let length = if ipv6 { 44 } else { 24 };
+                let mut reader = ByteReader {
+                    reader: CountingReader::new(&packet),
+                    offset: if ipv6 { 53 } else { 33 },
+                    flags,
+                    byte_reads: 0,
+                };
+                let mut inspector =
+                    PacketInspector::new(&mut reader, ipv6, Direction::Outbound, true);
+                let key = inspector.key().unwrap();
+                assert_eq!(key.protocol, IpProtocol::Tcp);
+                let reset = flags.is_some_and(|flags| flags & TCP_RST_FLAG != 0);
+                assert_eq!(inspector.is_tcp_reset(), reset);
+                assert_eq!(inspector.is_tcp_reset(), reset);
+                drop(inspector);
+                assert_eq!(reader.byte_reads, 1);
+                assert_eq!(reader.reader.requests, [length]);
+                assert_eq!(reader.reader.reads, [length]);
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_key_uses_its_initial_prefix_without_a_second_lookup() {
+        for ipv6 in [false, true] {
+            for protocol in [IpProtocol::Tcp, IpProtocol::Udp, IpProtocol::Unknown(47)] {
+                let packet = basic_packet(ipv6, protocol);
+                let mut reader = CountingReader::new(&packet);
+                let mut inspector =
+                    PacketInspector::new(&mut reader, ipv6, Direction::Outbound, true);
+                let key = inspector.key().unwrap();
+                assert_eq!(key.protocol, protocol);
+                let length = if ipv6 { 44 } else { 24 };
+                assert_eq!(inspector.reader.requests, [length]);
+                assert_eq!(inspector.reader.reads, [length]);
+            }
+        }
+    }
+
+    #[test]
+    fn basic_keys_share_one_small_read_and_transport_flags_are_lazy() {
+        for ipv6 in [false, true] {
+            for protocol in [IpProtocol::Tcp, IpProtocol::Udp] {
+                let packet = basic_packet(ipv6, protocol);
+                let prefix_length = if ipv6 { 44 } else { 24 };
+                for direction in [Direction::Outbound, Direction::Inbound] {
+                    let reader = CountingReader::new(&packet);
+                    let mut inspector = PacketInspector::new(reader, ipv6, direction, true);
+                    assert!(inspector.reader.reads.is_empty());
+                    assert!(!inspector.is_fragment());
+                    let key = inspector.key().unwrap();
+                    assert_eq!(key.protocol, protocol);
+                    assert_eq!(
+                        key.local_port,
+                        if matches!(direction, Direction::Outbound) {
+                            50_000
+                        } else {
+                            443
+                        }
+                    );
+                    assert!(inspector.key().unwrap() == key);
+                    assert!(inspector.icmp_metadata(&key).echo.is_none());
+                    assert_eq!(inspector.reader.reads, [prefix_length]);
+                    let reset = protocol == IpProtocol::Tcp;
+                    assert_eq!(inspector.is_tcp_reset(), reset);
+                    assert_eq!(inspector.is_tcp_reset(), reset);
+                    assert!(inspector.key().unwrap() == key);
+                    let expected = if reset {
+                        vec![prefix_length, prefix_length + 10]
+                    } else {
+                        vec![prefix_length]
+                    };
+                    assert_eq!(inspector.reader.reads, expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn header_cache_stays_register_sized() {
+        assert!(core::mem::size_of::<HeaderInspection>() <= core::mem::size_of::<u64>());
+    }
+
+    #[test]
+    fn a_single_key_request_bypasses_individual_fragments_before_ports() {
+        for ipv6 in [false, true] {
+            let mut packet = basic_packet(ipv6, IpProtocol::Tcp);
+            let expected_read = if ipv6 {
+                packet[6] = u8::from(IpProtocol::Ipv6Frag);
+                packet[40] = u8::from(IpProtocol::Tcp);
+                packet[42] = 0;
+                packet[43] = 1;
+                44
+            } else {
+                packet[6] = 0x20;
+                24
+            };
+            for direction in [Direction::Inbound, Direction::Outbound] {
+                let mut inspector =
+                    PacketInspector::new(CountingReader::new(&packet), ipv6, direction, true);
+                assert_eq!(
+                    inspector.key().err(),
+                    Some(PacketMetadataError::FragmentRequiresReassembly)
+                );
+                assert!(!inspector.is_tcp_reset());
+                assert_eq!(inspector.reader.reads, [expected_read]);
+            }
+        }
+    }
+
+    #[test]
+    fn fragment_probes_do_not_read_transport_or_unresolved_tails() {
+        let mut ipv4 = basic_packet(false, IpProtocol::Tcp);
+        ipv4[6] = 0x20;
+        let mut inspector =
+            PacketInspector::new(CountingReader::new(&ipv4), false, Direction::Outbound, true);
+        assert!(inspector.is_fragment());
+        assert!(matches!(
+            inspector.key(),
+            Err(PacketMetadataError::FragmentRequiresReassembly)
+        ));
+        assert!(!inspector.is_tcp_reset());
+        assert_eq!(inspector.reader.reads, [24]);
+
+        let mut ipv6 = basic_packet(true, IpProtocol::Ipv6Opts);
+        ipv6[40] = u8::from(IpProtocol::Ipv6Frag);
+        ipv6[41] = 0;
+        ipv6[48] = u8::from(IpProtocol::Ipv6Opts);
+        ipv6[51] = 1;
+        ipv6[57] = 255; // the chain after this fragment cannot resolve
+        let mut inspector =
+            PacketInspector::new(CountingReader::new(&ipv6), true, Direction::Inbound, true);
+        assert!(inspector.is_fragment());
+        assert!(matches!(
+            inspector.key(),
+            Err(PacketMetadataError::FragmentRequiresReassembly)
+        ));
+        assert!(!inspector.is_tcp_reset());
+        assert_eq!(inspector.reader.reads, [44, 52]);
+    }
+
+    #[test]
+    fn ipv6_options_are_validated_without_reading_their_bodies() {
+        let mut packet = basic_packet(true, IpProtocol::Ipv6Route);
+        packet[40] = 47; // a non-TCP/UDP protocol after a 48-byte Routing header
+        packet[41] = 5;
+        packet[43] = 1;
+        let mut inspector = PacketInspector::new(
+            CountingReader::new(&packet),
+            true,
+            Direction::Outbound,
+            true,
+        );
+        assert!(!inspector.is_fragment());
+        let key = inspector.key().unwrap();
+        assert_eq!(key.protocol, IpProtocol::Unknown(47));
+        assert!(inspector.icmp_metadata(&key).echo.is_none());
+        assert!(!inspector.is_tcp_reset());
+        assert_eq!(inspector.reader.reads, [44]);
+
+        let mut inspector = PacketInspector::new(
+            CountingReader::new(&packet[..87]),
+            true,
+            Direction::Outbound,
+            true,
+        );
+        assert!(!inspector.is_fragment());
+        assert!(matches!(
+            inspector.key(),
+            Err(PacketMetadataError::UnresolvedIpv6Headers)
+        ));
+        assert_eq!(inspector.reader.reads, [44]);
+    }
+
+    #[test]
+    fn icmp_quotes_are_read_only_for_attribution_and_stop_at_identity() {
+        let packet = captured_ipv4_network_unreachable();
+        for direction in [Direction::Inbound, Direction::Outbound] {
+            let mut inspector =
+                PacketInspector::new(CountingReader::new(&packet), false, direction, true);
+            let key = inspector.key().unwrap();
+            assert_eq!(key.protocol, IpProtocol::Icmp);
+            assert_eq!(inspector.reader.reads, [24]);
+            assert!(!inspector.is_tcp_reset());
+            let icmp = inspector.icmp_metadata(&key);
+            if matches!(direction, Direction::Inbound) {
+                assert!(matches!(
+                    icmp.error,
+                    Some(IcmpError::Transport(IpProtocol::Tcp, _, 34_912, 1234))
+                ));
+                assert_eq!(inspector.reader.reads, [24, 28, 48, 52]);
+            } else {
+                assert!(icmp.error.is_none());
+                assert_eq!(inspector.reader.reads, [24, 28]);
+            }
+            let reads = inspector.reader.reads.clone();
+            assert!(inspector.icmp_metadata(&key).error == icmp.error);
+            assert_eq!(inspector.reader.reads, reads);
+        }
+
+        let packet = ipv6_error_quote(IpProtocol::Udp);
+        let mut inspector = PacketInspector::new(
+            CountingReader::new(&packet),
+            true,
+            Direction::Inbound,
+            false,
+        );
+        let key = inspector.key().unwrap();
+        assert_eq!(key.protocol, IpProtocol::Icmpv6);
+        assert_eq!(inspector.reader.reads, [44]);
+        assert!(matches!(
+            inspector.icmp_metadata(&key).error,
+            Some(IcmpError::Transport(IpProtocol::Udp, _, 50_000, 443))
+        ));
+        assert_eq!(inspector.reader.reads, [44, 48, 88, 92]);
+    }
+
+    #[test]
+    fn failed_optional_fields_are_cached_without_losing_the_key() {
+        let packet = basic_packet(false, IpProtocol::Tcp);
+        let mut reader = CountingReader::new(&packet);
+        reader.readable_length = 24;
+        let mut inspector = PacketInspector::new(reader, false, Direction::Outbound, true);
+        let key = inspector.key().unwrap();
+        assert!(!inspector.is_tcp_reset());
+        assert!(!inspector.is_tcp_reset());
+        assert!(inspector.key().unwrap() == key);
+        assert_eq!(inspector.reader.reads, [24, 34]);
+    }
+
+    #[test]
+    fn failed_optional_materialization_keeps_the_callers_key_valid() {
+        struct Reader<'packet> {
+            packet: &'packet [u8],
+            storage: [u8; MAX_PACKET_INSPECT_LEN],
+            cached_length: usize,
+            reads: Vec<usize>,
+        }
+        impl PacketData for Reader<'_> {
+            fn len(&self) -> usize {
+                self.packet.len().min(MAX_PACKET_INSPECT_LEN)
+            }
+            fn prefix(&mut self, length: usize) -> Option<&[u8]> {
+                if length > self.len() {
+                    return None;
+                }
+                if length > self.cached_length {
+                    self.reads.push(length);
+                    if length > 24 {
+                        // A failed NDIS expansion may overwrite earlier scratch
+                        // bytes. The callout's already-owned key must survive.
+                        self.storage[..24].fill(0);
+                        self.cached_length = 0;
+                        return None;
+                    }
+                    self.storage[..length].copy_from_slice(&self.packet[..length]);
+                    self.cached_length = length;
+                }
+                Some(&self.storage[..length])
+            }
+        }
+        let packet = basic_packet(false, IpProtocol::Tcp);
+        let expected = original::inspect_packet(&packet[..128], false, Direction::Outbound, true)
+            .metadata
+            .unwrap()
+            .key;
+        let mut reader = Reader {
+            packet: &packet,
+            storage: [0; MAX_PACKET_INSPECT_LEN],
+            cached_length: 0,
+            reads: Vec::new(),
+        };
+        let mut inspector = PacketInspector::new(&mut reader, false, Direction::Outbound, true);
+        let key = inspector.key().unwrap();
+        assert!(!inspector.is_tcp_reset());
+        assert!(!inspector.is_tcp_reset());
+        assert!(key == expected);
+        drop(inspector);
+        assert_eq!(reader.reads, [24, 34]);
+        assert_eq!(&reader.storage[..24], &[0; 24]);
+    }
+
+    #[test]
+    fn failed_first_probe_is_retried_only_when_requested() {
+        let packet = basic_packet(false, IpProtocol::Udp);
+        let mut reader = CountingReader::new(&packet);
+        reader.failures = 2;
+        let mut inspector = PacketInspector::new(reader, false, Direction::Outbound, true);
+        assert!(!inspector.is_fragment());
+        assert!(matches!(
+            inspector.key(),
+            Err(PacketMetadataError::UnreadablePacket)
+        ));
+        assert!(matches!(
+            inspector.key(),
+            Err(PacketMetadataError::UnreadablePacket)
+        ));
+        assert_eq!(inspector.reader.reads, [24, 20]);
+        assert_eq!(inspector.retry_key().unwrap().local_port, 50_000);
+        assert_eq!(inspector.reader.reads, [24, 20, 24]);
+    }
+
+    #[test]
+    fn ipv4_options_extend_the_prefix_only_to_requested_fields() {
+        let mut packet = basic_packet(false, IpProtocol::Tcp);
+        packet[0] = 0x4f;
+        packet[60..62].copy_from_slice(&50_001u16.to_be_bytes());
+        packet[62..64].copy_from_slice(&443u16.to_be_bytes());
+        packet[73] = TCP_RST_FLAG;
+        let mut inspector = PacketInspector::new(
+            CountingReader::new(&packet),
+            false,
+            Direction::Outbound,
+            true,
+        );
+        assert!(!inspector.is_fragment());
+        assert_eq!(inspector.reader.reads, [24]);
+        assert_eq!(inspector.key().unwrap().local_port, 50_001);
+        assert_eq!(inspector.reader.reads, [24, 64]);
+        assert!(inspector.is_tcp_reset());
+        assert_eq!(inspector.reader.reads, [24, 64, 74]);
     }
 
     #[test]

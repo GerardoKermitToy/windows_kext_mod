@@ -1,18 +1,15 @@
 use alloc::string::{String, ToString};
+use core::mem::MaybeUninit;
 use smoltcp::wire::{
     IpAddress, IpProtocol, Ipv4Address, Ipv4Packet, Ipv6Address, Ipv6Packet, TcpPacket, UdpPacket,
-    IPV4_HEADER_LEN, IPV6_HEADER_LEN,
 };
-use wdk::filter_engine::net_buffer::NetBufferList;
+use wdk::filter_engine::net_buffer::{NetBufferList, NetBufferReader};
 
 use crate::device::Packet;
 use crate::ipv6_packet::{recalculate_ipv6_transport_checksum, rewrite_ipv6_tcp_udp, PortRewrite};
 use crate::{
-    connection::{Direction, RedirectInfo},
-    dbg, err,
-    packet_metadata::{
-        inspect_packet as inspect_packet_bytes, PacketInspection, MAX_PACKET_INSPECT_LEN,
-    },
+    connection::RedirectInfo, dbg, err, ipv6_packet::PacketData,
+    packet_metadata::MAX_PACKET_INSPECT_LEN,
 };
 
 /// `Redirect` is a trait that defines a method for redirecting network packets.
@@ -276,29 +273,30 @@ fn print_packet(packet: &[u8]) {
     }
 }
 
-/// Reads one bounded packet prefix from NDIS and derives all packet-callout
-/// metadata from that same snapshot.
-pub(crate) fn inspect_packet(
-    nbl: &NetBufferList,
-    ipv6: bool,
-    direction: Direction,
-    permit_fragments: bool,
-) -> PacketInspection {
-    // The IPv4 fallback reaches the TCP flags byte with a base-sized header and
-    // also covers the complete ICMP header. IPv6 extension parsing retains its
-    // established base-header fallback.
-    const IPV4_FALLBACK_LEN: usize = IPV4_HEADER_LEN + 14;
-    let fallback_length = if ipv6 {
-        IPV6_HEADER_LEN
-    } else {
-        IPV4_FALLBACK_LEN
-    };
-    // SAFETY: The live, synchronized NBL is borrowed for this call. The callback
-    // only parses bytes into owned metadata; it cannot mutate or release the packet.
-    unsafe {
-        nbl.inspect_bytes_up_to::<MAX_PACKET_INSPECT_LEN, _>(fallback_length, |packet| {
-            inspect_packet_bytes(packet, ipv6, direction, permit_fragments)
-        })
+impl<const N: usize> PacketData for Option<NetBufferReader<'_, '_, N>> {
+    #[inline]
+    fn len(&self) -> usize {
+        self.as_ref().map_or(0, NetBufferReader::len)
     }
-    .unwrap_or_else(|()| PacketInspection::unreadable())
+
+    #[inline]
+    fn prefix(&mut self, length: usize) -> Option<&[u8]> {
+        self.as_mut()?.prefix(length).ok()
+    }
+
+    #[inline]
+    fn byte(&mut self, offset: usize) -> Option<u8> {
+        self.as_mut()?.byte(offset).ok()
+    }
+}
+
+/// Borrows the packet and scratch storage without reading or copying either.
+#[inline]
+pub(crate) fn packet_reader<'nbl, 'storage>(
+    nbl: &'nbl NetBufferList,
+    storage: &'storage mut MaybeUninit<[u8; MAX_PACKET_INSPECT_LEN]>,
+) -> Option<NetBufferReader<'nbl, 'storage, MAX_PACKET_INSPECT_LEN>> {
+    // SAFETY: The WFP-owned NBL is borrowed for synchronous, read-only inspection.
+    // The callout stops using the reader before moving or injecting the packet.
+    unsafe { nbl.reader(storage).ok() }
 }
