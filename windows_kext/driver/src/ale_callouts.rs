@@ -1414,7 +1414,7 @@ pub(crate) fn expire_inactive_untracked_connections(device: &Device) {
     }
 }
 
-const TCP_UNESTABLISHED_TIMEOUT_MS: u64 = 10_000;
+const TCP_UNESTABLISHED_TIMEOUT_MS: u64 = 60_000;
 
 /// Ends local TCP authorization generations that never reached FLOW_ESTABLISHED.
 ///
