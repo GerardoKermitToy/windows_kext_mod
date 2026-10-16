@@ -152,13 +152,16 @@ pub(crate) fn should_permit_ale_tcp_reset(
         && transport_header[13] & 0x04 != 0
 }
 
-/// An inbound packet reauthorizing AUTH_CONNECT has no injectable IP header there.
+/// Preserve inbound UDP replies at AUTH_CONNECT: unlike TCP, a dropped datagram
+/// cannot rely on retransmission after the verdict triggers reauthorization.
 pub(crate) fn should_skip_cross_direction_ale_clone(
+    protocol: IpProtocol,
     reauthorize: bool,
     connection_direction: Direction,
     packet_direction: Direction,
 ) -> bool {
-    reauthorize
+    protocol != IpProtocol::Udp
+        && reauthorize
         && matches!(connection_direction, Direction::Outbound)
         && matches!(packet_direction, Direction::Inbound)
 }
@@ -522,26 +525,46 @@ mod tests {
     }
 
     #[test]
-    fn only_inbound_packet_on_reauthorized_outbound_flow_skips_clone() {
-        assert!(should_skip_cross_direction_ale_clone(
-            true,
-            Direction::Outbound,
-            Direction::Inbound
-        ));
-        assert!(!should_skip_cross_direction_ale_clone(
-            false,
-            Direction::Outbound,
-            Direction::Inbound
-        ));
-        assert!(!should_skip_cross_direction_ale_clone(
-            true,
-            Direction::Inbound,
-            Direction::Inbound
-        ));
-        assert!(!should_skip_cross_direction_ale_clone(
-            true,
-            Direction::Outbound,
-            Direction::Outbound
-        ));
+    fn udp_replies_are_captured_even_when_they_reauthorize_an_outbound_flow() {
+        for reauthorize in [false, true] {
+            for connection_direction in [Direction::Inbound, Direction::Outbound] {
+                for packet_direction in [Direction::Inbound, Direction::Outbound] {
+                    assert!(should_capture_ale_packet(
+                        IpProtocol::Udp,
+                        packet_direction,
+                        reauthorize,
+                    ));
+                    assert!(!should_skip_cross_direction_ale_clone(
+                        IpProtocol::Udp,
+                        reauthorize,
+                        connection_direction,
+                        packet_direction,
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn non_udp_cross_direction_clone_policy_is_unchanged() {
+        for protocol in [IpProtocol::Tcp, IpProtocol::Icmp, IpProtocol::Icmpv6] {
+            for reauthorize in [false, true] {
+                for connection_direction in [Direction::Inbound, Direction::Outbound] {
+                    for packet_direction in [Direction::Inbound, Direction::Outbound] {
+                        assert_eq!(
+                            should_skip_cross_direction_ale_clone(
+                                protocol,
+                                reauthorize,
+                                connection_direction,
+                                packet_direction,
+                            ),
+                            reauthorize
+                                && matches!(connection_direction, Direction::Outbound)
+                                && matches!(packet_direction, Direction::Inbound),
+                        );
+                    }
+                }
+            }
+        }
     }
 }

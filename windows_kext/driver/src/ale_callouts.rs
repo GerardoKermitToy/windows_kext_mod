@@ -858,12 +858,10 @@ fn create_packet_list(
     callout_data: &mut CalloutData,
     ale_data: &AleLayerData,
 ) -> Result<Option<TransportPacketList>, String> {
-    // An inbound packet can reauthorize an outbound ALE flow at AUTH_CONNECT.
-    // WFP does not expose a valid IP header for packet inspection at that layer,
-    // so it cannot be converted into the IP-header NBL required by transport
-    // receive injection. Absorb this indication without a clone; after the verdict
-    // forces another reauthorization, the next packet is classified normally.
+    // Keep the existing no-clone fallback for non-UDP cross-direction reauth.
+    // UDP replies must be saved: the absorbed datagram may be the only response.
     if should_skip_cross_direction_ale_clone(
+        ale_data.protocol,
         ale_data.reauthorize,
         ale_data.connection_direction,
         ale_data.packet_direction,
@@ -883,9 +881,9 @@ fn create_packet_list(
     let mut inbound = false;
     let mut event_data_offset = 0;
     if let Direction::Inbound = ale_data.packet_direction {
-        // At ALE_AUTH_RECV_ACCEPT the inbound data offset is at the payload.
-        // Retreat over both headers so the clone passed to
-        // FwpsInjectTransportReceiveAsync starts at the IP header.
+        // Both AUTH_RECV_ACCEPT and inbound UDP reauthorization at AUTH_CONNECT
+        // indicate the payload here. Retreat over both headers so the clone passed
+        // to FwpsInjectTransportReceiveAsync starts at the IP header.
         let base = if ale_data.is_ipv6 {
             IPV6_HEADER_LEN
         } else {
