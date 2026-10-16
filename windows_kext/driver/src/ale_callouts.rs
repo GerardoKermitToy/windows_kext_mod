@@ -253,12 +253,20 @@ fn track_tcp_endpoint_instance(
     parent_endpoint_handle: Option<u64>,
     key: Key,
     instance_id: u64,
+    reauthorize_outbound: bool,
 ) {
     let Some(endpoint_handle) = endpoint_handle else {
         return;
     };
 
-    let now = wdk::utils::get_monotonic_timestamp_ms();
+    // Only an observed initial authorization can start the outbound SYN timeout.
+    // A flow first seen during reauthorization may already be established and will
+    // not get another FLOW_ESTABLISHED. Existing associations keep their timestamp.
+    let initial_authorization_at_ms = if reauthorize_outbound {
+        0
+    } else {
+        wdk::utils::get_monotonic_timestamp_ms()
+    };
     let mut endpoint_cache = device.tcp_endpoint_cache.write_lock();
     let associated = device
         .connection_cache
@@ -268,7 +276,7 @@ fn track_tcp_endpoint_instance(
                 key,
                 parent_endpoint_handle,
                 instance_id,
-                now,
+                initial_authorization_at_ms,
             ))
         });
     if matches!(associated, Some(false)) {
@@ -320,6 +328,7 @@ fn track_endpoint_instance(
     parent_endpoint_handle: Option<u64>,
     key: Key,
     instance_id: u64,
+    reauthorize_outbound: bool,
 ) {
     match key.protocol {
         IpProtocol::Tcp => track_tcp_endpoint_instance(
@@ -328,6 +337,7 @@ fn track_endpoint_instance(
             parent_endpoint_handle,
             key,
             instance_id,
+            reauthorize_outbound,
         ),
         IpProtocol::Udp => {
             track_udp_endpoint_instance(device, endpoint_handle, key, instance_id)
@@ -403,6 +413,8 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
         ale_data.packet_direction,
     );
     let key = ale_data.as_key();
+    let reauthorize_outbound = ale_data.reauthorize
+        && matches!(ale_data.connection_direction, Direction::Outbound);
 
     // An outbound self-injected indication has no application send context, so its
     // transport endpoint handle belongs to the injector and is shared by every
@@ -440,6 +452,7 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
                         parent_endpoint_handle,
                         key,
                         connection_instance_id,
+                        reauthorize_outbound,
                     );
                 }
             }
@@ -508,6 +521,7 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
                     parent_endpoint_handle,
                     key,
                     registration.instance_id,
+                    reauthorize_outbound,
                 );
             }
             Err(err) => crate::err!("failed to build connection: {}", err),
@@ -584,6 +598,7 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
                     parent_endpoint_handle,
                     key,
                     connection_instance_id,
+                    reauthorize_outbound,
                 );
             }
         } else {
@@ -748,6 +763,7 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
             parent_endpoint_handle,
             key,
             registration.instance_id,
+            reauthorize_outbound,
         );
         if let Some(pending) = device.publish_pending_packet(
             (key, packet),

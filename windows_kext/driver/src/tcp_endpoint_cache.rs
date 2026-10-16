@@ -205,19 +205,18 @@ impl TcpEndpointCache {
     }
 
     /// Associates one exact live connection-cache generation with its WFP endpoint
-    /// and records when its authorization identity appeared.
+    /// and records when its initial authorization was observed.
     ///
     /// Reauthorization can repeat the same association while omitting optional
-    /// parent-endpoint metadata. A different connection for an already tracked
-    /// handle is rejected: replacing it could let an old closure consume a newer
-    /// connection generation.
+    /// parent-endpoint metadata. It preserves the original timestamp, so completing
+    /// a pended connect cannot disable its timeout. A different connection for an
+    /// already tracked handle is rejected: replacing it could let an old closure
+    /// consume a newer connection generation.
     ///
-    /// # Parameters
-    /// * `associated_at_ms` - Timestamp in milliseconds when the endpoint was associated.
-    ///   **Special value 0** marks the entry as exempt from timeout-based cleanup;
-    ///   such entries are retained until explicitly removed via `take()` or `clear()`.
-    ///   Established connections typically use 0 since they should only be removed
-    ///   on explicit closure events, not by timeout.
+    /// A zero timestamp exempts a newly associated endpoint from timeout cleanup
+    /// without declaring it established. Use it when first seen at outbound
+    /// reauthorization: an active flow will not produce another FLOW_ESTABLISHED.
+    /// Native resource release and endpoint closure still retire that generation.
     pub fn associate_instance_at(
         &mut self,
         endpoint_handle: u64,
@@ -702,6 +701,81 @@ mod tests {
             .any(|endpoint| endpoint.instance_id == 100));
         assert!(cache.lookup_is_consistent());
         assert_eq!(cache.get_entries_count(), 0);
+    }
+
+    #[test]
+    fn first_seen_reauthorization_waits_for_native_closure() {
+        let mut ipv4 = key();
+        ipv4.local_address = IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1));
+        ipv4.remote_address = ipv4.local_address;
+        let mut ipv6 = ipv4;
+        ipv6.local_address = IpAddress::Ipv6(Ipv6Address::LOOPBACK);
+        ipv6.remote_address = ipv6.local_address;
+
+        for tuple in [ipv4, ipv6] {
+            for resource_release in [false, true] {
+                let mut cache = TcpEndpointCache::new();
+                assert!(cache.associate_instance_at(10, tuple, Some(20), 100, 0));
+                assert!(cache.associate_instance_at(11, tuple, Some(20), 100, 0));
+                assert!(cache
+                    .take_unestablished_before(u64::MAX, |_| panic!("untimed endpoint"))
+                    .is_empty());
+                assert!(cache
+                    .resolve_live_instance(&tuple, Some(20), |id| id == 100)
+                    .is_some());
+
+                let endpoint = if resource_release {
+                    cache.take_unestablished(10)
+                } else {
+                    cache.take(10)
+                };
+                assert_eq!(endpoint.expect("native closure").instance_id, 100);
+                assert_eq!(cache.get_entries_count(), 0);
+                assert!(cache.lookup_is_consistent());
+            }
+        }
+    }
+
+    #[test]
+    fn reauthorization_preserves_initial_connect_timeout_and_retires_aliases() {
+        for (initial_parent, reauth_parent) in [
+            (None, None),
+            (None, Some(20)),
+            (Some(20), None),
+            (Some(20), Some(20)),
+        ] {
+            let mut cache = TcpEndpointCache::new();
+            let tuple = key();
+            assert!(cache.associate_instance_at(10, tuple, initial_parent, 100, 10));
+            assert!(cache.associate_instance_at(10, tuple, reauth_parent, 100, 0));
+            let parent = reauth_parent.or(initial_parent);
+            assert!(cache.associate_instance_at(11, tuple, parent, 100, 0));
+            assert!(cache.take_unestablished_before(9, |_| true).is_empty());
+
+            let expired = cache.take_unestablished_before(10, |_| true);
+            assert_eq!(expired.len(), 1);
+            assert_eq!(expired[0].instance_id, 100);
+            assert_eq!(cache.get_entries_count(), 0);
+            assert!(cache.lookup_is_consistent());
+        }
+    }
+
+    #[test]
+    fn first_seen_reauthorization_does_not_exempt_another_generation() {
+        let mut cache = TcpEndpointCache::new();
+        let tuple = key();
+        assert!(cache.associate_instance_at(10, tuple, Some(20), 100, 0));
+        assert!(cache.associate_instance_at(11, tuple, Some(20), 101, 10));
+
+        let expired = cache.take_unestablished_before(10, |_| true);
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].instance_id, 101);
+        assert_eq!(
+            cache.take(10).expect("reauthorized generation").instance_id,
+            100
+        );
+        assert!(cache.take(11).is_none());
+        assert!(cache.lookup_is_consistent());
     }
 
     #[test]
