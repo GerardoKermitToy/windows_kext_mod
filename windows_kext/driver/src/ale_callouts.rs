@@ -48,6 +48,13 @@ struct AleLayerData {
 impl AleLayerData {
     #[inline]
     fn get_thread_id(&self, device: &Device) -> u64 {
+        // During reauthorization, the callout may execute in arbitrary receive/DPC context
+        // (e.g., when an inbound packet triggers reauth of an outbound flow).
+        // PsGetCurrentThreadId() would return the current thread, not the socket owner.
+        if self.reauthorize {
+            return 0;
+        }
+
         if matches!(self.connection_direction, Direction::Outbound)
             && !matches!(self.process_id, 0 | 4)
             && !device.is_owner_pid(self.process_id as u32)
