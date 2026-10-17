@@ -1049,7 +1049,7 @@ impl Device {
             if process_id == 0 {
                 process_id = wdk::utils::current_process_id();
             }
-            if thread_id == 0 && !self.is_owner_pid(process_id as u32) {
+            if thread_id == 0 && !matches!(process_id, 0 | 4) && !self.is_owner_pid(process_id as u32) {
                 thread_id = wdk::utils::current_thread_id();
             }
         }
