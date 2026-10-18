@@ -574,27 +574,289 @@ The `ToString`, `PayloadLayerToString`, `ProtocolToString`, `DirectionToString`,
 
 ## Building and testing
 
-The driver supports release builds only. A debug build intentionally fails with a compile-time error. The target is fixed to `x86_64-pc-windows-msvc` with `panic=abort`.
+### Supported configuration and precautions
+
+This build-and-run procedure is documented **only for Windows 11 Enterprise 26H2, x64**, with **UEFI Secure Boot enabled** and the **`CodeIntegrity-AllowConfigurablePolicy-CustomKernelSigners`** policy manually activated. It uses a custom UEFI Platform Key (PK), a signed Code Integrity policy, and a locally issued kernel-mode signing certificate. It is not a Microsoft/WHQL signing procedure, and it does not establish compatibility with other Windows releases or editions.
+
+The driver supports **release builds only**. A debug build intentionally fails with a compile-time error. The target is fixed to `x86_64-pc-windows-msvc` with `panic=abort`.
+
+> **Before changing the system:** use a development/test machine you administer, with local console access and a tested recovery USB. Back up Windows, the existing EFI policy, and the firmware's Secure Boot keys/databases (PK, KEK, db, and dbx), or establish a vendor-supported way to restore them. Save the BitLocker/device-encryption recovery key outside the machine and suspend protection for the planned firmware/boot changes according to your recovery procedure. An incorrect enforced policy or missing bootloader certificate can prevent Windows from starting. A signed policy is protected against tampering; removing its file is not a general rollback procedure. Review Microsoft's [signed-policy precautions](https://learn.microsoft.com/en-us/windows/security/application-security/application-control/app-control-for-business/deployment/use-signed-policies-to-protect-appcontrol-against-tampering) before deployment.
+
+**Check OS support before deploying anything:** the existing `REG_DWORD` value `CustomKernelSignerLockedEnabled` must be present under `HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\CI\Protected`. If it is absent, install the current Windows updates for Windows 11 Enterprise 26H2, reboot, and check again **before copying an enforced policy to EFI**. Do not create the value manually to substitute for missing OS support. If it remains absent, stop this procedure.
+
+Install the [build prerequisites](#build-prerequisites) before starting: `signtool.exe` from the Windows SDK is already needed in step 2. The examples assume the checkout is `C:\portmaster_v3` and Windows is installed in `C:\Windows`.
+
+Use **64-bit Windows PowerShell 5.1 as Administrator** for the certificate, ConfigCI, EFI, and verification commands below. The Windows PowerShell/ConfigCI commands are not Git Bash commands; do not substitute PowerShell 7 for this procedure. Stop at any error rather than continuing with incomplete output.
+
+### Build prerequisites
+
+Install the following software before configuring the policy or building the driver:
+
+| Software | Required components and purpose |
+|---|---|
+| [Visual Studio or Visual Studio Build Tools](https://visualstudio.microsoft.com/downloads/) | **Desktop development with C++**, including the MSVC x64/x86 compiler/linker and Windows C++ libraries. The scripts currently use the **Visual Studio 18 Enterprise** installation path shown below. Other editions/Build Tools require adjusting that path. |
+| [Windows SDK and Windows Driver Kit (WDK)](https://learn.microsoft.com/en-us/windows-hardware/drivers/download-the-wdk) | The current linker script selects **10.0.28000.0**. Install the matching SDK/WDK kernel libraries, the SDK tools **`rc.exe`** and **`signtool.exe`**, and ensure the **KMDF 1.15 x64** libraries are available. Merely installing the user-mode SDK is insufficient. |
+| [Rust via rustup](https://rustup.rs/) | Install the **stable MSVC** toolchain on the `x86_64-pc-windows-msvc` host, including Cargo and the `x86_64-pc-windows-msvc` target. The driver's `rust-toolchain` selects `stable`; nightly is not required. Make `%USERPROFILE%\.cargo\bin` available on `PATH`. |
+| Windows PowerShell 5.1 | Included with Windows. Used for certificate creation, the built-in **ConfigCI** module, version-resource generation, and `link-dev.ps1`. |
+| [Git for Windows](https://gitforwindows.org/) | For obtaining the checkout and for **Git Bash** if using the unit-test command below. |
+| CMake **3.15 or newer** and Ninja — **client only** | Needed for the C++ monitor, not for `build-signed.bat`. They can be installed through Visual Studio's **C++ CMake tools for Windows** component. The client requires a C++20-capable compiler. |
+
+After installing Rust, ensure the selected toolchain and target are available:
+
+```powershell
+rustup toolchain install stable
+rustup target add x86_64-pc-windows-msvc --toolchain stable
+```
+
+Open a new shell after installing tools so that `cargo` is on `PATH`. Initial builds need access to crates.io and the pinned `windows-rs` GitHub dependency; driver timestamping also needs access to `http://timestamp.digicert.com`.
+
+**Match the scripts' paths to the installed tools.** The current defaults are:
+
+- `windows_kext\build-signed.bat`: `VCVARS` points to `C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvarsall.bat`.
+- `windows_kext\link-dev.ps1`: `$SDK_Version = "10.0.28000.0"`; kernel libraries are under `C:\Program Files (x86)\Windows Kits\10\lib\10.0.28000.0\km\x64`, and KMDF libraries are under `C:\Program Files (x86)\Windows Kits\10\lib\wdf\kmdf\x64\1.15` (`WdfLdr.lib` and `WdfDriverEntry.lib`).
+- `kext_client\build.bat`, if building the monitor: its own `VCVARS` points to `C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvars64.bat`.
+
+If the installed edition/version differs, adjust the corresponding paths before building; `build-signed.bat` does not discover arbitrary Visual Studio or WDK installations. Use the matching SDK version in the full SignTool path in step 2 as well. The normal driver build uses the checked-in `windows_kext\c_helper\x64\c_helper.lib`; it does not rebuild the C helper. Go, Python, Perl, and LLVM/Clang are not required for this build path.
+
+### 1. Create the local certificates
+
+Change to `windows_kext`; all relative output paths in steps 1 and 2 refer to this directory:
+
+```powershell
+Set-Location 'C:\portmaster_v3\windows_kext'
+```
+
+Run the following certificate-generation script. It creates a self-signed root CA and two certificates issued by that CA, with exportable private keys in `Cert:\LocalMachine\My`, then exports them to the current directory:
+
+```powershell
+$pwd = ConvertTo-SecureString -String "1" -Force -AsPlainText
+
+$cert_params = @{
+    Type = 'Custom'
+    Subject = 'CN=Localhost Root Certification Authority'
+    FriendlyName = 'Localhost Root Certification Authority'
+    TextExtension = '2.5.29.19={text}CA=1'
+    HashAlgorithm = 'sha512'
+    KeyLength = 4096
+    KeyAlgorithm = 'RSA'
+    KeyUsage = 'CertSign','CRLSign'
+    KeyExportPolicy = 'Exportable'
+    NotAfter = (Get-Date).AddYears(100)
+    CertStoreLocation = 'Cert:\LocalMachine\My'
+}
+
+$root_cert = New-SelfSignedCertificate @cert_params
+
+Export-PfxCertificate -Cert $root_cert -FilePath ./localhost-root-ca.pfx -Password $pwd
+Export-Certificate -Cert $root_cert -FilePath ./localhost-root-ca.der
+
+
+$cert_params = @{
+    Type = 'Custom'
+    Subject = 'CN=Localhost UEFI Platform Key Certificate'
+    FriendlyName = 'Localhost UEFI Platform Key Certificate'
+    TextExtension = '2.5.29.19={text}CA=0'
+    Signer = $root_cert
+    HashAlgorithm = 'sha256'
+    KeyLength = 2048
+    KeyAlgorithm = 'RSA'
+    KeyUsage = 'DigitalSignature'
+    KeyExportPolicy = 'Exportable'
+    NotAfter = (Get-Date).AddYears(10)
+    CertStoreLocation = 'Cert:\LocalMachine\My'
+}
+
+$pk_cert = New-SelfSignedCertificate @cert_params
+
+Export-PfxCertificate -Cert $pk_cert -FilePath ./localhost-pk.pfx -Password $pwd
+Export-Certificate -Cert $pk_cert -FilePath ./localhost-pk.der
+
+
+$cert_params = @{
+    Type = 'CodeSigningCert'
+    Subject = 'CN=Localhost Kernel Mode Driver Certificate'
+    FriendlyName = 'Localhost Kernel Mode Driver Certificate'
+    TextExtension = '2.5.29.19={text}CA=0'
+    Signer = $root_cert
+    HashAlgorithm = 'sha256'
+    KeyLength = 2048
+    KeyAlgorithm = 'RSA'
+    KeyUsage = 'DigitalSignature'
+    KeyExportPolicy = 'Exportable'
+    NotAfter = (Get-Date).AddYears(10)
+    CertStoreLocation = 'Cert:\LocalMachine\My'
+}
+
+$km_cert = New-SelfSignedCertificate @cert_params
+
+Export-PfxCertificate -Cert $km_cert -FilePath ./localhost-km.pfx -Password $pwd
+Export-Certificate -Cert $km_cert -FilePath ./localhost-km.der
+```
+
+| File pair (`.pfx` / `.der`) | Purpose |
+|---|---|
+| `localhost-root-ca` | Root CA issuing the PK and KM certificates; its public certificate supplies the driver signing chain |
+| `localhost-pk` | Signs `SiPolicy.bin`; its public certificate is enrolled as the UEFI **PK** |
+| `localhost-km` | Signs the driver; its public certificate is authorized by the Code Integrity policy for **kernel-mode** code |
+
+The `.der` files contain public certificates; the `.pfx` files also contain **private keys**. Do not commit PFX files or publish them with build artifacts. Keep secure backups, particularly of the root and PK private keys: they control certificate issuance and future policy updates. Do not regenerate the certificates after enrolling the PK/deploying the policy unless you also plan the corresponding trust-policy migration.
+
+> The supplied script uses the example PFX password **`1`**, matching the signing examples below. This is not a secure password for real key storage. If you change it, update the policy-signing command and the PFX password used by `windows_kext\link-dev.ps1` as well.
+
+### 2. Create and sign `SiPolicy.p7b`
+
+Continue in the same elevated Windows PowerShell session and `windows_kext` directory. Generate a single-policy-format Code Integrity policy from the installed system's signing roots, authorize PK-signed policy updates, and add the KM certificate as a kernel-mode signer:
+
+```powershell
+New-CIPolicy -FilePath .\SiPolicy.xml -Level RootCertificate -ScanPath C:\Windows\System32\
+Set-RuleOption -FilePath .\SiPolicy.xml -Option 3 -Delete
+Set-RuleOption -FilePath .\SiPolicy.xml -Option 6 -Delete
+Add-SignerRule -FilePath .\SiPolicy.xml -CertificatePath .\localhost-pk.der -Update
+Add-SignerRule -FilePath .\SiPolicy.xml -CertificatePath .\localhost-km.der -Kernel
+ConvertFrom-CIPolicy -XmlFilePath .\SiPolicy.xml -BinaryFilePath .\SiPolicy.bin
+```
+
+- Removing option **3** (`Enabled:Audit Mode`) makes the policy **enforced**, not audit-only.
+- Removing option **6** (`Enabled:Unsigned System Integrity Policy`) requires signed policy updates.
+- `-Update` authorizes the PK certificate to sign policy updates; it does not authorize that certificate to sign drivers. `-Kernel` authorizes the KM certificate for kernel-mode code.
+- `RootCertificate` rules trust signing roots, not just individual scanned files. Conversely, a scan of `System32` may miss required third-party drivers stored elsewhere. Review scan warnings and policy coverage, including boot/storage drivers, before enforcing it. Do not deploy an incomplete policy.
+
+Sign the binary policy using the PK's private key. The full SDK path below assumes Windows SDK **10.0.28000.0**; if a different version is installed, use its actual `x64\signtool.exe` path:
+
+```powershell
+& 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.28000.0\x64\signtool.exe' sign /fd sha256 /p7co 1.3.6.1.4.1.311.79.1 /p7 . /f .\localhost-pk.pfx /p 1 /n "Localhost UEFI Platform Key Certificate" .\SiPolicy.bin
+```
+
+Only after SignTool succeeds and produces `SiPolicy.bin.p7`, rename that **signed output**, not the unsigned `.bin` file:
+
+```powershell
+Move-Item -LiteralPath .\SiPolicy.bin.p7 -Destination .\SiPolicy.p7b
+```
+
+Keep `SiPolicy.xml`, the certificates, and the signed policy for recovery and future updates. These steps describe initial deployment: do not overwrite an existing signed policy without a planned update signed by an authorized update signer.
+
+### 3. Copy the signed policy to the EFI System Partition
+
+Use a free drive letter (`X:` in this example) and mount the EFI System Partition of the Windows installation being configured:
+
+```powershell
+mountvol.exe X: /S
+```
+
+If `X:\EFI\Microsoft\Boot\SiPolicy.p7b` already exists, **stop and back it up** before planning a replacement. On a multi-boot/multi-disk machine, verify that this is the correct EFI partition. For a new deployment, copy the signed file:
+
+```powershell
+Copy-Item -LiteralPath .\SiPolicy.p7b -Destination 'X:\EFI\Microsoft\Boot\SiPolicy.p7b'
+```
+
+Remove the temporary drive-letter mount:
+
+```powershell
+mountvol.exe X: /D
+```
+
+Complete the offline registry and firmware changes below **before the next startup of the target Windows installation**.
+
+### 4. Enable `CustomKernelSigners` in the offline SYSTEM hive
+
+The required value in the target Windows installation is:
+
+```text
+Key:   HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\CI\Protected
+Value: CustomKernelSignerLockedEnabled
+Type:  REG_DWORD
+Data:  1
+```
+
+The value must already exist, as checked before policy deployment. Do not create it manually if it is missing; the required Windows updates must be installed before starting this procedure.
+
+This protected value cannot be changed from the running target system. Do not change ownership/permissions of the live `CI\Protected` key. Instead, load the target system's registry hive from another Windows installation or a trusted Windows PE/live USB:
+
+1. Fully shut down the target Windows installation; do not leave it hibernated or use a Fast Startup shutdown. Boot the other Windows/Windows PE environment. Verify beforehand that the recovery media can boot with the intended Secure Boot configuration.
+2. Locate the target Windows volume. Its drive letter may differ from normal; the example below uses **`D:\Windows`**. If BitLocker is enabled, unlock that volume with its recovery key. Back up `D:\Windows\System32\Config\SYSTEM` and its associated transaction logs before editing.
+3. Start **Registry Editor (`regedit.exe`) as Administrator** in the recovery environment. Select **`HKEY_LOCAL_MACHINE`**, then **File → Load Hive**. Open **`D:\Windows\System32\Config\SYSTEM`** and give it the temporary name **`OfflineSYSTEM`**. Do not edit the recovery environment's own SYSTEM hive.
+4. Open **`HKEY_LOCAL_MACHINE\OfflineSYSTEM\Select`** and inspect the DWORD values **`Current`** and **`Default`**. `Current` identifies the last active control set; `Default` selects the control set for the next normal startup. Usually both are `1`, meaning **`ControlSet001`**. For `Default = 2`, use `ControlSet002`, and so on. Do not assume `ControlSet001` without checking. An offline hive has no live `CurrentControlSet` alias.
+5. In the control set selected for the next normal startup, open **`Control\CI\Protected`**. For `Default = 1`, the complete offline path is:
+
+   ```text
+   HKEY_LOCAL_MACHINE\OfflineSYSTEM\ControlSet001\Control\CI\Protected
+   ```
+
+   Double-click the existing **`CustomKernelSignerLockedEnabled`** value, confirm it is **`REG_DWORD`**, and set **Value data** to **`1`**. Decimal or hexadecimal is equivalent for this value. If the value is missing, do not create it; return to the Windows-update/support check above.
+6. Select **`HKEY_LOCAL_MACHINE\OfflineSYSTEM`**, then **File → Unload Hive**, and confirm. This saves the changes and releases the hive. Close Registry Editor and shut down the recovery environment.
+
+### 5. Enroll the custom PK and verify Secure Boot
+
+Copy the public **`localhost-pk.der`** certificate to a firmware-readable USB drive (typically FAT32). Do not put the PFX/private keys on that drive. Enter the machine's UEFI/BIOS settings:
+
+1. Switch Secure Boot key management from **Standard Mode** to **Custom Mode**. The exact menu names and enrollment procedure depend on the firmware vendor.
+2. In **Platform Key (PK)** management, replace/enroll the PK using **`localhost-pk.der`**, the same certificate whose private key signed `SiPolicy.p7b`. This certificate belongs in **PK**, not in db or KEK. The KM driver certificate is authorized by the CI policy and does not need to be enrolled as the firmware PK.
+3. Preserve the existing **KEK, db, and dbx** entries needed to boot Windows and maintain revocations. Do not use a blanket **Clear all Secure Boot keys** operation. Ensure db trusts the certificate chain of the installed Windows boot manager.
+4. Leave **Secure Boot enabled and active**, save the firmware settings, and boot the configured Windows installation. **Custom Mode is not the same as disabling Secure Boot**; the machine must not remain in Setup Mode without an enrolled PK.
+
+**Optional Microsoft certificate updates.** If the appropriate current Microsoft certificates are not already installed, firmware may allow appending them to **db**. Microsoft's [Secure Boot certificate-expiration and CA-update guidance](https://support.microsoft.com/en-us/servicing/os/secure-boot/2025/06/windows-secure-boot-certificate-expiration-and-ca-updates) explains the transition. Public db certificates are available in Microsoft's [secureboot_objects repository](https://github.com/microsoft/secureboot_objects/tree/main/PreSignedObjects/DB/Certificates), including:
+
+- `windows uefi ca 2023.der` — Windows bootloaders;
+- `microsoft uefi ca 2023.der` — third-party bootloaders/EFI applications;
+- `microsoft option rom uefi ca 2023.der` — third-party option ROMs.
+
+Append only the certificates appropriate for the machine; do not replace the entire db or put these certificates in the PK slot. The linked directory contains **db certificates**, not the Microsoft KEK update. Follow the separate Microsoft/OEM guidance for KEK updates; adding db certificates alone does not complete the whole certificate-transition process.
+
+After Windows starts, verify from an elevated Windows PowerShell session:
+
+```powershell
+Confirm-SecureBootUEFI
+```
+
+The result must be **`True`**. Then verify the live registry value:
+
+```powershell
+Get-ItemPropertyValue -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\CI\Protected' -Name 'CustomKernelSignerLockedEnabled'
+```
+
+The result must be **`1`**. If either check fails, resolve the system/firmware configuration before trying to load the driver. These checks are prerequisites, not proof that a particular `.sys` file will be admitted by kernel Code Integrity.
+
+### 6. Build and sign the driver
 
 Build and sign the `.sys` file with:
 
-```bat
-C:\portmaster_v3\windows_kext\build-signed.bat
+```powershell
+& 'C:\portmaster_v3\windows_kext\build-signed.bat'
 ```
 
-The script runs `cargo build --release`, links the resulting static library against WDK/KMDF, and signs `windows_kext\portmaster-kext.sys`. It requires Visual Studio, WDK, and a configured signing certificate.
+The batch file changes to its own directory, builds `driver\target\x86_64-pc-windows-msvc\release\driver.lib` with `cargo build --release`, initializes the x64 Visual Studio environment, generates/compiles the version resource, and invokes `link-dev.ps1` to link and sign **`C:\portmaster_v3\windows_kext\portmaster-kext.sys`**.
 
-Run the driver unit tests with:
+The current signing command in `link-dev.ps1` uses:
+
+- **`localhost-km.pfx`**, subject **`Localhost Kernel Mode Driver Certificate`**, to sign the driver;
+- **`localhost-root-ca.der`** as the additional chain certificate;
+- PFX password **`1`**, SHA-256, and the DigiCert timestamp service.
+
+Keep those files in `windows_kext`, or deliberately update the signing command if using different locations/passwords. `localhost-pk.pfx` signs the policy in step 2, **not** the driver. The batch file builds/signs the driver; it does not enroll firmware keys, activate `CustomKernelSigners`, deploy the policy, or load the driver.
+
+A successful build/signature operation, or even a successful `signtool verify /pa` Authenticode check, is not proof that Windows kernel Code Integrity will admit the driver. Use the bounded monitor run below to check actual loading under the configured policy. Authenticode chain validation also depends on certificate-store trust; the custom kernel-admission setup is defined by the signed policy and enrolled PK, not just the ordinary certificate store.
+
+### Unit tests and C++ client
+
+Run the driver unit tests from Git Bash with:
 
 ```bash
 cd /c/portmaster_v3/windows_kext/driver && RUSTFLAGS="" cargo test --release
 ```
 
-Build the C++ client with:
+Build the C++ client/monitor from PowerShell with:
 
-```bat
-C:\portmaster_v3\kext_client\build.bat
+```powershell
+& 'C:\portmaster_v3\kext_client\build.bat'
 ```
+
+With the default Ninja build, the monitor is `C:\portmaster_v3\kext_client\build\kext_monitor.exe`. If CMake falls back to a multi-configuration generator, the executable may be under `build\Release` instead. Run it **as Administrator**, always with **`--duration`** for a bounded test and with the explicit driver path:
+
+```powershell
+& 'C:\portmaster_v3\kext_client\build\kext_monitor.exe' --duration 10 'C:\portmaster_v3\windows_kext\portmaster-kext.sys'
+```
+
+The monitor creates/starts the driver service itself, opens the device, and on normal completion closes the device, stops/unloads the driver, and removes its service. **Do not create the service manually.** The default verdict is `PermanentAccept`; avoid global blocking/redirect verdicts for an initial smoke test. Wait for the timed run to finish and clean up; do not forcibly kill the process or stop its service while the device handle is open. Do not run the monitor without a duration limit for unattended tests.
 
 ## License
 
