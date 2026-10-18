@@ -618,6 +618,24 @@ Open a new shell after installing tools so that `cargo` is on `PATH`. Initial bu
 
 If the installed edition/version differs, adjust the corresponding paths before building; `build-signed.bat` does not discover arbitrary Visual Studio or WDK installations. Use the matching SDK version in the full SignTool path in step 2 as well. The normal driver build uses the checked-in `windows_kext\c_helper\x64\c_helper.lib`; it does not rebuild the C helper. Go, Python, Perl, and LLVM/Clang are not required for this build path.
 
+### Download the source
+
+After installing [Git for Windows](https://gitforwindows.org/), open a new PowerShell window and clone the complete [windows_kext_mod repository](https://github.com/GerardoKermitToy/windows_kext_mod) into the directory used by the examples:
+
+```powershell
+git clone https://github.com/GerardoKermitToy/windows_kext_mod.git 'C:\portmaster_v3'
+```
+
+The destination must not already exist or must be empty. If `C:\portmaster_v3` already contains the desired checkout, skip cloning; do not delete or overwrite it. To use a different location, clone into a new directory and replace `C:\portmaster_v3` in all subsequent commands with that path.
+
+Change to the repository root:
+
+```powershell
+Set-Location 'C:\portmaster_v3'
+```
+
+Keep the complete repository layout: `windows_kext` contains the driver and signing scripts, while `kext_client` contains the C++ monitor and uses the sibling `winrpc` sources. Continue with certificate creation below before building and signing the driver.
+
 ### 1. Create the local certificates
 
 Change to `windows_kext`; all relative output paths in steps 1 and 2 refer to this directory:
