@@ -1,5 +1,6 @@
 use alloc::string::{String, ToString};
 use core::mem::MaybeUninit;
+use likely_stable::{likely, unlikely};
 use smoltcp::wire::{IPV4_HEADER_LEN, IPV6_HEADER_LEN};
 use wdk::filter_engine::callout_data::CalloutData;
 use wdk::filter_engine::layer;
@@ -106,7 +107,7 @@ fn retreat_to_ip_header(
     ipv6: bool,
     wfp_ip_header_size: Option<u32>,
 ) -> Result<(), String> {
-    let base = if ipv6 {
+    let base = if unlikely(ipv6) {
         IPV6_HEADER_LEN
     } else {
         IPV4_HEADER_LEN
@@ -269,7 +270,7 @@ fn ip_packet_layer(
             smoltcp::wire::IpProtocol::Tcp | smoltcp::wire::IpProtocol::Udp
         );
         // Read connection state once for policy or redirect rewriting.
-        let connection_info = if transport_protocol {
+        let connection_info = if likely(transport_protocol) {
             get_connection_info(
                 &device.connection_cache,
                 &key,
@@ -283,18 +284,19 @@ fn ip_packet_layer(
 
         // Resets never need a userspace verdict, but cached redirects must
         // rewrite their tuple below, even after the sending endpoint closes.
-        if key.protocol == smoltcp::wire::IpProtocol::Tcp
-            && inspection.is_tcp_reset()
-            && connection_info
-                .as_ref()
-                .and_then(|info| info.redirect_info.as_ref())
-                .is_none()
-        {
+        if unlikely(
+            key.protocol == smoltcp::wire::IpProtocol::Tcp
+                && inspection.is_tcp_reset()
+                && connection_info
+                    .as_ref()
+                    .and_then(|info| info.redirect_info.as_ref())
+                    .is_none(),
+        ) {
             data.action_permit();
             return;
         }
 
-        let icmp_metadata = if !transport_protocol {
+        let icmp_metadata = if unlikely(!transport_protocol) {
             inspection.icmp_metadata(&key)
         } else {
             Default::default()
@@ -334,7 +336,7 @@ fn ip_packet_layer(
         //
         // Inbound errors use the quoted TCP/UDP tuple or echo identity; echo
         // replies use their identifier and sequence number.
-        if !transport_protocol {
+        if unlikely(!transport_protocol) {
             match direction {
                 Direction::Outbound if !icmp_metadata.is_local_error => {
                     if let Some(echo) = icmp_metadata.echo {
@@ -409,7 +411,7 @@ fn ip_packet_layer(
                             };
                             // The error can arrive after the sending endpoint closed.
                             let cache = &device.connection_cache;
-                            (process_id, thread_id) = if ipv6 {
+                            (process_id, thread_id) = if unlikely(ipv6) {
                                 let identity = |conn: &ConnectionV6| {
                                     Some((conn.get_process_id(), conn.thread_id))
                                 };
@@ -447,7 +449,7 @@ fn ip_packet_layer(
             }
         }
 
-        if transport_protocol {
+        if likely(transport_protocol) {
             if let Some(mut conn_info) = connection_info {
                 // A new inbound connection must reach ALE_AUTH_RECV_ACCEPT so it
                 // can be attributed and authorized there. Keep permitting it while
@@ -626,7 +628,7 @@ fn ip_packet_layer(
         };
 
         // Preserve outbound reinjection; only userspace sees a local error as inbound.
-        if icmp_metadata.is_local_error {
+        if unlikely(icmp_metadata.is_local_error) {
             effective_direction = Direction::Inbound;
         }
         if let Some(pending) = device.publish_pending_packet(
@@ -740,7 +742,7 @@ fn get_connection_info(
     // mistaken for retained history belonging to the application whose tuple it
     // copied. Inbound lookups likewise use live state only because the tuple can
     // identify a new flow awaiting ALE authorization.
-    if ipv6 {
+    if unlikely(ipv6) {
         let process = |conn: &ConnectionV6| -> Option<ConnectionInfo> {
             // The callback runs behind the cache's spin lock. Just copy and return.
             Some(ConnectionInfo::from_connection(conn))

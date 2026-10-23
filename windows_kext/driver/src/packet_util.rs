@@ -1,5 +1,6 @@
 use alloc::string::{String, ToString};
 use core::mem::MaybeUninit;
+use likely_stable::unlikely;
 use smoltcp::wire::{
     IpAddress, IpProtocol, Ipv4Address, Ipv4Packet, Ipv6Address, Ipv6Packet, TcpPacket, UdpPacket,
 };
@@ -225,7 +226,7 @@ fn redirect_inbound_packet(
 }
 
 pub fn recalc_header_checksums(packet: &mut [u8], ipv6: bool) -> Result<(), String> {
-    if ipv6 {
+    if unlikely(ipv6) {
         // TCP/UDP start after the complete extension-header chain, and the
         // pseudo-header length is the upper-layer length rather than the IPv6
         // payload length (which includes extensions).

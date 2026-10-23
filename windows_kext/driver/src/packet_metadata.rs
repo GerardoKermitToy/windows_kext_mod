@@ -1,5 +1,6 @@
 use core::fmt;
 
+use likely_stable::{likely, unlikely};
 use smoltcp::wire::{
     IpAddress, IpProtocol, Ipv4Address, Ipv4Packet, Ipv6Address, Ipv6Packet, IPV4_HEADER_LEN,
     IPV6_HEADER_LEN,
@@ -97,6 +98,7 @@ impl HeaderInspection {
 /// Packet-callout fields are resolved on demand. The reader is borrowed in the
 /// callout, and the caller owns the key: neither packet storage nor a second key
 /// is copied into this inspector. TCP flags and ICMP quotes remain lazy.
+/// Branch hints favor IPv4 TCP/UDP traffic without excluding other packets.
 pub(crate) struct PacketInspector<R> {
     reader: R,
     ipv6: bool,
@@ -169,7 +171,7 @@ impl<R: PacketData> PacketInspector<R> {
     }
 
     fn read_header(&mut self) -> HeaderInspection {
-        let base_length = if self.ipv6 {
+        let base_length = if unlikely(self.ipv6) {
             IPV6_HEADER_LEN
         } else {
             IPV4_HEADER_LEN
@@ -177,7 +179,7 @@ impl<R: PacketData> PacketInspector<R> {
         // Four bytes of lookahead keep the ordinary IP+ports path to one NDIS
         // call rather than doubling its cost just to learn the protocol/IHL.
         let initial_length = core::cmp::min(self.reader.len(), base_length + 4);
-        let header = if initial_length >= base_length {
+        let header = if likely(initial_length >= base_length) {
             self.reader
                 .prefix(initial_length)
                 .map(|packet| Self::parse_base_header(packet, self.ipv6, self.permit_fragments))
@@ -196,16 +198,17 @@ impl<R: PacketData> PacketInspector<R> {
     }
 
     fn resolve_ipv6_header(&mut self, mut header: HeaderInspection) -> HeaderInspection {
-        if self.ipv6
-            && header.error.is_none()
-            && matches!(
-                header.protocol,
-                IpProtocol::HopByHop
-                    | IpProtocol::Ipv6Route
-                    | IpProtocol::Ipv6Frag
-                    | IpProtocol::Ipv6Opts
-            )
-        {
+        if unlikely(
+            self.ipv6
+                && header.error.is_none()
+                && matches!(
+                    header.protocol,
+                    IpProtocol::HopByHop
+                        | IpProtocol::Ipv6Route
+                        | IpProtocol::Ipv6Frag
+                        | IpProtocol::Ipv6Opts
+                ),
+        ) {
             let headers = walk_ipv6_headers_reader(&mut self.reader, self.permit_fragments, false);
             header.protocol = headers.protocol;
             header.transport_offset = headers.transport_offset as u16;
@@ -223,7 +226,7 @@ impl<R: PacketData> PacketInspector<R> {
 
     #[inline(always)]
     fn parse_base_header(packet: &[u8], ipv6: bool, permit_fragments: bool) -> HeaderInspection {
-        if ipv6 {
+        if unlikely(ipv6) {
             HeaderInspection {
                 protocol: IpProtocol::from(packet[6]),
                 transport_offset: IPV6_HEADER_LEN as u16,
@@ -240,7 +243,7 @@ impl<R: PacketData> PacketInspector<R> {
                 transport_offset: core::cmp::max(raw_offset, IPV4_HEADER_LEN) as u16,
                 is_fragment,
                 valid_tcp_flags: (IPV4_HEADER_LEN..=IPV4_MAX_HEADER_LEN).contains(&raw_offset),
-                error: (permit_fragments && is_fragment)
+                error: unlikely(permit_fragments && is_fragment)
                     .then_some(PacketMetadataError::FragmentRequiresReassembly),
             }
         }
@@ -249,13 +252,13 @@ impl<R: PacketData> PacketInspector<R> {
     #[inline]
     fn read_key(&mut self) -> Result<Key, PacketMetadataError> {
         if self.header.is_none() {
-            let base_length = if self.ipv6 {
+            let base_length = if unlikely(self.ipv6) {
                 IPV6_HEADER_LEN
             } else {
                 IPV4_HEADER_LEN
             };
             let initial_length = core::cmp::min(self.reader.len(), base_length + 4);
-            let packet = if initial_length >= base_length {
+            let packet = if likely(initial_length >= base_length) {
                 self.reader.prefix(initial_length)
             } else {
                 None
@@ -274,19 +277,20 @@ impl<R: PacketData> PacketInspector<R> {
                             | IpProtocol::Ipv6Frag
                             | IpProtocol::Ipv6Opts
                     );
-                let key_end = if matches!(header.protocol, IpProtocol::Tcp | IpProtocol::Udp) {
-                    usize::from(header.transport_offset) + 4
-                } else if self.ipv6 {
-                    IPV6_HEADER_LEN
-                } else {
-                    IPV4_HEADER_LEN + 4
-                };
-                if !extension && packet.len() >= key_end {
+                let key_end =
+                    if likely(matches!(header.protocol, IpProtocol::Tcp | IpProtocol::Udp)) {
+                        usize::from(header.transport_offset) + 4
+                    } else if unlikely(self.ipv6) {
+                        IPV6_HEADER_LEN
+                    } else {
+                        IPV4_HEADER_LEN + 4
+                    };
+                if likely(!extension && packet.len() >= key_end) {
                     // The common path parses the key from the first read itself,
                     // not through another cached-prefix lookup or header call.
                     return Ok(Self::parse_key(packet, self.ipv6, self.direction, header));
                 }
-                if extension {
+                if unlikely(extension) {
                     let header = self.resolve_ipv6_header(header);
                     self.header = Some(header);
                 }
@@ -307,7 +311,7 @@ impl<R: PacketData> PacketInspector<R> {
             return Err(error);
         }
         // Preserve the IPv4 key contract even for protocols without ports.
-        let length = if self.ipv6 {
+        let length = if unlikely(self.ipv6) {
             IPV6_HEADER_LEN
         } else {
             IPV4_HEADER_LEN + 4
@@ -318,10 +322,10 @@ impl<R: PacketData> PacketInspector<R> {
             .ok_or(PacketMetadataError::UnreadablePacket)?;
         let (source, destination) = Self::key_addresses(packet, self.ipv6);
         let offset = usize::from(header.transport_offset);
-        let ports = if matches!(header.protocol, IpProtocol::Tcp | IpProtocol::Udp) {
+        let ports = if likely(matches!(header.protocol, IpProtocol::Tcp | IpProtocol::Udp)) {
             if let Some(transport) = packet.get(offset..offset + 4) {
                 get_ports(transport, header.protocol)
-            } else if offset + 4 > self.reader.len() {
+            } else if unlikely(offset + 4 > self.reader.len()) {
                 (0, 0)
             } else {
                 // Present but unreadable ports must not produce a cache-miss key.
@@ -364,7 +368,7 @@ impl<R: PacketData> PacketInspector<R> {
     fn key_addresses(packet: &[u8], ipv6: bool) -> (IpAddress, IpAddress) {
         // Both callers already require a complete base header. Read its known
         // address ranges without separate IP packet accessor call frames.
-        if ipv6 {
+        if unlikely(ipv6) {
             (
                 IpAddress::Ipv6(Ipv6Address::from_bytes(&packet[8..24])),
                 IpAddress::Ipv6(Ipv6Address::from_bytes(&packet[24..40])),
@@ -381,7 +385,7 @@ impl<R: PacketData> PacketInspector<R> {
         let header = self.header();
         if header.error.is_some()
             || header.protocol
-                != if self.ipv6 {
+                != if unlikely(self.ipv6) {
                     IpProtocol::Icmpv6
                 } else {
                     IpProtocol::Icmp
@@ -396,7 +400,7 @@ impl<R: PacketData> PacketInspector<R> {
         let echo = get_icmp_echo(transport, self.ipv6);
         // Version and declared length matter only for ICMP error attribution,
         // not for the common TCP/UDP key or fragment path.
-        let (packet_end, valid_error) = if self.ipv6 {
+        let (packet_end, valid_error) = if unlikely(self.ipv6) {
             let ip_packet = Ipv6Packet::new_unchecked(packet);
             (
                 ip_packet.total_len(),
@@ -440,13 +444,13 @@ impl<R: PacketData> PacketInspector<R> {
             start: quote_offset,
             end: outer_end,
         };
-        let base_length = if self.ipv6 {
+        let base_length = if unlikely(self.ipv6) {
             IPV6_HEADER_LEN
         } else {
             IPV4_HEADER_LEN
         };
         let quoted = quote.prefix(base_length)?;
-        let (protocol, offset) = if self.ipv6 {
+        let (protocol, offset) = if unlikely(self.ipv6) {
             let ip_packet = Ipv6Packet::new_unchecked(quoted);
             if ip_packet.version() != 6
                 || IpAddress::Ipv6(ip_packet.src_addr()) != key.local_address
@@ -485,7 +489,7 @@ impl<R: PacketData> PacketInspector<R> {
         get_icmp_error(
             protocol,
             key.local_address,
-            if self.ipv6 {
+            if unlikely(self.ipv6) {
                 IpAddress::Ipv6(Ipv6Packet::new_unchecked(quoted).dst_addr())
             } else {
                 IpAddress::Ipv4(Ipv4Packet::new_unchecked(quoted).dst_addr())
@@ -587,7 +591,7 @@ fn build_key(
 }
 
 fn get_ports(transport: &[u8], protocol: IpProtocol) -> (u16, u16) {
-    if !matches!(protocol, IpProtocol::Tcp | IpProtocol::Udp) || transport.len() < 4 {
+    if unlikely(!matches!(protocol, IpProtocol::Tcp | IpProtocol::Udp) || transport.len() < 4) {
         return (0, 0);
     }
 

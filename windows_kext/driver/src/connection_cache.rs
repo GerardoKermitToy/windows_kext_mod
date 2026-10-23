@@ -4,6 +4,7 @@ use crate::{
 };
 use alloc::{string::String, vec::Vec};
 
+use likely_stable::unlikely;
 use smoltcp::wire::{IpAddress, IpProtocol};
 #[cfg(not(test))]
 use wdk::rw_spin_lock::RwSpinLock;
@@ -139,7 +140,7 @@ impl ConnectionCache {
         key: &Key,
         process_id: u64,
     ) -> Result<ConnectionRegistration, String> {
-        let result = if key.is_ipv6() {
+        let result = if unlikely(key.is_ipv6()) {
             let mut connection =
                 ConnectionV6::from_untracked_key(key, process_id, Direction::Inbound)?;
             connection.extra.idle_expiration = true;
@@ -194,7 +195,7 @@ impl ConnectionCache {
         native_lifecycle: bool,
         thread_id: u64,
     ) -> Result<ConnectionRegistration, String> {
-        if key.is_ipv6() {
+        if unlikely(key.is_ipv6()) {
             let mut connection = if native_lifecycle {
                 ConnectionV6::from_key(key, process_id, direction)?
             } else {
@@ -279,11 +280,11 @@ impl ConnectionCache {
         instance_id: u64,
         use_instance: impl FnOnce(u64) -> Option<T>,
     ) -> Option<T> {
-        if instance_id == 0 {
+        if unlikely(instance_id == 0) {
             return None;
         }
 
-        if key.is_ipv6() {
+        if unlikely(key.is_ipv6()) {
             let connections = self.connections_v6.read_lock();
             if connections.has_live_instance(key, instance_id) {
                 return use_instance(instance_id);
@@ -312,11 +313,11 @@ impl ConnectionCache {
         value: T,
         use_instance: impl FnOnce(u64, T, u64) -> R,
     ) -> Result<R, T> {
-        if instance_id == 0 {
+        if unlikely(instance_id == 0) {
             return Err(value);
         }
 
-        if key.is_ipv6() {
+        if unlikely(key.is_ipv6()) {
             let connections = self.connections_v6.read_lock();
             if let Some(conn) = connections.get_live_instance_matching(key, instance_id) {
                 return Ok(use_instance(instance_id, value, conn.thread_id));
@@ -340,7 +341,7 @@ impl ConnectionCache {
             return false;
         }
 
-        if key.is_ipv6() {
+        if unlikely(key.is_ipv6()) {
             let mut connections = self.connections_v6.write_lock();
             if let Some(conn) = connections.get_mut_instance(key, instance_id) {
                 return merge_process_id(&mut conn.process_id, &mut conn.thread_id, process_id, 0);
@@ -356,7 +357,7 @@ impl ConnectionCache {
 
     /// Returns the instance ID of the current live entry.
     pub fn get_connection_instance_id(&self, key: &Key) -> Option<u64> {
-        if key.is_ipv6() {
+        if unlikely(key.is_ipv6()) {
             self.read_connection_v6(key, |connection| Some(connection.get_instance_id()))
         } else {
             self.read_connection_v4(key, |connection| Some(connection.get_instance_id()))
@@ -366,11 +367,11 @@ impl ConnectionCache {
     /// Returns whether the exact live connection belongs to the outbound side.
     /// A missing generation is treated as no direction by returning `None`.
     pub fn is_outbound_connection_instance(&self, key: &Key, instance_id: u64) -> Option<bool> {
-        if instance_id == 0 {
+        if unlikely(instance_id == 0) {
             return None;
         }
 
-        let current = if key.is_ipv6() {
+        let current = if unlikely(key.is_ipv6()) {
             self.read_connection_v6(key, connection_instance_is_outbound_v6)
         } else {
             self.read_connection_v4(key, connection_instance_is_outbound_v4)
@@ -380,7 +381,7 @@ impl ConnectionCache {
 
     /// Returns an exact live entry that still lacks native lifecycle identity.
     pub fn get_untracked_connection_instance_id(&self, key: &Key) -> Option<u64> {
-        if key.is_ipv6() {
+        if unlikely(key.is_ipv6()) {
             let connections = self.connections_v6.read_lock();
             connections.untracked_instance_id(key)
         } else {
@@ -393,7 +394,7 @@ impl ConnectionCache {
     /// endpoint or flow. An exact instance check prevents a delayed association from
     /// changing a replacement connection that reused the tuple.
     pub fn mark_connection_instance_tracked(&self, key: &Key, instance_id: u64) -> bool {
-        if key.is_ipv6() {
+        if unlikely(key.is_ipv6()) {
             let mut connections = self.connections_v6.write_lock();
             connections.mark_native_lifecycle_instance(key, instance_id)
         } else {
@@ -403,7 +404,7 @@ impl ConnectionCache {
     }
 
     pub fn update_connection(&self, key: Key, verdict: Verdict) -> Option<RedirectInfo> {
-        if key.is_ipv6() {
+        if unlikely(key.is_ipv6()) {
             let mut connections = self.connections_v6.write_lock();
             if let Some(conn) = connections.get_mut(&key) {
                 conn.verdict = verdict;
@@ -430,7 +431,7 @@ impl ConnectionCache {
         instance_id: u64,
         verdict: Verdict,
     ) -> Option<ConnectionUpdate> {
-        if key.is_ipv6() {
+        if unlikely(key.is_ipv6()) {
             let mut connections = self.connections_v6.write_lock();
             if let Some(conn) = connections.get_mut_instance(&key, instance_id) {
                 conn.verdict = verdict;
@@ -457,7 +458,7 @@ impl ConnectionCache {
             return None;
         }
 
-        if key.is_ipv6() {
+        if unlikely(key.is_ipv6()) {
             self.connections_v6.read_lock().find_active_udp_pid(
                 key.local_address,
                 key.local_port,

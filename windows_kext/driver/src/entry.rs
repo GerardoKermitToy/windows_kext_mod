@@ -6,6 +6,7 @@ use core::{
     marker::PhantomData,
     sync::atomic::{AtomicBool, AtomicPtr, Ordering},
 };
+use likely_stable::{likely, unlikely};
 use num_traits::FromPrimitive;
 use wdk::irp_helpers::{
     CleanupRequest, CloseRequest, CreateRequest, DeviceControlRequest, ReadRequest, WriteRequest,
@@ -143,7 +144,7 @@ impl DispatchGate {
         let admitted = !self.unloading.load(Ordering::Acquire)
             && !(is_read && self.reads_closed.load(Ordering::Acquire));
 
-        if admitted {
+        if likely(admitted) {
             self.active.fetch_add(1, Ordering::AcqRel);
             if is_read {
                 self.reads.fetch_add(1, Ordering::AcqRel);
@@ -161,11 +162,11 @@ impl DispatchGate {
     }
 
     fn acquire_lifetime(&self) -> Option<DispatchLifetimeGuard<'_>> {
-        if !self.lifetime_initialized.load(Ordering::Acquire) {
+        if unlikely(!self.lifetime_initialized.load(Ordering::Acquire)) {
             return None;
         }
         let acquired = unsafe { ExAcquireRundownProtection(self.dispatch_lifetime.get()) } != 0;
-        acquired.then_some(DispatchLifetimeGuard {
+        likely(acquired).then_some(DispatchLifetimeGuard {
             rundown: self.dispatch_lifetime.get(),
             _gate: PhantomData,
         })

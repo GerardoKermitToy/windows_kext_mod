@@ -8,6 +8,7 @@ use alloc::{
     },
     vec::Vec,
 };
+use likely_stable::unlikely;
 use smoltcp::wire::{IpAddress, IpProtocol};
 
 #[derive(Clone, Copy, PartialEq, PartialOrd, Eq, Ord)]
@@ -562,7 +563,7 @@ impl<T: Connection + Clone> ConnectionMap<T> {
     /// Unlike `read`, this check does not refresh activity and never falls back to
     /// redirected or ended state. It is used to validate endpoint-owned identity.
     pub fn has_live_instance(&self, key: &Key, instance_id: u64) -> bool {
-        if instance_id == 0 {
+        if unlikely(instance_id == 0) {
             return false;
         }
 
@@ -583,7 +584,7 @@ impl<T: Connection + Clone> ConnectionMap<T> {
     /// instance ID still identifies exactly one cached generation. The instance
     /// check makes the otherwise ambiguous redirect scan safe for this operation.
     pub fn get_live_instance_matching(&self, key: &Key, instance_id: u64) -> Option<&T> {
-        if instance_id == 0 {
+        if unlikely(instance_id == 0) {
             return None;
         }
         if let Some(conn) = self.bucket(key).and_then(|bucket| {
@@ -617,7 +618,7 @@ impl<T: Connection + Clone> ConnectionMap<T> {
     /// a replacement connection that reused the same tuple. Redirected packet keys
     /// are supported for the packet-layer path in the same way as `read_matching`.
     pub fn get_mut_instance(&mut self, key: &Key, instance_id: u64) -> Option<&mut T> {
-        if instance_id == 0 {
+        if unlikely(instance_id == 0) {
             return None;
         }
 
@@ -803,7 +804,7 @@ impl<T: Connection + Clone> ConnectionMap<T> {
 
     /// Binds native endpoint/flow lifetime to one exact live fallback instance.
     pub fn mark_native_lifecycle_instance(&mut self, key: &Key, instance_id: u64) -> bool {
-        if instance_id == 0 {
+        if unlikely(instance_id == 0) {
             return false;
         }
 
@@ -826,7 +827,7 @@ impl<T: Connection + Clone> ConnectionMap<T> {
     /// instance that existed when its context was associated prevents an old flow
     /// from ending a newer connection with the same five-tuple.
     pub fn end_instance(&mut self, key: Key, instance_id: u64) -> Option<T> {
-        if instance_id == 0 {
+        if unlikely(instance_id == 0) {
             return None;
         }
 
@@ -850,7 +851,7 @@ impl<T: Connection + Clone> ConnectionMap<T> {
         let timestamp = get_monotonic_timestamp_ms();
         let mut ended = Vec::with_capacity(instances.len());
         for &(key, instance_id) in instances {
-            if instance_id == 0 {
+            if unlikely(instance_id == 0) {
                 continue;
             }
             if let Some(conn) = self.bucket_mut(&key).and_then(|bucket| {

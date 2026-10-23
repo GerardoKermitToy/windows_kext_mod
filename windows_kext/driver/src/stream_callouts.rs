@@ -1,3 +1,4 @@
+use likely_stable::unlikely;
 use smoltcp::wire::{IpProtocol, Ipv4Address, Ipv6Address};
 use wdk::filter_engine::{callout_data::CalloutData, layer, net_buffer::NetBufferListIter};
 
@@ -139,7 +140,7 @@ pub fn stream_layer_udp_v4(data: CalloutData) {
     // especially since ICMP reports type/code in the port fields, which would
     // corrupt the counters of an unrelated UDP connection.
     let protocol = IpProtocol::from(data.get_value_u8(Fields::IpProtocol as usize));
-    if protocol != IpProtocol::Udp {
+    if unlikely(protocol != IpProtocol::Udp) {
         return;
     }
 
@@ -192,7 +193,7 @@ pub fn stream_layer_udp_v6(data: CalloutData) {
     };
 
     let protocol = IpProtocol::from(data.get_value_u8(Fields::IpProtocol as usize));
-    if protocol != IpProtocol::Udp {
+    if unlikely(protocol != IpProtocol::Udp) {
         return;
     }
 

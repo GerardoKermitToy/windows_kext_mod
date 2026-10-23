@@ -9,6 +9,7 @@ use crate::device::{Device, Packet};
 use crate::udp_flow_cache::UdpFlowRegistration;
 use alloc::{boxed::Box, string::String, vec::Vec};
 
+use likely_stable::{likely, unlikely};
 use smoltcp::wire::{
     IpAddress, IpProtocol, Ipv4Address, Ipv6Address, IPV4_HEADER_LEN, IPV6_HEADER_LEN,
 };
@@ -68,12 +69,9 @@ impl AleLayerData {
     fn as_key(&self) -> Key {
         let mut local_port = 0;
         let mut remote_port = 0;
-        match self.protocol {
-            IpProtocol::Tcp | IpProtocol::Udp => {
-                local_port = self.local_port;
-                remote_port = self.remote_port;
-            }
-            _ => {}
+        if likely(matches!(self.protocol, IpProtocol::Tcp | IpProtocol::Udp)) {
+            local_port = self.local_port;
+            remote_port = self.remote_port;
         }
 
         Key {
@@ -364,7 +362,10 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
 
     // Only TCP and UDP are associated with an ALE connection. Avoid the two WFP
     // injection-state queries for protocols that are always handled at packet layer.
-    if !matches!(ale_data.protocol, IpProtocol::Tcp | IpProtocol::Udp) {
+    if unlikely(!matches!(
+        ale_data.protocol,
+        IpProtocol::Tcp | IpProtocol::Udp
+    )) {
         // Outbound: will be handled by packet layer next.
         // Inbound: was already handled by packet layer.
         data.action_permit();
@@ -545,7 +546,7 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
     }
 
     // Check if connection is already in cache.
-    let cached = if ale_data.is_ipv6 {
+    let cached = if unlikely(ale_data.is_ipv6) {
         device
             .connection_cache
             .read_connection_v6(&key, |conn| -> Option<(Verdict, u64, bool)> {
@@ -570,7 +571,7 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
             return None;
         }
 
-        if ale_data.is_ipv6 {
+        if unlikely(ale_data.is_ipv6) {
             device.connection_cache.read_ended_connection_v6(
                 &key,
                 |conn| -> Option<(Verdict, u64, bool)> {
@@ -617,7 +618,7 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
         crate::dbg!("processing existing connection: {} {}", key, verdict);
         match verdict {
             // No verdict yet
-            Verdict::Undecided if !live => {
+            Verdict::Undecided if unlikely(!live) => {
                 // Endpoint closure cannot leave a queued request behind: it either
                 // retired the request or waited for its verdict before ending the
                 // generation. A retained Undecided value is therefore teardown
@@ -707,7 +708,7 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
         // back to a tuple lookup and reintroduce stale-generation teardown. An
         // already cached connection was handled above and can safely reuse the
         // association saved by its initial authorization.
-        if matches!(ale_data.protocol, IpProtocol::Tcp) && endpoint_handle.is_none() {
+        if unlikely(matches!(ale_data.protocol, IpProtocol::Tcp) && endpoint_handle.is_none()) {
             crate::err!(
                 "cannot register TCP authorization without an endpoint handle: {}",
                 key
@@ -891,7 +892,7 @@ fn create_packet_list(
         // Both AUTH_RECV_ACCEPT and inbound UDP reauthorization at AUTH_CONNECT
         // indicate the payload here. Retreat over both headers so the clone passed
         // to FwpsInjectTransportReceiveAsync starts at the IP header.
-        let base = if ale_data.is_ipv6 {
+        let base = if unlikely(ale_data.is_ipv6) {
             IPV6_HEADER_LEN
         } else {
             IPV4_HEADER_LEN
@@ -899,7 +900,7 @@ fn create_packet_list(
         let ip_header_size = callout_data
             .get_ip_header_size()
             .ok_or_else(|| String::from("missing ALE IP header size metadata"))?;
-        if ip_header_size < base {
+        if unlikely(ip_header_size < base) {
             return Err(alloc::format!(
                 "invalid ALE IP header size: {}",
                 ip_header_size
@@ -914,7 +915,7 @@ fn create_packet_list(
             IpProtocol::Udp => 8,
             _ => 0,
         };
-        if transport_header_size < minimum_transport_header_size {
+        if unlikely(transport_header_size < minimum_transport_header_size) {
             return Err(alloc::format!(
                 "invalid ALE transport header size: {}",
                 transport_header_size
@@ -1203,7 +1204,7 @@ pub(crate) unsafe extern "system" fn udp_flow_delete(
     }
 
     let key = context.key;
-    if key.is_ipv6() {
+    if unlikely(key.is_ipv6()) {
         if let Some(conn) = device
             .connection_cache
             .end_connection_instance_v6(key, context.connection_instance_id)
@@ -1228,7 +1229,7 @@ pub(crate) fn end_tcp_connection(
     process_id: u64,
 ) {
     let key = endpoint.key;
-    if key.is_ipv6() {
+    if unlikely(key.is_ipv6()) {
         if let Some(conn) = device
             .connection_cache
             .end_connection_instance_v6(key, endpoint.instance_id)
@@ -1292,7 +1293,7 @@ fn end_udp_endpoint(device: &Device, endpoint_handle: u64, process_id: u64) -> b
     // Keep the common one-peer socket closure allocation-free. The batch path
     // below is for sockets that accumulated several remote tuples.
     if let [peer] = endpoint.as_slice() {
-        if peer.key.is_ipv6() {
+        if unlikely(peer.key.is_ipv6()) {
             if let Some(conn) = device
                 .connection_cache
                 .end_connection_instance_v6(peer.key, peer.instance_id)
@@ -1313,7 +1314,7 @@ fn end_udp_endpoint(device: &Device, endpoint_handle: u64, process_id: u64) -> b
     let mut peers_v4 = Vec::new();
     let mut peers_v6 = Vec::new();
     for peer in endpoint {
-        if peer.key.is_ipv6() {
+        if unlikely(peer.key.is_ipv6()) {
             peers_v6.push((peer.key, peer.instance_id));
         } else {
             peers_v4.push((peer.key, peer.instance_id));
@@ -1705,7 +1706,7 @@ pub fn ale_flow_established_monitor(data: CalloutData) {
             let Some(protocol) = get_protocol_if_present(&data, Fields::IpProtocol as usize) else {
                 return;
             };
-            if !matches!(protocol, IpProtocol::Tcp | IpProtocol::Udp) {
+            if unlikely(!matches!(protocol, IpProtocol::Tcp | IpProtocol::Udp)) {
                 return;
             }
 
@@ -1736,7 +1737,7 @@ pub fn ale_flow_established_monitor(data: CalloutData) {
             let Some(protocol) = get_protocol_if_present(&data, Fields::IpProtocol as usize) else {
                 return;
             };
-            if !matches!(protocol, IpProtocol::Tcp | IpProtocol::Udp) {
+            if unlikely(!matches!(protocol, IpProtocol::Tcp | IpProtocol::Udp)) {
                 return;
             }
 
