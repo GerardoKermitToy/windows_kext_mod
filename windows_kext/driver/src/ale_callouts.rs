@@ -281,7 +281,7 @@ fn track_tcp_endpoint_instance(
                 initial_authorization_at_ms,
             ))
         });
-    if matches!(associated, Some(false)) {
+    if unlikely(matches!(associated, Some(false))) {
         crate::err!(
             "TCP endpoint handle {} is already associated with another connection: {}",
             endpoint_handle,
@@ -830,7 +830,9 @@ fn save_packet(
         callout_data.action_permit();
         return Ok(None);
     }
-    if pend && matches!(ale_data.packet_direction, Direction::Inbound) && packet_list.is_none() {
+    if unlikely(
+        pend && matches!(ale_data.packet_direction, Direction::Inbound) && packet_list.is_none(),
+    ) {
         return Err("ALE receive/accept indication has no packet data".into());
     }
     let captured = packet_list.is_some();
@@ -1074,7 +1076,7 @@ fn associate_udp_flow_context(
         endpoint_handle,
     })) as u64;
 
-    if !device.udp_flow_cache.register(flow_context, registration) {
+    if unlikely(!device.udp_flow_cache.register(flow_context, registration)) {
         unsafe {
             drop(Box::from_raw(flow_context as *mut UdpFlowContext));
         }
@@ -1857,7 +1859,7 @@ pub fn ale_flow_established_monitor(data: CalloutData) {
             (endpoint, rebind_failed)
         };
 
-        if rebind_failed {
+        if unlikely(rebind_failed) {
             crate::err!("failed to rebind established TCP endpoint: {}", key);
             return;
         }

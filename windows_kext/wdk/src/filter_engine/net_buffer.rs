@@ -1,4 +1,5 @@
 use core::mem::MaybeUninit;
+use likely_stable::unlikely;
 
 use alloc::{
     string::{String, ToString},
@@ -146,7 +147,7 @@ impl<'storage, const N: usize> PacketPrefix<'storage, N> {
         length: usize,
         mut read: impl FnMut(usize, *mut u8) -> (*mut u8, usize),
     ) -> Result<&[u8], ()> {
-        if length > N || length > data_length {
+        if unlikely(length > N || length > data_length) {
             return Err(());
         }
         if length == 0 {
@@ -155,12 +156,12 @@ impl<'storage, const N: usize> PacketPrefix<'storage, N> {
         if length > self.length {
             let storage = self.storage.as_mut_ptr().cast::<u8>();
             let (mut ptr, mut native_span) = read(length, storage);
-            if ptr.is_null() {
+            if unlikely(ptr.is_null()) {
                 // The eager reader's fallback retried transient NDIS failures.
                 // Keep one recovery attempt without reading any extra bytes.
                 (ptr, native_span) = read(length, storage);
             }
-            if ptr.is_null() {
+            if unlikely(ptr.is_null()) {
                 // A failed expansion may have overwritten scratch bytes. Never
                 // expose them as an earlier successful prefix. A native prefix
                 // is unaffected because NDIS only writes into scratch storage.
@@ -340,7 +341,7 @@ impl NetBufferList {
             let nb = nbl.Header.first_net_buffer;
             if let Some(nb) = nb.as_ref() {
                 let data_length = nb.nbSize.DataLength;
-                if data_length == 0 {
+                if unlikely(data_length == 0) {
                     return Err("can't clone empty packet".to_string());
                 }
 
@@ -354,7 +355,7 @@ impl NetBufferList {
                 // and returns a pointer to the supplied buffer.
                 let ptr = NdisGetDataBuffer(nb, data_length, buffer_ptr, 1, 0);
 
-                if ptr.is_null() {
+                if unlikely(ptr.is_null()) {
                     return Err("failed to copy packet buffer".to_string());
                 }
 
@@ -398,7 +399,7 @@ impl NetBufferList {
                 packet_count += 1;
                 nb = nb_ref.Next;
             }
-            if packet_count == 0 {
+            if unlikely(packet_count == 0) {
                 return Err("net buffer list has no packets".to_string());
             }
             if packet_count == 1 {
@@ -411,14 +412,14 @@ impl NetBufferList {
             nb = nbl.Header.first_net_buffer;
             while let Some(nb_ref) = nb.as_ref() {
                 let data_length = nb_ref.nbSize.DataLength;
-                if data_length == 0 {
+                if unlikely(data_length == 0) {
                     return Err("can't clone empty packet".to_string());
                 }
 
                 let mut buffer = alloc::vec![0_u8; data_length as usize];
                 let buffer_ptr = buffer.as_mut_ptr();
                 let ptr = NdisGetDataBuffer(nb, data_length, buffer_ptr, 1, 0);
-                if ptr.is_null() {
+                if unlikely(ptr.is_null()) {
                     return Err("failed to copy packet buffer".to_string());
                 }
                 if ptr != buffer_ptr {
@@ -672,7 +673,7 @@ impl NetworkAllocator {
         &self,
         packet_data: &mut [u8],
     ) -> Result<*mut NET_BUFFER_LIST, String> {
-        if self.pool_handle.is_null() {
+        if unlikely(self.pool_handle.is_null()) {
             return Err("allocator not initialized".to_string());
         }
         unsafe {
@@ -684,7 +685,7 @@ impl NetworkAllocator {
                 0,
                 core::ptr::null_mut(),
             );
-            if mdl.is_null() {
+            if unlikely(mdl.is_null()) {
                 return Err("failed to allocate mdl".to_string());
             }
 
@@ -706,7 +707,7 @@ impl NetworkAllocator {
                 IoFreeMdl(mdl);
                 return Err(err);
             }
-            if nbl.is_null() {
+            if unlikely(nbl.is_null()) {
                 IoFreeMdl(mdl);
                 return Err("WFP returned a null NET_BUFFER_LIST".to_string());
             }

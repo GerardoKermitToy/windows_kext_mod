@@ -3,6 +3,7 @@ use core::{
     fmt::{Debug, Display},
     sync::atomic::{AtomicU64, Ordering},
 };
+use likely_stable::{likely, unlikely};
 use num_derive::FromPrimitive;
 use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Address, Ipv6Address};
 
@@ -17,7 +18,7 @@ static NEXT_CONNECTION_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 fn next_connection_instance_id() -> u64 {
     loop {
         let id = NEXT_CONNECTION_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);
-        if id != 0 {
+        if likely(id != 0) {
             return id;
         }
     }
@@ -356,10 +357,12 @@ impl Connection for ConnectionV4 {
     type RemoteAddressKey = u32;
 
     fn remote_equals(&self, key: &Key) -> bool {
-        if self.protocol != key.protocol
-            || self.local_port != key.local_port
-            || self.remote_port != key.remote_port
-        {
+        // The cache already selected the protocol, local port and remote endpoint.
+        if unlikely(
+            self.protocol != key.protocol
+                || self.local_port != key.local_port
+                || self.remote_port != key.remote_port,
+        ) {
             return false;
         }
         if let IpAddress::Ipv4(local_address) = &key.local_address {
@@ -570,10 +573,12 @@ impl Connection for ConnectionV6 {
     type RemoteAddressKey = (u64, u64);
 
     fn remote_equals(&self, key: &Key) -> bool {
-        if self.protocol != key.protocol
-            || self.local_port != key.local_port
-            || self.remote_port != key.remote_port
-        {
+        // The cache already selected the protocol, local port and remote endpoint.
+        if unlikely(
+            self.protocol != key.protocol
+                || self.local_port != key.local_port
+                || self.remote_port != key.remote_port,
+        ) {
             return false;
         }
         if let IpAddress::Ipv6(local_address) = &key.local_address {

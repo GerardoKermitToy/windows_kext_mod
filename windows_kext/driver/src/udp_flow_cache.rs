@@ -9,6 +9,7 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
+use likely_stable::unlikely;
 
 #[cfg(not(test))]
 use wdk::rw_spin_lock::RwSpinLock;
@@ -85,13 +86,13 @@ impl UdpFlowCache {
     /// is invalid or already registered. A false result leaves ownership with the
     /// caller.
     pub fn register(&self, flow_context: u64, mut registration: UdpFlowRegistration) -> bool {
-        if flow_context == 0 || registration.connection_instance_id == 0 {
+        if unlikely(flow_context == 0 || registration.connection_instance_id == 0) {
             return false;
         }
 
         let _guard = self.lock.write_lock();
         let state = unsafe { &mut *self.state.get() };
-        if state.shutting_down || state.registrations.contains_key(&flow_context) {
+        if unlikely(state.shutting_down || state.registrations.contains_key(&flow_context)) {
             return false;
         }
         registration.flow_context = flow_context;
@@ -105,7 +106,7 @@ impl UdpFlowCache {
     /// means flowDeleteFn already claimed it while `FwpsFlowAssociateContext0` was
     /// returning, or the allocation address has since been reused.
     pub fn mark_associated(&self, flow_context: u64, connection_instance_id: u64) -> bool {
-        if flow_context == 0 || connection_instance_id == 0 {
+        if unlikely(flow_context == 0 || connection_instance_id == 0) {
             return false;
         }
 
@@ -158,7 +159,7 @@ impl UdpFlowCache {
         let _guard = self.lock.write_lock();
         let state = unsafe { &mut *self.state.get() };
         let registration = state.registrations.get(&flow_context)?;
-        if registration.layer_id != layer_id || registration.callout_id != callout_id {
+        if unlikely(registration.layer_id != layer_id || registration.callout_id != callout_id) {
             return None;
         }
         let registration = state.registrations.remove(&flow_context)?;

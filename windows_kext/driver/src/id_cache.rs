@@ -1,4 +1,5 @@
 use core::mem;
+use likely_stable::likely;
 
 use alloc::{
     collections::{btree_map::Entry as MapEntry, BTreeMap, VecDeque},
@@ -417,7 +418,8 @@ fn add_pending_request(
     connection_instance_id: Option<u64>,
     request_id: u64,
 ) {
-    let Some(instance_id) = connection_instance_id.filter(|instance_id| *instance_id != 0) else {
+    let Some(instance_id) = connection_instance_id.filter(|instance_id| likely(*instance_id != 0))
+    else {
         return;
     };
 
@@ -434,7 +436,8 @@ fn remove_pending_request(
     connection_instance_id: Option<u64>,
     request_id: u64,
 ) {
-    let Some(instance_id) = connection_instance_id.filter(|instance_id| *instance_id != 0) else {
+    let Some(instance_id) = connection_instance_id.filter(|instance_id| likely(*instance_id != 0))
+    else {
         return;
     };
     let Some(ids) = pending_by_instance.get_mut(&instance_id) else {

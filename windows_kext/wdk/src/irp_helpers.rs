@@ -1,4 +1,5 @@
 use core::ffi::c_void;
+use likely_stable::{likely, unlikely};
 
 use windows_sys::{
     Wdk::{
@@ -31,7 +32,7 @@ impl IrpPtr {
     /// `ptr` must either be null or point to a live, native-aligned IRP owned by
     /// the I/O manager for the entire request operation.
     unsafe fn new(ptr: *mut IRP) -> Option<Self> {
-        (!ptr.is_null()).then_some(Self { ptr })
+        likely(!ptr.is_null()).then_some(Self { ptr })
     }
 
     /// Returns the request's current I/O stack location.
@@ -41,7 +42,7 @@ impl IrpPtr {
     /// While `self.ptr` is non-null, the caller must uphold the live native IRP
     /// contract established by [`IrpPtr::new`].
     unsafe fn current_stack_location(&self) -> *mut IO_STACK_LOCATION {
-        if self.ptr.is_null() {
+        if unlikely(self.ptr.is_null()) {
             return core::ptr::null_mut();
         }
 
@@ -64,7 +65,7 @@ impl IrpPtr {
     /// While `self.ptr` is non-null, the caller must uphold the live native IRP
     /// contract established by [`IrpPtr::new`].
     unsafe fn system_buffer(&self) -> *mut u8 {
-        if self.ptr.is_null() {
+        if unlikely(self.ptr.is_null()) {
             return core::ptr::null_mut();
         }
 
@@ -78,7 +79,7 @@ impl IrpPtr {
     /// reclaimed during completion.
     fn complete(&mut self, status: NTSTATUS, information: usize) -> NTSTATUS {
         let irp = core::mem::replace(&mut self.ptr, core::ptr::null_mut());
-        if irp.is_null() {
+        if unlikely(irp.is_null()) {
             return status;
         }
 

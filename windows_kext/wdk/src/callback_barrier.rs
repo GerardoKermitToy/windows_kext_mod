@@ -11,12 +11,19 @@ use core::{
     marker::PhantomData,
     sync::atomic::{AtomicU64, Ordering},
 };
+use likely_stable::{likely, unlikely};
 
+#[cfg(not(test))]
 use windows_sys::Wdk::System::SystemServices::{
-    ExAcquireRundownProtection, ExInitializeRundownProtection, ExReInitializeRundownProtection,
-    ExReleaseRundownProtection, ExRundownCompleted, ExWaitForRundownProtectionRelease,
-    EX_RUNDOWN_REF, EX_RUNDOWN_REF_0,
+    ExAcquireRundownProtection as acquire_rundown, ExReleaseRundownProtection as release_rundown,
 };
+use windows_sys::Wdk::System::SystemServices::{
+    ExInitializeRundownProtection, ExReInitializeRundownProtection, ExRundownCompleted,
+    ExWaitForRundownProtectionRelease, EX_RUNDOWN_REF, EX_RUNDOWN_REF_0,
+};
+
+#[cfg(test)]
+use self::tests::{acquire_rundown, release_rundown};
 
 const NEVER_STARTED: u8 = 0;
 const PREPARED: u8 = 1;
@@ -171,16 +178,16 @@ impl CallbackBarrier {
     pub fn enter_callback(&self) -> Option<CallbackAdmission<'_>> {
         let initial_token = self.state.load(Ordering::Acquire);
         let initial_phase = state_phase(initial_token);
-        if !matches!(
+        if unlikely(!matches!(
             initial_phase,
             PREPARED | OPEN | CLASSIFY_CLOSING | CLASSIFY_CLOSED
-        ) {
+        )) {
             return None;
         }
         let generation = state_generation(initial_token);
         let lifetime = self.acquire(&self.callback_lifetime)?;
         let current_token = self.state.load(Ordering::Acquire);
-        if state_generation(current_token) != generation {
+        if unlikely(state_generation(current_token) != generation) {
             return None;
         }
 
@@ -204,10 +211,10 @@ impl CallbackBarrier {
     pub fn enter_classify(&self) -> Option<ClassifyAdmission<'_>> {
         let initial_token = self.state.load(Ordering::Acquire);
         let initial_phase = state_phase(initial_token);
-        if !matches!(
+        if unlikely(!matches!(
             initial_phase,
             PREPARED | OPEN | CLASSIFY_CLOSING | CLASSIFY_CLOSED
-        ) {
+        )) {
             // In particular, do not admit a new callback after final draining
             // starts. A callback that read the old state may still race through
             // the acquisition below; the second state check handles that finite
@@ -218,7 +225,7 @@ impl CallbackBarrier {
 
         let lifetime = self.acquire(&self.callback_lifetime)?;
         let current_token = self.state.load(Ordering::Acquire);
-        if state_generation(current_token) != generation {
+        if unlikely(state_generation(current_token) != generation) {
             // The static barrier was reused for a newer driver instance while
             // this callback was delayed. It may have acquired the new generation's
             // rundown reference, but it must never acquire Device access from it.
@@ -258,17 +265,17 @@ impl CallbackBarrier {
     pub fn enter_flow_delete(&self) -> Option<FlowDeleteAdmission<'_>> {
         let initial_token = self.state.load(Ordering::Acquire);
         let initial_phase = state_phase(initial_token);
-        if !matches!(
+        if unlikely(!matches!(
             initial_phase,
             PREPARED | OPEN | CLASSIFY_CLOSING | CLASSIFY_CLOSED
-        ) {
+        )) {
             return None;
         }
         let generation = state_generation(initial_token);
 
         let lifetime = self.acquire(&self.callback_lifetime)?;
         let current_token = self.state.load(Ordering::Acquire);
-        if state_generation(current_token) != generation {
+        if unlikely(state_generation(current_token) != generation) {
             // See the corresponding classify path. Do not let a delayed callback
             // interpret an old flow context using the new Device instance.
             return None;
@@ -301,8 +308,9 @@ impl CallbackBarrier {
         rundown: &'a UnsafeCell<EX_RUNDOWN_REF>,
     ) -> Option<CallbackGuard<'a>> {
         let rundown = rundown.get();
-        let acquired = unsafe { ExAcquireRundownProtection(rundown) } != 0;
-        acquired.then_some(CallbackGuard {
+        let acquired = unsafe { acquire_rundown(rundown) } != 0;
+        // A failed acquisition must not construct a guard that releases rundown.
+        likely(acquired).then(|| CallbackGuard {
             rundown,
             _barrier: PhantomData,
         })
@@ -439,10 +447,56 @@ struct CallbackGuard<'a> {
 impl Drop for CallbackGuard<'_> {
     fn drop(&mut self) {
         unsafe {
-            ExReleaseRundownProtection(self.rundown);
+            release_rundown(self.rundown);
         }
     }
 }
 
 /// The callback barrier for the one Device owned by this driver image.
 pub static CALLBACK_BARRIER: CallbackBarrier = CallbackBarrier::new();
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::cell::Cell;
+
+    std::thread_local! {
+        static ACQUIRE_SUCCEEDS: Cell<bool> = const { Cell::new(false) };
+        static RELEASE_COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    // Exercise the real guard construction and Drop without calling kernel APIs.
+    pub(super) unsafe fn acquire_rundown(_rundown: *mut EX_RUNDOWN_REF) -> u8 {
+        ACQUIRE_SUCCEEDS.with(|succeeds| u8::from(succeeds.get()))
+    }
+
+    pub(super) unsafe fn release_rundown(_rundown: *mut EX_RUNDOWN_REF) {
+        RELEASE_COUNT.with(|count| count.set(count.get() + 1));
+    }
+
+    #[test]
+    fn failed_acquisition_does_not_release_rundown() {
+        ACQUIRE_SUCCEEDS.with(|succeeds| succeeds.set(false));
+        RELEASE_COUNT.with(|count| count.set(0));
+        let barrier = CallbackBarrier::new();
+
+        let guard = barrier.acquire(&barrier.callback_lifetime);
+
+        assert!(guard.is_none());
+        RELEASE_COUNT.with(|count| assert_eq!(count.get(), 0));
+    }
+
+    #[test]
+    fn successful_acquisition_releases_rundown_on_drop() {
+        ACQUIRE_SUCCEEDS.with(|succeeds| succeeds.set(true));
+        RELEASE_COUNT.with(|count| count.set(0));
+        let barrier = CallbackBarrier::new();
+
+        let guard = barrier.acquire(&barrier.callback_lifetime);
+
+        assert!(guard.is_some());
+        RELEASE_COUNT.with(|count| assert_eq!(count.get(), 0));
+        drop(guard);
+        RELEASE_COUNT.with(|count| assert_eq!(count.get(), 1));
+    }
+}

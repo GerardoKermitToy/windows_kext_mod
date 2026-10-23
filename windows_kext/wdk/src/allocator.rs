@@ -1,4 +1,5 @@
 use core::alloc::{GlobalAlloc, Layout};
+use likely_stable::likely;
 
 use windows_sys::Wdk::System::SystemServices::{ExAllocatePool2, ExFreePoolWithTag};
 
@@ -36,7 +37,7 @@ unsafe impl GlobalAlloc for WindowsAllocator {
             return core::ptr::null_mut();
         }
 
-        if layout.align() <= POOL_ALIGNMENT {
+        if likely(layout.align() <= POOL_ALIGNMENT) {
             // SAFETY: `layout` has a nonzero size, and nonpaged NX pool is valid
             // for allocator calls made at any IRQL at which this driver allocates.
             return unsafe {
@@ -101,7 +102,7 @@ unsafe impl GlobalAlloc for WindowsAllocator {
             return;
         }
 
-        let base = if layout.align() <= POOL_ALIGNMENT {
+        let base = if likely(layout.align() <= POOL_ALIGNMENT) {
             ptr
         } else {
             // SAFETY: for an over-aligned layout, `alloc` stored the original

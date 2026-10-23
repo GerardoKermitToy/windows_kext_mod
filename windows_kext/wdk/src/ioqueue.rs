@@ -10,6 +10,7 @@ use core::{
 
 use crate::{dbg, rw_spin_lock::RwSpinLock};
 use alloc::boxed::Box;
+use likely_stable::likely;
 use windows_sys::{
     Wdk::Foundation::KQUEUE,
     Win32::{
@@ -147,7 +148,7 @@ impl<T> IOQueue<T> {
         // then insert into a queue that will never be consumed or freed.
         let result = {
             let _lifecycle_guard = self.lifecycle_lock.write_lock();
-            if self.initialized.load(Ordering::Acquire) {
+            if likely(self.initialized.load(Ordering::Acquire)) {
                 unsafe { KeInsertQueue(kqueue, raw_ptr as *mut c_void) }
             } else {
                 -1
@@ -186,7 +187,7 @@ impl<T> IOQueue<T> {
             let kqueue = self.kernel_queue.get();
             let timeout = timeout.map_or(core::ptr::null(), core::ptr::from_ref);
             // Check if initialized.
-            if self.initialized.load(Ordering::Acquire) {
+            if likely(self.initialized.load(Ordering::Acquire)) {
                 // Pop and check the return value.
                 let list_entry =
                     KeRemoveQueue(kqueue, KprocessorMode::KernelMode, timeout) as *mut Entry<T>;

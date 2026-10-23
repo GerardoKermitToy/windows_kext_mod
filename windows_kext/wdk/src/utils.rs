@@ -1,4 +1,5 @@
 use alloc::string::{String, ToString};
+use likely_stable::likely;
 use ntstatus::ntstatus::NtStatus;
 use windows_sys::Wdk::System::SystemServices::{
     KeDelayExecutionThread, KeGetCurrentIrql, KeQueryInterruptTimePrecise, PASSIVE_LEVEL,
@@ -9,7 +10,7 @@ use crate::ffi;
 pub fn check_ntstatus(status: i32) -> Result<(), String> {
     // Match the native NT_SUCCESS macro: informational and warning-free positive
     // statuses are successful too, not only STATUS_SUCCESS (zero).
-    if status >= 0 {
+    if likely(status >= 0) {
         return Ok(());
     }
 

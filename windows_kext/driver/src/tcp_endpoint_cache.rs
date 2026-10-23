@@ -10,6 +10,8 @@ use alloc::{
     vec::Vec,
 };
 
+use likely_stable::unlikely;
+
 use crate::connection_map::Key;
 
 #[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
@@ -226,7 +228,7 @@ impl TcpEndpointCache {
         instance_id: u64,
         associated_at_ms: u64,
     ) -> bool {
-        if endpoint_handle == 0 || instance_id == 0 {
+        if unlikely(endpoint_handle == 0 || instance_id == 0) {
             return false;
         }
 
@@ -314,7 +316,7 @@ impl TcpEndpointCache {
         endpoint_handle: u64,
         endpoint: TcpEndpointConnection,
     ) -> bool {
-        if endpoint_handle == 0 || endpoint.instance_id == 0 {
+        if unlikely(endpoint_handle == 0 || endpoint.instance_id == 0) {
             return false;
         }
         if self

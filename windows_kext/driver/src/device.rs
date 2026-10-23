@@ -3,6 +3,7 @@ use core::{
     ffi::c_void,
     sync::atomic::{AtomicPtr, AtomicU32, Ordering},
 };
+use likely_stable::unlikely;
 use num_traits::FromPrimitive;
 use protocol::{
     command::{CommandParseError, CommandType},
@@ -376,7 +377,7 @@ impl Device {
         write_request: &WriteRequest,
     ) -> Result<(), CommandWriteError> {
         let mut remaining = write_request.get_buffer();
-        if remaining.is_empty() {
+        if unlikely(remaining.is_empty()) {
             err!("Rejecting empty command write");
             return Err(CommandWriteError::new(STATUS_INVALID_PARAMETER, 0));
         }
@@ -1120,7 +1121,7 @@ impl Device {
             }
         };
 
-        if endpoint.key.is_ipv6() {
+        if unlikely(endpoint.key.is_ipv6()) {
             if let Some(connection) = self.connection_cache.end_connection_instance_v6_unless(
                 endpoint.key,
                 endpoint.instance_id,
@@ -1162,7 +1163,7 @@ impl Device {
     /// lock through closure-cache insertion, so it cannot add an untracked request
     /// between the final empty check and the lifecycle end.
     fn complete_ready_tcp_endpoint_closure(&self, endpoint: TcpEndpointConnection) {
-        if endpoint.key.is_ipv6() {
+        if unlikely(endpoint.key.is_ipv6()) {
             let completed = self.connection_cache.end_connection_instance_v6_after(
                 endpoint.key,
                 endpoint.instance_id,

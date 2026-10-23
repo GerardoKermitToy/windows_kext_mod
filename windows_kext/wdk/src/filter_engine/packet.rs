@@ -11,6 +11,7 @@ use core::{
     pin::Pin,
     sync::atomic::{AtomicBool, AtomicPtr, Ordering},
 };
+use likely_stable::unlikely;
 use windows_sys::{
     Wdk::{
         Foundation::KDPC,
@@ -323,12 +324,12 @@ impl TransportInjectionState {
     }
 
     fn acquire_submission(&self) -> Option<TransportSubmission> {
-        if self.closing.load(Ordering::Acquire) {
+        if unlikely(self.closing.load(Ordering::Acquire)) {
             return None;
         }
 
         let rundown = self.submissions.get();
-        if unsafe { ExAcquireRundownProtection(rundown) } == 0 {
+        if unlikely(unsafe { ExAcquireRundownProtection(rundown) } == 0) {
             return None;
         }
         let submission = TransportSubmission { rundown };
@@ -336,7 +337,7 @@ impl TransportInjectionState {
         // A closer can publish its state between the first check and the native
         // acquisition. The reference is included in its wait either way; reject
         // the new operation so teardown does not submit additional packet work.
-        if self.closing.load(Ordering::Acquire) {
+        if unlikely(self.closing.load(Ordering::Acquire)) {
             return None;
         }
 
@@ -634,7 +635,9 @@ impl Injector {
             return Err("failed to inject packet: transport injector is closing".to_string());
         };
         let transport_inject_handle = self.transport_injection.handle.load(Ordering::Acquire);
-        if transport_inject_handle == INVALID_HANDLE_VALUE || transport_inject_handle.is_null() {
+        if unlikely(
+            transport_inject_handle == INVALID_HANDLE_VALUE || transport_inject_handle.is_null(),
+        ) {
             return Err("failed to inject packet: invalid handle value".to_string());
         }
 
@@ -680,7 +683,7 @@ impl Injector {
                 core::ptr::null_mut(),
             )
         };
-        if queued == 0 {
+        if unlikely(queued == 0) {
             // This is a fresh KDPC, so it cannot legitimately already be queued.
             // Ownership was not transferred; reclaim the packet and rundown guard.
             unsafe {
@@ -696,7 +699,9 @@ impl Injector {
         transport_inject_handle: *mut c_void,
         packet_list: TransportPacketList,
     ) -> Result<(), String> {
-        if transport_inject_handle == INVALID_HANDLE_VALUE || transport_inject_handle.is_null() {
+        if unlikely(
+            transport_inject_handle == INVALID_HANDLE_VALUE || transport_inject_handle.is_null(),
+        ) {
             return Err("failed to inject packet: invalid handle value".to_string());
         }
 
@@ -772,12 +777,12 @@ impl Injector {
         net_buffer_list: NetBufferList,
         inject_info: InjectInfo,
     ) -> Result<(), String> {
-        let inject_handle = if inject_info.ipv6 {
+        let inject_handle = if unlikely(inject_info.ipv6) {
             self.packet_inject_handle_v6.load(Ordering::Acquire)
         } else {
             self.packet_inject_handle_v4.load(Ordering::Acquire)
         };
-        if inject_handle == INVALID_HANDLE_VALUE || inject_handle.is_null() {
+        if unlikely(inject_handle == INVALID_HANDLE_VALUE || inject_handle.is_null()) {
             return Err("failed to inject packet: invalid handle value".to_string());
         }
 
@@ -891,12 +896,14 @@ impl Injector {
         nbl: *const NET_BUFFER_LIST,
         ipv6: bool,
     ) -> PacketInjectionOrigin {
-        let inject_handle = if ipv6 {
+        let inject_handle = if unlikely(ipv6) {
             self.packet_inject_handle_v6.load(Ordering::Acquire)
         } else {
             self.packet_inject_handle_v4.load(Ordering::Acquire)
         };
-        if inject_handle == INVALID_HANDLE_VALUE || inject_handle.is_null() || nbl.is_null() {
+        if unlikely(
+            inject_handle == INVALID_HANDLE_VALUE || inject_handle.is_null() || nbl.is_null(),
+        ) {
             return PacketInjectionOrigin::Unknown;
         }
 
@@ -933,10 +940,11 @@ impl Injector {
         nbl: *const NET_BUFFER_LIST,
     ) -> PacketInjectionOrigin {
         let transport_inject_handle = self.transport_injection.handle.load(Ordering::Acquire);
-        if transport_inject_handle == INVALID_HANDLE_VALUE
-            || transport_inject_handle.is_null()
-            || nbl.is_null()
-        {
+        if unlikely(
+            transport_inject_handle == INVALID_HANDLE_VALUE
+                || transport_inject_handle.is_null()
+                || nbl.is_null(),
+        ) {
             return PacketInjectionOrigin::Unknown;
         }
 

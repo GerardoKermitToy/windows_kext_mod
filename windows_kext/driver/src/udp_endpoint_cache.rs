@@ -7,6 +7,7 @@
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
+use likely_stable::unlikely;
 
 #[cfg(not(test))]
 use wdk::rw_spin_lock::RwSpinLock;
@@ -75,8 +76,14 @@ impl UdpEndpointCache {
     ///   such entries are retained until explicitly removed. Non-zero values enable
     ///   protection against race conditions during periodic cleanup by preventing
     ///   removal of recently created associations.
-    pub fn associate_instance_at(&mut self, endpoint_handle: u64, key: Key, instance_id: u64, associated_at_ms: u64) -> bool {
-        if endpoint_handle == 0 || instance_id == 0 {
+    pub fn associate_instance_at(
+        &mut self,
+        endpoint_handle: u64,
+        key: Key,
+        instance_id: u64,
+        associated_at_ms: u64,
+    ) -> bool {
+        if unlikely(endpoint_handle == 0 || instance_id == 0) {
             return false;
         }
 
@@ -112,7 +119,7 @@ impl UdpEndpointCache {
         key: &Key,
         mut accept_instance: impl FnMut(u64) -> Option<T>,
     ) -> Option<T> {
-        if endpoint_handle == 0 {
+        if unlikely(endpoint_handle == 0) {
             return None;
         }
 

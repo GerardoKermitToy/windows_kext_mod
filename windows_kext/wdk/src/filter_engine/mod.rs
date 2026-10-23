@@ -1,4 +1,5 @@
 use core::ffi::c_void;
+use likely_stable::unlikely;
 
 use crate::alloc::borrow::ToOwned;
 use crate::driver::Driver;
@@ -337,7 +338,7 @@ unsafe extern "system" fn catch_all_callout(
         // driver-owned memory if WFP nevertheless arrives late.
         return;
     };
-    if !callback_admission.is_active() {
+    if unlikely(!callback_admission.is_active()) {
         // Runtime callouts exist briefly while their FWPM transaction is being
         // built and while unload removes filters. The lifetime guard remains held
         // through return, but Device/filter context is intentionally inaccessible.
@@ -371,7 +372,7 @@ unsafe extern "system" fn catch_all_callout(
     let Some(classify_out) = (unsafe { classify_out.as_mut() }) else {
         return;
     };
-    if fixed_values.value_count != 0 && fixed_values.incoming_value_array.is_null() {
+    if unlikely(fixed_values.value_count != 0 && fixed_values.incoming_value_array.is_null()) {
         return;
     }
 

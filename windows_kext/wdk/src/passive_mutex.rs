@@ -6,6 +6,7 @@ use core::{
     mem::ManuallyDrop,
     ops::{Deref, DerefMut},
 };
+use likely_stable::unlikely;
 
 use windows_sys::{
     Wdk::{
@@ -105,7 +106,7 @@ impl<T> PassiveMutex<T> {
     /// Acquires the mutex without changing the caller's IRQL.
     pub fn lock(&self) -> Result<PassiveMutexGuard<'_, T>, PassiveMutexError> {
         let irql = unsafe { KeGetCurrentIrql() };
-        if irql != PASSIVE_LEVEL as u8 {
+        if unlikely(irql != PASSIVE_LEVEL as u8) {
             return Err(PassiveMutexError::WrongIrql(irql));
         }
 

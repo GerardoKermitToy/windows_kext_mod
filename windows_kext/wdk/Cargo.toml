@@ -9,6 +9,7 @@ edition = "2021"
 perf-etw = []
 
 [dependencies]
+likely_stable = { version = "0.1.3", default-features = false }
 ntstatus = { version = "0.1.2", default-features = false }
 
 [dependencies.widestring]

@@ -165,7 +165,8 @@ impl DispatchGate {
             return None;
         }
         let acquired = unsafe { ExAcquireRundownProtection(self.dispatch_lifetime.get()) } != 0;
-        likely(acquired).then_some(DispatchLifetimeGuard {
+        // Construct the release guard only after rundown was actually acquired.
+        likely(acquired).then(|| DispatchLifetimeGuard {
             rundown: self.dispatch_lifetime.get(),
             _gate: PhantomData,
         })
@@ -281,7 +282,7 @@ impl DispatchGuard<'_> {
 
 impl Drop for DispatchGuard<'_> {
     fn drop(&mut self) {
-        if !self.admitted {
+        if unlikely(!self.admitted) {
             return;
         }
         if self.is_read {
@@ -554,10 +555,10 @@ unsafe extern "system" fn driver_create(
     let Some(dispatch_guard) = dispatch_guard else {
         return create_request.fail(STATUS_DEVICE_NOT_READY);
     };
-    if !dispatch_guard.is_admitted() {
+    if unlikely(!dispatch_guard.is_admitted()) {
         return create_request.fail(STATUS_DEVICE_NOT_READY);
     }
-    if !wdk::utils::is_passive_level() {
+    if unlikely(!wdk::utils::is_passive_level()) {
         return create_request.fail(STATUS_INVALID_DEVICE_STATE);
     }
     let Some(device) = get_device() else {
@@ -609,10 +610,10 @@ unsafe extern "system" fn driver_cleanup(
     let Some(dispatch_guard) = dispatch_guard else {
         return cleanup_request.complete();
     };
-    if !dispatch_guard.is_admitted() {
+    if unlikely(!dispatch_guard.is_admitted()) {
         return cleanup_request.complete();
     }
-    if !wdk::utils::is_passive_level() {
+    if unlikely(!wdk::utils::is_passive_level()) {
         return cleanup_request.fail(STATUS_INVALID_DEVICE_STATE);
     }
     let Some(device) = get_device() else {
@@ -692,10 +693,10 @@ unsafe extern "system" fn driver_read(
     let Some(dispatch_guard) = dispatch_guard else {
         return read_request.end_of_file();
     };
-    if !dispatch_guard.is_admitted() {
+    if unlikely(!dispatch_guard.is_admitted()) {
         return read_request.end_of_file();
     }
-    if !wdk::utils::is_passive_level() {
+    if unlikely(!wdk::utils::is_passive_level()) {
         return read_request.fail(STATUS_INVALID_DEVICE_STATE);
     }
     let Some(device) = get_device() else {
@@ -719,10 +720,10 @@ unsafe extern "system" fn driver_write(
     let Some(dispatch_guard) = dispatch_guard else {
         return write_request.complete();
     };
-    if !dispatch_guard.is_admitted() {
+    if unlikely(!dispatch_guard.is_admitted()) {
         return write_request.complete();
     }
-    if !wdk::utils::is_passive_level() {
+    if unlikely(!wdk::utils::is_passive_level()) {
         return write_request.fail(STATUS_INVALID_DEVICE_STATE);
     }
     let Some(device) = get_device() else {
@@ -758,10 +759,10 @@ unsafe extern "system" fn device_control(
     let Some(dispatch_guard) = dispatch_guard else {
         return control_request.not_implemented();
     };
-    if !dispatch_guard.is_admitted() {
+    if unlikely(!dispatch_guard.is_admitted()) {
         return control_request.not_implemented();
     }
-    if !wdk::utils::is_passive_level() {
+    if unlikely(!wdk::utils::is_passive_level()) {
         return control_request.fail(STATUS_INVALID_DEVICE_STATE);
     }
     let Some(device) = get_device() else {

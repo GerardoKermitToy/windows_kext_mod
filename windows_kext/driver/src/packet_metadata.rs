@@ -151,7 +151,7 @@ impl<R: PacketData> PacketInspector<R> {
         let offset = usize::from(header.transport_offset);
         let reset = header.error.is_none()
             && header.protocol == IpProtocol::Tcp
-            && header.valid_tcp_flags
+            && likely(header.valid_tcp_flags)
             && self
                 .reader
                 .byte(offset + TCP_FLAGS_OFFSET)
@@ -251,7 +251,8 @@ impl<R: PacketData> PacketInspector<R> {
 
     #[inline]
     fn read_key(&mut self) -> Result<Key, PacketMetadataError> {
-        if self.header.is_none() {
+        // Packet callouts request the key before inspecting other header fields.
+        if likely(self.header.is_none()) {
             let base_length = if unlikely(self.ipv6) {
                 IPV6_HEADER_LEN
             } else {
