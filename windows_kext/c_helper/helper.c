@@ -6,7 +6,7 @@
 #include <stdlib.h>
 #include <wchar.h>
 
-#define NDIS640 1                // Windows 8 and Windows Server 2012
+#define NDIS640 1                // Windows 8.1 and Windows Server 2012 R2
 
 #include "Ntifs.h"
 #include <ntddk.h>              // Windows Driver Development Kit

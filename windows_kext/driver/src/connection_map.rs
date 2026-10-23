@@ -40,7 +40,7 @@ impl Key {
         (self.protocol, self.local_port)
     }
 
-    /// Returns true if the local address is an IPv4 address.
+    /// Returns true if the local address is an IPv6 address.
     pub fn is_ipv6(&self) -> bool {
         match self.local_address {
             IpAddress::Ipv4(_) => false,
@@ -972,9 +972,8 @@ impl<T: Connection + Clone> ConnectionMap<T> {
     }
 
     /// Removes ended history after its one-minute late-packet grace period.
-    /// Live TCP and UDP entries are retained regardless of inactivity until a
-    /// native lifecycle indication ends them, the cache is cleared, or the driver
-    /// unloads.
+    /// This pass retains all live entries regardless of inactivity. Idle-expirable
+    /// untracked entries are ended separately by `end_inactive_untracked_connections`.
     pub fn clean_ended_connections(&mut self) {
         let now = get_monotonic_timestamp_ms();
         let before_one_minute = now.saturating_sub(Duration::from_secs(60).as_millis() as u64);

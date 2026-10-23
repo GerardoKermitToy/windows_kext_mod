@@ -122,7 +122,9 @@ impl ClassifyOut {
         self.action_type = FWP_ACTION_NONE;
     }
 
-    // Set absorb flag. This will drop the packet. Used when the packets will be reinjected in the future.
+    // Sets the absorb flag only. With FWP_ACTION_BLOCK this silently discards
+    // the indication, for example before reinjecting a clone. It does not set
+    // the action type or clear the action-write right.
     pub fn set_absorb(&mut self) {
         self.flags |= FWPS_CLASSIFY_OUT_FLAG_ABSORB;
     }

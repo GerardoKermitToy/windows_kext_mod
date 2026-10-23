@@ -51,10 +51,9 @@ const ENTRY_TTL_MS: u64 = 10_000;
 
 /// Upper bound on tracked requests.
 ///
-/// Reached only if many processes have unanswered requests at once; normal traffic
-/// keeps this near zero because a matched reply removes its entry immediately. The
-/// bound exists so that a host which never replies cannot grow the map without
-/// limit.
+/// Reached when many distinct requests remain unanswered, even from one process.
+/// A matched reply removes its entry immediately. The bound prevents unanswered
+/// requests from growing the map without limit.
 ///
 /// The data is small: a key is 22 bytes (a smoltcp `IpAddress` is 17 - a
 /// discriminant plus room for a v6 address - followed by identifier and sequence)

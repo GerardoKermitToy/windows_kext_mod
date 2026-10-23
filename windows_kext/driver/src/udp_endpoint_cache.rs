@@ -174,9 +174,9 @@ impl UdpEndpointCache {
     ///
     /// # Parameters
     /// * `instance_ids` - List of dead instance IDs to remove
-    /// * `current_time_ms` - Current timestamp in milliseconds. Associations created
-    ///   within the grace period (1000ms) are not removed to avoid race conditions
-    ///   during the window between cache association and connection_map insertion.
+    /// * `current_time_ms` - Current timestamp in milliseconds. Associations with
+    ///   `associated_at_ms == 0` or an age in `[0, 1000)` ms are retained even when
+    ///   their instance IDs are listed for removal.
     pub fn remove_instances(&mut self, mut instance_ids: Vec<u64>, current_time_ms: u64) -> usize {
         if instance_ids.is_empty() {
             return 0;

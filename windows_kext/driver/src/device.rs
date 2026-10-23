@@ -171,12 +171,11 @@ unsafe fn report_injection_failure(path: InjectionPath, status: NTSTATUS) {
 }
 
 impl Device {
-    /// Initialize all members of the device. Memory is handled by windows.
-    /// Make sure everything is initialized here.
+    /// Builds the Device-owned resources without registering WFP callouts or filters.
+    /// Filtering is activated separately after the complete Device is published.
     pub fn new(driver: &Driver) -> Result<Self, String> {
-        // Complete every fallible standalone allocation before registering WFP
-        // callbacks. If either resource is unavailable, DriverEntry fails without
-        // ever exposing a callback that depends on a partially built Device.
+        // Complete standalone allocations before creating the FilterEngine. If any
+        // resource is unavailable, DriverEntry fails before WFP registration.
         let injector = Injector::new_with_failure_callback(Some(report_injection_failure))
             .map_err(|err| format!("injector error: {}", err))?;
         let network_allocator =
@@ -222,7 +221,7 @@ impl Device {
         filter_engine.commit(callouts::get_callout_vec())
     }
 
-    /// Returns the PID of the process that currently has the device handle open, or 0 if none.
+    /// Returns whether the nonzero PID belongs to the current device-handle owner.
     pub fn is_owner_pid(&self, pid: u32) -> bool {
         let p = self.owner_pid.load(Ordering::Acquire);
         p != 0 && p == pid
@@ -963,7 +962,8 @@ impl Device {
         for el in pending_packets {
             let id = el.id();
             let pending = el.value;
-            // Set any verdict. Driver will unload after that and the filter will not be active.
+            // Block the exact connection generation while resolving its pending
+            // packet. A user-issued shutdown does not itself unload the driver.
             if let Some(instance_id) = pending.connection_instance_id {
                 _ = self.connection_cache.update_connection_instance(
                     pending.key,
@@ -984,8 +984,8 @@ impl Device {
         endpoint_cache.clear();
     }
 
-    /// Publishes a packet decision request only while its exact connection
-    /// generation remains live.
+    /// Publishes a packet decision request, checking liveness when it is associated
+    /// with an exact connection generation. Unassociated packets are enqueued directly.
     ///
     /// `with_live_connection_instance_matching` holds the connection-map read guard
     /// through both pending-cache insertion and event-queue insertion. Every native
@@ -1054,7 +1054,7 @@ impl Device {
             }
         }
         let infos = {
-            // Connection publication already holds the family map's read guard.
+            // Connection-associated publication already holds the family map's read guard.
             // Take closure state before the packet cache, matching endpoint-close
             // and verdict-completion lock order, so a new request cannot escape an
             // existing closure waiter. `IdCache::push` expands a multi-NET_BUFFER

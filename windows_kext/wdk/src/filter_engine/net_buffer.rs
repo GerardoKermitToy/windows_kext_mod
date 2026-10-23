@@ -344,7 +344,7 @@ impl NetBufferList {
                     return Err("can't clone empty packet".to_string());
                 }
 
-                // Allocate space in buffer, if buffer is too small.
+                // Allocate a new owned buffer for the first net buffer's packet bytes.
                 let mut buffer = alloc::vec![0_u8; data_length as usize];
 
                 let buffer_ptr = buffer.as_mut_ptr();
@@ -506,8 +506,9 @@ impl NetBufferList {
 
     /// Retreats the start of the first net buffer.
     ///
-    /// When `auto_advance` is true, the original offset is restored when this
-    /// wrapper is dropped.
+    /// A successful call with `auto_advance` records `size` for one advance on drop.
+    /// The recorded amount replaces any previous amount; repeated retreats are
+    /// not accumulated, and explicit advances do not cancel it.
     pub fn retreat(&mut self, size: u32, auto_advance: bool) -> Result<(), String> {
         unsafe {
             let Some(nbl) = self.nbl.as_mut() else {

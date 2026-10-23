@@ -153,8 +153,8 @@ impl<T> IOQueue<T> {
                 -1
             }
         };
-        // There is no documentation that rundown queue will return error. This is here just for good measures.
-        // It is unlikely to happen and not critical.
+        // A push after rundown takes the synthetic negative-result path above;
+        // KeInsertQueue itself returns the queue's previous signal state.
         if result >= 0 {
             return Ok(());
         }
@@ -165,8 +165,9 @@ impl<T> IOQueue<T> {
         return Err(Status::Uninitialized);
     }
 
-    /// Marks all current and future waits as canceled. The flag remains set
-    /// until a new owner calls `reset_cancellation`.
+    /// Marks current and future `wait_and_pop_cancellable` calls as canceled.
+    /// Other pop methods do not observe this flag. It remains set until a new
+    /// owner calls `reset_cancellation`.
     pub fn cancel_waiters(&self) {
         self.cancelled.store(true, Ordering::Release);
     }
@@ -281,7 +282,8 @@ impl<T> IOQueue<T> {
         self.pop_internal(Some(&timeout_ptr))
     }
 
-    /// Removes all elements and frees all the memory. The object can't be used after this function is called.
+    /// Drains and frees queued entries and permanently shuts down the queue.
+    /// The KQUEUE backing allocation remains owned by this object until Drop.
     pub fn rundown(&self) {
         self.cancel_waiters();
         unsafe {
@@ -323,7 +325,7 @@ impl<T> IOQueue<T> {
 
 impl<T> Drop for IOQueue<T> {
     fn drop(&mut self) {
-        // Reinitialize queue.
+        // Drain queued entries before clearing the KQUEUE storage.
         self.rundown();
         unsafe {
             let ptr = self.kernel_queue.get();

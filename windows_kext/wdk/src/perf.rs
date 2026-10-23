@@ -410,8 +410,9 @@ impl Span {
         let Some(slot) = operation.slot(detail) else {
             return span;
         };
-        // SAFETY: callable at any IRQL with an optional output. The number is
-        // group-relative, so different processor groups share these atomic slots.
+        // SAFETY: callable at any IRQL with an optional output. The return value is
+        // a system-wide processor index; modulo CPU_SLOTS maps processors whose
+        // indices differ by a multiple of CPU_SLOTS to the same atomic slot.
         let cpu =
             unsafe { KeGetCurrentProcessorNumberEx(core::ptr::null_mut()) as usize } % CPU_SLOTS;
         let count = COUNTERS[cpu].0[slot].fetch_add(1, Ordering::Relaxed);

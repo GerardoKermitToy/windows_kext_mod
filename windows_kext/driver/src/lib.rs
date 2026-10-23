@@ -6,8 +6,8 @@
 extern crate alloc;
 
 // Unit tests link as a user-mode executable, where the WFP/NDIS kernel imports
-// used by the other modules are unavailable. Keep the pure connection modules
-// in that graph and compile the full driver graph for every non-test build.
+// used by the other modules are unavailable. Keep kernel-independent modules and
+// test doubles in that graph; compile the full driver graph for non-test builds.
 #[cfg(not(test))]
 mod ale_callouts;
 mod ale_policy;

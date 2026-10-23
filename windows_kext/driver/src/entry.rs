@@ -27,13 +27,11 @@ use windows_sys::Win32::Foundation::{
 
 static VERSION: [u8; 4] = include!("../../kextinterface/version.txt");
 
-/// Global device pointer.
+/// Global device pointer, published with Release and loaded with Acquire.
 ///
-/// We use `AtomicPtr` to ensure thread safety.
-/// - **Safety**: Prevents data races and acts as a compiler barrier against dangerous optimizations
-///   (e.g., load hoisting), ensuring concurrent callouts see a valid, up-to-date pointer.
-/// - **Performance**: Negligible overhead. On x64, `Acquire` is free (same as a normal load).
-///   On ARM64, it uses efficient hardware-supported load-acquire instructions.
+/// The atomic synchronizes pointer access and publication of the initialized Device;
+/// it does not keep the allocation alive. DispatchGate and CALLBACK_BARRIER guards
+/// protect Device access until unload drains both paths and removes the pointer.
 static DEVICE: AtomicPtr<device::Device> = AtomicPtr::new(core::ptr::null_mut());
 
 /// Serializes user-mode dispatch routines with driver teardown.
@@ -42,15 +40,16 @@ static DEVICE: AtomicPtr<device::Device> = AtomicPtr::new(core::ptr::null_mut())
 /// so a lightweight gate is sufficient. A dispatch increments the active count
 /// only while unload is not closing the gate. Unload drains ordinary dispatches,
 /// runs the existing shutdown path to wake blocked reads, and then waits for those
-/// reads before destroying the WDFDEVICE-backed Device allocation.
+/// reads before destroying the Box-owned Device allocation.
 struct DispatchGate {
     /// Serializes the short admission/closure transition. It is held only
     /// while counters and admission flags are updated; readers never wait for
     /// Device work while holding it.
     admission_lock: RwSpinLock<()>,
-    /// Counts the instructions in every admitted preprocess callback, including
-    /// callbacks that arrive after admission has closed and only complete their
-    /// IRP. This is separate from the Device-access counters below.
+    /// Keeps callback code alive for every preprocess callback that acquires
+    /// rundown, including callbacks that arrive after Device admission has closed
+    /// and only complete their IRP. This is separate from the Device-access
+    /// counters below.
     dispatch_lifetime: UnsafeCell<EX_RUNDOWN_REF>,
     lifetime_initialized: AtomicBool,
     unloading: AtomicBool,
@@ -400,9 +399,8 @@ pub unsafe extern "system" fn driver_entry(
     let device = match device::Device::new(&driver) {
         Ok(device) => Box::new(device),
         Err(err) => {
-            // Device::new may have registered WFP callbacks before a later
-            // initialization step failed.  Close admission even on this error
-            // path so no callback can outlive the temporary FilterEngine state.
+            // No WFP callbacks have been registered yet. Close both admission
+            // gates before returning from the failed initialization.
             DISPATCH_GATE.close();
             DISPATCH_GATE.wait_for_all();
             DISPATCH_GATE.wait_for_lifetime();
@@ -470,7 +468,7 @@ pub unsafe extern "system" fn driver_entry(
     STATUS_SUCCESS
 }
 
-// driver_unload function is called when service delete is called from user-space.
+// Called by KMDF when the driver is unloaded, not merely when its service is deleted.
 unsafe extern "system" fn driver_unload(_driver: windows_sys::Win32::Foundation::HANDLE) {
     info!("Unloading driver");
 
@@ -510,7 +508,7 @@ unsafe extern "system" fn driver_unload(_driver: windows_sys::Win32::Foundation:
 
         // No flow context or callback may remain before any Device field is
         // reclaimed. This also closes the defensive late-callback path before
-        // FilterEngine/Injector teardown starts.
+        // Device field destruction starts.
         wdk::callback_barrier::CALLBACK_BARRIER.close_all_and_wait();
         DISPATCH_GATE.wait_for_all();
     } else {
@@ -534,7 +532,7 @@ unsafe extern "system" fn driver_unload(_driver: windows_sys::Win32::Foundation:
             drop(Box::from_raw(ptr));
         }
     }
-    // Device destruction also drains the asynchronous injection handles.
+    // prepare_unload has already drained and destroyed the injection handles.
     #[cfg(feature = "perf-etw")]
     wdk::perf::unregister();
 }
@@ -597,7 +595,7 @@ unsafe extern "system" fn driver_create(
     create_request.complete()
 }
 
-/// driver_cleanup is triggered when user-space closes the last handle to the device.
+/// Triggered when the last handle to a file object is closed (IRP_MJ_CLEANUP).
 unsafe extern "system" fn driver_cleanup(
     _wdf_device: windows_sys::Win32::Foundation::HANDLE,
     irp: *mut IRP,
@@ -658,9 +656,9 @@ unsafe extern "system" fn driver_cleanup(
     cleanup_request.complete()
 }
 
-/// IRP_MJ_CLOSE is a separate lifetime phase from CLEANUP. Complete it through
-/// the driver's own dispatch table so a late file-object deletion never falls
-/// back into KMDF after the WDFDEVICE has begun teardown.
+/// IRP_MJ_CLOSE is a separate lifetime phase from CLEANUP. Complete it in the
+/// driver's KMDF preprocess callback rather than forwarding a late file-object
+/// deletion after the WDFDEVICE has begun teardown.
 unsafe extern "system" fn driver_close(
     _wdf_device: windows_sys::Win32::Foundation::HANDLE,
     irp: *mut IRP,

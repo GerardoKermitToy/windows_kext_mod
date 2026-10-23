@@ -303,10 +303,10 @@ impl IdCache {
     /// are never merged. Other packets are removed and returned for fail-closed
     /// completion after both the cache lock and its outer Device lock are released.
     ///
-    /// The reverse index makes the ordinary one-endpoint path proportional to the
-    /// number of that endpoint's pending requests rather than the size of the global
-    /// queue. No replacement queue is allocated: surviving UDP entries are changed
-    /// in place and other entries are removed directly from the existing deque.
+    /// The reverse index identifies this endpoint's pending request IDs without
+    /// scanning the global queue. Each ID still needs a binary search, and removing
+    /// an entry can shift other deque elements. No replacement queue is allocated:
+    /// surviving UDP entries are changed in place; other entries are removed directly.
     pub fn retire_connection_instances(
         &mut self,
         sorted_instance_ids: &[u64],

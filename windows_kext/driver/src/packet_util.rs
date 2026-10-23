@@ -86,7 +86,8 @@ fn redirect_net_buffer(
 /// This function modifies the packet in-place to change its destination address and port.
 /// It also updates the checksums for the IP and transport layer headers.
 /// If the `unify` parameter is true, it sets the source and destination addresses to be the same.
-/// If the remote address is a loopback address, it sets the source address to the loopback address.
+/// With `unify` disabled, a loopback target also sets the source to 127.0.0.1 or ::1;
+/// otherwise the original source address is preserved.
 fn redirect_outbound_packet(
     packet: &mut [u8],
     remote_address: IpAddress,

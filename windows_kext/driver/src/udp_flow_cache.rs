@@ -121,10 +121,10 @@ impl UdpFlowCache {
         true
     }
 
-    /// Cancels a registration after `FwpsFlowAssociateContext0` failed. WFP never
-    /// owned the context in this case, so flowDeleteFn cannot race this removal.
-    /// The instance check prevents an ABA pointer reuse from reclaiming a newer
-    /// registration at the same allocation address.
+    /// Removes a matching registration so the caller can reclaim its context after
+    /// a failed association or an AlreadyGone result from flow-context removal.
+    /// A mismatched connection-instance ID prevents removal of a registration that
+    /// reused the same allocation address.
     pub fn cancel_registration(&self, flow_context: u64, connection_instance_id: u64) -> bool {
         if flow_context == 0 || connection_instance_id == 0 {
             return false;
@@ -146,10 +146,9 @@ impl UdpFlowCache {
     /// Removing the record before doing callback work makes the record an explicit
     /// in-flight count: unload cannot drop `Device` until `finish_callback` runs.
     /// Cleanup-requested callbacks skip connection and endpoint mutation because
-    /// those cache instances were already found stale. `None` means a duplicate or
-    /// unknown callback whose pointer has already been reclaimed.
-    /// The layer/callout check rejects a delayed callback for an older context if
-    /// the allocator has reused the same address for a different registration.
+    /// those cache instances were already found stale. `None` means no registration
+    /// exists for the pointer, or its layer/callout IDs do not match. Mismatched
+    /// callbacks leave the current registration and in-flight count unchanged.
     pub fn begin_callback(
         &self,
         flow_context: u64,
@@ -228,7 +227,8 @@ impl UdpFlowCache {
     }
 
     /// Returns the registrations still owned by WFP and marks each as requested.
-    /// A record is yielded once; it remains in the map until flowDeleteFn claims it.
+    /// `retry_removal` makes a registration eligible for another removal attempt.
+    /// Records remain until flowDeleteFn or explicit reclamation removes them.
     pub fn pending_removals(&self) -> Vec<UdpFlowRegistration> {
         let _guard = self.lock.write_lock();
         let state = unsafe { &mut *self.state.get() };

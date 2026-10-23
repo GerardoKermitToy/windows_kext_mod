@@ -170,7 +170,7 @@ impl ConnectionCache {
     }
 
     /// Registers PID and TID together under the existing connection-map lock.
-    /// UDP is promoted to native lifecycle only after endpoint association.
+    /// UDP is promoted to native lifecycle after endpoint or flow-context association.
     pub fn register_ale_connection(
         &self,
         key: &Key,
@@ -667,7 +667,7 @@ impl ConnectionCache {
         connections.end_untracked_on_endpoint(key, local_address, process_id)
     }
 
-    /// Ends inactive outbound entries that have no native endpoint or flow callback.
+    /// Ends idle-expirable fallback entries without native endpoint or flow identity.
     pub fn end_inactive_untracked_connections(&self) -> (Vec<ConnectionV4>, Vec<ConnectionV6>) {
         let v4 = {
             let mut connections = self.connections_v4.write_lock();

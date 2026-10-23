@@ -125,9 +125,10 @@ impl<T> PassiveMutex<T> {
 
 impl<T> Drop for PassiveMutex<T> {
     fn drop(&mut self) {
-        // Drop the protected value while the resource is still initialized. The
-        // Device is destroyed at PASSIVE_LEVEL during DriverUnload, which is the
-        // required context for FilterEngine's WFP management teardown.
+        // Always drop the protected value, including after initialization failure;
+        // delete the executive resource below only if it was initialized. The Device
+        // is destroyed at PASSIVE_LEVEL during DriverUnload, which is the required
+        // context for FilterEngine's WFP management teardown.
         unsafe {
             ManuallyDrop::drop(&mut *self.value.get());
             if self.initialized {

@@ -54,11 +54,11 @@ const _: () = {
 
 /// A callback lifetime barrier for the singleton driver instance.
 ///
-/// `callback_lifetime` counts every callback from its first instruction until
-/// return, including callbacks that intentionally bypass Device during startup
-/// or teardown. The other two references control access to Device: classify
-/// admission closes first, while flow-delete admission stays open until unload
-/// has removed every associated flow context.
+/// `callback_lifetime` covers callbacks admitted by `enter_*` while their
+/// returned guards are held, including callbacks that bypass Device during
+/// startup or teardown. The other two references control access to Device:
+/// classify admission closes first, while flow-delete admission stays open
+/// until unload has removed every associated flow context.
 pub struct CallbackBarrier {
     callback_lifetime: UnsafeCell<EX_RUNDOWN_REF>,
     classify: UnsafeCell<EX_RUNDOWN_REF>,

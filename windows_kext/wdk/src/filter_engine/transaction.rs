@@ -4,7 +4,9 @@ use super::{ffi, FilterEngine};
 use alloc::{format, string::String};
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_TXN_READ_ONLY;
 
-/// Transaction guard for Filter Engine. Internally useses a lock. DO NOT USE WITH OTHER LOCKS.
+/// FWPM transaction guard; uncommitted transactions are aborted on drop.
+/// Calls require PASSIVE_LEVEL; a passive-level mutex may serialize access,
+/// but locks that raise IRQL must not be held.
 pub(super) struct Transaction<'a> {
     filter_engine: &'a mut FilterEngine,
     committed: bool,

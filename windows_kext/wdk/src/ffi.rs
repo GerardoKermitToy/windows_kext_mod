@@ -433,7 +433,8 @@ extern "system" {
         flags: u32,
     );
 
-    /// pm_InitDriverObject initialize driver object. This function initializes requerd memory for the device context.
+    /// Creates the non-PnP KMDF driver and control device, registers WDM IRP
+    /// preprocess callbacks, and creates the device symbolic link.
     pub(crate) fn pm_InitDriverObject(
         driver_object: *mut DRIVER_OBJECT,
         registry_path: *mut UNICODE_STRING,
@@ -453,7 +454,8 @@ extern "system" {
     /// Enables I/O delivery only after Rust has published the fully initialized Device.
     pub(crate) fn pm_FinishControlDeviceInitialization(wdf_device: HANDLE);
 
-    /// WdfObjectGetTypedContext 1to1 reference to WdfDeviceWdmGetDeviceObject. The WdfDeviceWdmGetDeviceObject method returns the Windows Driver Model (WDM) device object that is associated with a specified framework device object.
+    /// Wraps WdfDeviceWdmGetDeviceObject and returns the WDM device object
+    /// associated with the specified KMDF device.
     pub(crate) fn pm_GetDeviceObject(wdf_device: HANDLE) -> *mut c_void;
 
     /// The FwpsInjectNetworkSendAsync0 function injects packet data into the send data path.

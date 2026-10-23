@@ -226,9 +226,9 @@ pub struct TransportPacketList {
 }
 
 // The list is moved from classify to the verdict path and then reclaimed by a
-// potentially different CPU in the WFP injection completion callback. All raw
-// pointers either target fields in the same pinned Box or native NBL state whose
-// ownership moves with this value.
+// potentially different CPU in the WFP injection completion callback. After
+// boxing, raw pointers target fields in that stable Box, its separately owned
+// control-data allocation, or native NBL state whose ownership moves with it.
 unsafe impl Send for TransportPacketList {}
 
 /// Ownership passed to a network-injection completion callback.
@@ -707,8 +707,8 @@ impl Injector {
         let raw_nbl = boxed.net_buffer_list.nbl;
 
         unsafe {
-            // Populate send_params with pointers into the boxed struct.
-            // These addresses are stable because the Box will not move until freed.
+            // Populate send_params with pointers into the boxed struct and its
+            // owned control-data allocation. Both remain stable until completion.
             let mut control_data_length = 0;
             let control_data: *mut c_void = match &boxed.control_data {
                 Some(cd) => {

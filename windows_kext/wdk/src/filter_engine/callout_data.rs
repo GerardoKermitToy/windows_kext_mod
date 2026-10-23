@@ -28,7 +28,9 @@ enum ClassifyDeferKind {
     Reauthorization,
 }
 
-/// An ALE operation whose native completion context is owned by this wrapper.
+/// Deferred ALE authorization state, optionally carrying an owned packet clone.
+/// Initial authorization owns the `FwpsPendOperation0` completion context;
+/// reauthorization is a marker with no native completion context.
 ///
 /// The private representation prevents safe code from manufacturing a WFP
 /// completion context. Values can be created only from a live [`CalloutData`]
@@ -97,9 +99,9 @@ impl ClassifyDefer {
     /// Completes an ALE operation or returns a saved reauthorization packet.
     ///
     /// This method is callable from a classify callback, including at
-    /// DISPATCH_LEVEL. Reauthorization is deliberately only represented here;
-    /// the caller must invoke the WFP management operation from a
-    /// PASSIVE_LEVEL path after this method returns.
+    /// DISPATCH_LEVEL. It performs no WFP management work. For a user-space
+    /// reauthorization verdict, the PASSIVE_LEVEL verdict path resets the
+    /// filters before consuming this value.
     pub fn complete(self, inject_packet: bool) -> Result<Option<TransportPacketList>, String> {
         match self.kind {
             ClassifyDeferKind::Initial(context) => {
@@ -481,9 +483,9 @@ impl<'a> CalloutData<'a> {
 
 impl Drop for CalloutData<'_> {
     fn drop(&mut self) {
-        // A classify callback starts with a provisional fail-closed action. If
-        // control returns without an explicit final action, make that default
-        // block hard so an early error/return cannot let a lower filter permit it.
+        // If the handler selected a provisional fail-closed action and did not
+        // replace it with an explicit final action, make that block hard before
+        // returning so a lower-priority filter cannot turn it into permit.
         if self.provisional_block {
             self.classify_out.clear_write_flag();
         }

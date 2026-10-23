@@ -100,9 +100,9 @@ fn get_datagram_payload_length(data: &CalloutData, direction: Direction) -> usiz
 /// Returns true if the net buffer list of this indication is a copy that the
 /// driver re-injected itself.
 ///
-/// Only the *first* packet of a connection is absorbed and re-injected: it is
-/// pended while Portmaster decides a verdict. Once the verdict is cached, later
-/// packets are permitted in place and never re-injected.
+/// Pending packets are absorbed and re-injected when accepted. Temporary verdicts
+/// can repeat this path for later packets, and cached redirects also re-inject
+/// packets after rewriting them. Cached PermanentAccept traffic passes in place.
 ///
 /// The caller must combine this with the direction, because the meaning of a
 /// self-injected copy differs per direction:

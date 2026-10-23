@@ -86,8 +86,8 @@ pub fn ip_packet_layer_inbound_v6(data: CalloutData) {
 ///
 /// `NdisRetreatNetBufferDataStart` can fail, so the amount accepted from WFP
 /// metadata is bounded and the retreat result is propagated to the caller. IPv4
-/// headers cap at 60 bytes (IHL is 4 bits of 32-bit words); IPv6 base plus a
-/// realistic extension header chain is bounded well below this.
+/// headers cap at 60 bytes; IPv6 extension chains can exceed this defensive limit.
+/// Out-of-range metadata falls back to the base header size below.
 const MAX_IP_HEADER_RETREAT: u32 = 128;
 
 /// Retreats an inbound net buffer to the start of the IP header.
@@ -316,10 +316,9 @@ fn ip_packet_layer(
         // ALE layers and are reported with PID 0 unless packet-specific attribution
         // below can resolve their originator.
         //
-        // For an outbound packet the originator is available anyway, from the
-        // thread this callout runs on. An application sending an echo request
-        // travels down the stack synchronously on its own thread, so the current
-        // process *is* the sender.
+        // For an outbound ICMP echo request, capture the sender's identity from
+        // the current thread. Such requests normally travel down the stack
+        // synchronously on the application's own thread.
         //
         // Measured on Windows 11 with three concurrent `ping` processes: every
         // outbound ICMP indication carried the PID of the process that sent it, and

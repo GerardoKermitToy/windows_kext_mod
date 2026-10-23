@@ -12,8 +12,8 @@ use crate::{
     ipv6_packet::{walk_ipv6_headers_reader, PacketData},
 };
 
-/// Prefix large enough for the IPv6 base header, the bounded extension-header
-/// chain and every transport field inspected by the packet callout.
+/// Maximum packet prefix inspected by the packet callout. IPv6 extension chains
+/// or quoted headers that exceed this budget cannot be fully inspected.
 pub(crate) const MAX_PACKET_INSPECT_LEN: usize = 128;
 
 const IPV4_MAX_HEADER_LEN: usize = 60;

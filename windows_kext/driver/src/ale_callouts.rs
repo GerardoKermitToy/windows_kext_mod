@@ -181,11 +181,8 @@ pub fn ale_layer_connect_v6(data: CalloutData) {
         local_port: data.get_value_u16(Fields::IpLocalPort as usize),
         remote_ip: get_ipv6_address(&data, Fields::IpRemoteAddress as usize),
         remote_port: data.get_value_u16(Fields::IpRemotePort as usize),
-        // Read only when actually populated. WFP reports SubInterfaceIndex as
-        // FWP_EMPTY at the connect authorization layer - there is no interface
-        // binding yet at that point - so reading it unconditionally returned
-        // whatever the union held, and that value went on to be used as an
-        // injection parameter. The v4 path already passes zeros here.
+        // Read populated FWP_UINT32 interface fields and use zero for absent or
+        // mistyped values, matching the IPv4 path.
         interface_index: get_u32_or_zero(&data, Fields::InterfaceIndex as usize),
         sub_interface_index: get_u32_or_zero(&data, Fields::SubInterfaceIndex as usize),
     };
@@ -372,9 +369,11 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
         return;
     }
 
-    // Network-layer reinjection is used by the packet path, while packets held at
-    // ALE receive/accept are returned with the transport injector. Either kind can
-    // be indicated here again and must be permitted without creating another pend.
+    // Network-layer reinjection is used by the packet path and loopback ALE
+    // receive/accept; other ALE receive/accept clones use the transport injector.
+    // Either path can be indicated here again. Permit self-injection without
+    // another pend unless inbound loopback TCP/UDP still needs receive/accept
+    // authorization.
     // Keep foreign injection distinct: it is handled below at the packet layer
     // without binding the injector's shared raw endpoint to an application flow.
     let layer_data = data.get_layer_data();
@@ -675,12 +674,14 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
                 }
             }
             Verdict::PermanentBlock | Verdict::Undeterminable | Verdict::Failed => {
-                // Packet layer will not see this connection.
+                // Reject at ALE. Outbound traffic will not continue to the packet
+                // layer; inbound traffic may already have passed it.
                 crate::dbg!("permanent block {}", key);
                 data.action_block_hard();
             }
             Verdict::PermanentDrop => {
-                // Packet layer will not see this connection.
+                // Reject at ALE. Outbound traffic will not continue to the packet
+                // layer; inbound traffic may already have passed it.
                 crate::dbg!("permanent drop {}", key);
                 data.block_and_absorb();
             }
@@ -1032,8 +1033,10 @@ pub(crate) fn reclaim_udp_flow_context(
 
 /// Associates the cached UDP tuple with WFP's native ALE-flow lifetime.
 ///
-/// Endpoint lifetime tracking is established independently at authorization and
-/// remains valid even if WFP rejects this flow-context association.
+/// Any endpoint lifetime tracking established independently at authorization
+/// remains valid if WFP rejects this flow-context association. When endpoint
+/// metadata is absent, successful flow association can provide native lifetime
+/// tracking instead.
 ///
 /// The registration table owns the identifiers needed to retire stale contexts
 /// during periodic cleanup and to remove every remaining context during unload.
@@ -1290,8 +1293,8 @@ fn end_udp_endpoint(device: &Device, endpoint_handle: u64, process_id: u64) -> b
         return false;
     };
 
-    // Keep the common one-peer socket closure allocation-free. The batch path
-    // below is for sockets that accumulated several remote tuples.
+    // Avoid the batch path's temporary peer and instance-ID vectors for a one-peer
+    // socket. Connection-end event serialization still allocates.
     if let [peer] = endpoint.as_slice() {
         if unlikely(peer.key.is_ipv6()) {
             if let Some(conn) = device
@@ -1779,10 +1782,10 @@ pub fn ale_flow_established_monitor(data: CalloutData) {
     if matches!(key.protocol, IpProtocol::Udp) {
         let endpoint_handle = transport_endpoint_handle(&data);
         // Authorization normally records the exact cache instance under the
-        // endpoint handle. A packet-layer fallback has no such association yet;
-        // FLOW_ESTABLISHED is its one safe opportunity to acquire the endpoint and
-        // native flow identity. Only an explicitly untracked exact tuple may use
-        // that fallback, so a tracked replacement is never claimed by lookup alone.
+        // endpoint handle. If that handle has no live association, only an
+        // explicitly untracked exact tuple may supply the fallback instance.
+        // Without endpoint metadata, use the ordinary live connection lookup
+        // before associating the flow context.
         let connection_instance_id = if let Some(endpoint_handle) = endpoint_handle {
             let associated = {
                 let endpoint_cache = device.udp_endpoint_cache.read_lock();

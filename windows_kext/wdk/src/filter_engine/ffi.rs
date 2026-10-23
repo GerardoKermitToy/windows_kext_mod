@@ -28,7 +28,7 @@ use windows_sys::{
 
 use super::layer::Layer;
 
-// Management objects are zero-initialized in Rust and passed by value to FWPM,
+// Management objects are zero-initialized in Rust and passed by pointer to FWPM,
 // so both their complete x64 size and every populated field offset must match
 // the WDK rather than merely sharing a compatible prefix.
 #[cfg(target_pointer_width = "64")]
@@ -296,7 +296,7 @@ pub(crate) fn register_filter(
         let mut filter: FWPM_FILTER0 = MaybeUninit::zeroed().assume_init();
         filter.displayData.name = name.as_ptr() as _;
         filter.displayData.description = description.as_ptr() as _;
-        filter.action.r#type = action; // Says this filter's callout MUST make a block/permit decision. Also see doc excerpts below.
+        filter.action.r#type = action; // Use the caller-supplied callout action type (terminating or inspection).
         filter.subLayerKey = GUID::from_u128(sublayer_guid);
         filter.weight.r#type = FWP_UINT8;
         filter.weight.Anonymous.uint8 = 15; // The weight of this filter within its sublayer

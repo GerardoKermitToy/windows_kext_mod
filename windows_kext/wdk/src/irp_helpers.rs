@@ -200,9 +200,8 @@ impl CleanupRequest {
 
 /// Wraps an IRP_MJ_CLOSE request.
 ///
-/// The driver supplies a raw WDM dispatch table for its WDF control device, so
-/// CLOSE must be completed by the same table rather than falling back to KMDF's
-/// device dispatch after driver-owned teardown has begun.
+/// The driver handles CLOSE in a KMDF WDM IRP preprocess callback and
+/// completes it there, including when driver-owned teardown has begun.
 pub struct CloseRequest {
     irp: IrpPtr,
 }

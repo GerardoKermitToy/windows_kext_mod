@@ -213,10 +213,11 @@ impl TcpEndpointCache {
     /// already tracked handle is rejected: replacing it could let an old closure
     /// consume a newer connection generation.
     ///
-    /// A zero timestamp exempts a newly associated endpoint from timeout cleanup
-    /// without declaring it established. Use it when first seen at outbound
-    /// reauthorization: an active flow will not produce another FLOW_ESTABLISHED.
-    /// Native resource release and endpoint closure still retire that generation.
+    /// A zero timestamp does not itself start a timeout or mark an endpoint
+    /// established. A timed, unestablished alias can still expire the whole
+    /// generation. Use zero when first seen at outbound reauthorization: an active
+    /// flow will not produce another FLOW_ESTABLISHED. Native resource release and
+    /// endpoint closure still retire that generation.
     pub fn associate_instance_at(
         &mut self,
         endpoint_handle: u64,
