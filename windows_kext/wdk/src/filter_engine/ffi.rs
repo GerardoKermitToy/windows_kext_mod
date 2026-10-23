@@ -1,8 +1,10 @@
 use crate::alloc::borrow::ToOwned;
 use crate::ffi::FwpsCalloutClassifyFn;
 use crate::ffi::{
-    FwpsCalloutRegister3, FwpsCalloutUnregisterById0, FwpsCalloutUnregisterByKey0, FWPS_CALLOUT3,
-    FWPS_FILTER3,
+    FwpmCalloutAdd0, FwpmEngineClose0, FwpmEngineOpen0, FwpmFilterAdd0, FwpmFilterDeleteById0,
+    FwpmSubLayerAdd0, FwpmSubLayerDeleteByKey0, FwpmTransactionAbort0, FwpmTransactionBegin0,
+    FwpmTransactionCommit0, FwpsCalloutRegister3, FwpsCalloutUnregisterById0,
+    FwpsCalloutUnregisterByKey0, FWPS_CALLOUT3, FWPS_FILTER3,
 };
 use crate::utils::check_ntstatus;
 use alloc::string::String;
@@ -14,9 +16,7 @@ use widestring::U16CString;
 
 use windows_sys::Win32::Foundation::{NTSTATUS, STATUS_SUCCESS};
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
-    FwpmCalloutAdd0, FwpmEngineClose0, FwpmEngineOpen0, FwpmFilterAdd0, FwpmFilterDeleteById0,
-    FwpmSubLayerAdd0, FwpmSubLayerDeleteByKey0, FwpmTransactionAbort0, FwpmTransactionBegin0,
-    FwpmTransactionCommit0, FWPM_CALLOUT0, FWPM_CALLOUT_FLAG_USES_PROVIDER_CONTEXT,
+    FWPM_CALLOUT0, FWPM_CALLOUT_FLAG_USES_PROVIDER_CONTEXT,
     FWPM_CONDITION_IP_PROTOCOL, FWPM_DISPLAY_DATA0, FWPM_FILTER0, FWPM_FILTER_CONDITION0,
     FWPM_SESSION0, FWPM_SESSION_FLAG_DYNAMIC, FWPM_SUBLAYER0, FWP_MATCH_EQUAL, FWP_UINT8,
 };
@@ -116,7 +116,7 @@ pub(crate) fn create_filter_engine() -> Result<HANDLE, String> {
             &wdf_session,
             &mut handle,
         );
-        check_ntstatus(status as i32)?;
+        check_ntstatus(status)?;
         if handle.is_null() || handle == INVALID_HANDLE_VALUE {
             return Err("filter engine returned an invalid session handle".to_owned());
         }
@@ -147,7 +147,7 @@ pub(crate) fn register_sublayer(
         sublayer.weight = 0xFFFF; // Set to Max value. Weight compared to other sublayers.
 
         let status = FwpmSubLayerAdd0(filter_engine_handle, &sublayer, core::ptr::null_mut());
-        check_ntstatus(status as i32)?;
+        check_ntstatus(status)?;
 
         return Ok(());
     }
@@ -157,7 +157,7 @@ pub(crate) fn unregister_sublayer(filter_engine_handle: HANDLE, guid: u128) -> R
     let guid = GUID::from_u128(guid);
     unsafe {
         let status = FwpmSubLayerDeleteByKey0(filter_engine_handle, ptr::addr_of!(guid));
-        check_ntstatus(status as i32)?;
+        check_ntstatus(status)?;
         return Ok(());
     }
 }
@@ -244,7 +244,7 @@ fn callout_add(
             core::ptr::null_mut(),
             core::ptr::null_mut(),
         );
-        check_ntstatus(status as i32)?;
+        check_ntstatus(status)?;
     };
     return Ok(());
 }
@@ -324,7 +324,7 @@ pub(crate) fn register_filter(
             &mut filter_id,
         );
 
-        check_ntstatus(status as i32)?;
+        check_ntstatus(status)?;
         if filter_id == 0 {
             return Err("WFP returned a zero filter ID".to_owned());
         }
@@ -339,7 +339,7 @@ pub(crate) fn unregister_filter(
 ) -> Result<(), String> {
     unsafe {
         let status = FwpmFilterDeleteById0(filter_engine_handle, filter_id);
-        check_ntstatus(status as i32)?;
+        check_ntstatus(status)?;
         return Ok(());
     }
 }
@@ -347,7 +347,7 @@ pub(crate) fn unregister_filter(
 pub(crate) fn filter_engine_close(filter_engine_handle: HANDLE) -> Result<(), String> {
     unsafe {
         let status = FwpmEngineClose0(filter_engine_handle);
-        check_ntstatus(status as i32)?;
+        check_ntstatus(status)?;
         return Ok(());
     }
 }
@@ -358,7 +358,7 @@ pub(crate) fn filter_engine_transaction_begin(
 ) -> Result<(), String> {
     unsafe {
         let status = FwpmTransactionBegin0(filter_engine_handle, flags);
-        check_ntstatus(status as i32)?;
+        check_ntstatus(status)?;
         return Ok(());
     }
 }
@@ -366,7 +366,7 @@ pub(crate) fn filter_engine_transaction_begin(
 pub(crate) fn filter_engine_transaction_commit(filter_engine_handle: HANDLE) -> Result<(), String> {
     unsafe {
         let status = FwpmTransactionCommit0(filter_engine_handle);
-        check_ntstatus(status as i32)?;
+        check_ntstatus(status)?;
         return Ok(());
     }
 }
@@ -374,7 +374,7 @@ pub(crate) fn filter_engine_transaction_commit(filter_engine_handle: HANDLE) -> 
 pub(crate) fn filter_engine_transaction_abort(filter_engine_handle: HANDLE) -> Result<(), String> {
     unsafe {
         let status = FwpmTransactionAbort0(filter_engine_handle);
-        check_ntstatus(status as i32)?;
+        check_ntstatus(status)?;
         return Ok(());
     }
 }

@@ -18,6 +18,8 @@ import threading
 import time
 import traceback
 
+from monitor_window import start_monitor, check_monitor, wait_for_cleanup
+
 ROOT = Path(__file__).resolve().parents[2]
 CLIENT = r'''
 import json, os, socket, sys, time
@@ -54,7 +56,7 @@ with socket.socket(f, socket.SOCK_DGRAM) as s:
 print(json.dumps(meta), flush=True)
 '''
 CONN = re.compile(
-    r'\[CONN v[46]\] id=(\d+) pid=(\d+) (\w+) proto=17\(UDP\) layer=\d+\([^)]*\)\r?\n'
+    r'\[CONN v[46]\] id=(\d+) pid=(\d+) (?:tid=\d+ )?(\w+) proto=17\(UDP\) layer=\d+\([^)]*\)\r?\n'
     r'\s+(\S+):(\d+) -> (\S+):(\d+)\s+payload=\d+ bytes\r?\n'
     r'(?:\s+payload: (?:[0-9a-f]+|\(none\))\r?\n)?'
     r'\s+-> verdict (\w+) sent'
@@ -65,7 +67,7 @@ END = re.compile(r'\[END\s+v[46]\] pid=(\d+) (\w+) proto=17\(UDP\) (\S+):(\d+) -
 def owners():
     result = subprocess.run([
         'powershell.exe', '-NoProfile', '-Command',
-        "Get-Process | Where-Object ProcessName -eq kext_monitor | ForEach-Object { 'monitor=' + $_.Id }; "
+        "Add-Type -AssemblyName System.ServiceProcess; Get-Process | Where-Object ProcessName -eq kext_monitor | ForEach-Object { 'monitor=' + $_.Id }; "
         "([System.ServiceProcess.ServiceController]::GetServices() + "
         "[System.ServiceProcess.ServiceController]::GetDevices()) | Where-Object ServiceName -eq PortmasterKext | "
         "ForEach-Object { 'service=' + $_.Status }; exit 0",
@@ -174,7 +176,7 @@ def main():
         assert not any(matches(event, 'inbound', remote, port, local, meta['port']) for event in all_ends), 'live listener ended'
         return dict(connections=client_connections, ends=client_ends)
 
-    duration = args.repeats * 3 + 10
+    duration = args.repeats * 3 + 20
     command = [str(args.monitor.resolve()), '--duration', str(duration), '--poll', '200', '--timestamps',
                '--payload', '--no-bandwidth', '--filter-ip', remote, '--out', str(records.resolve())]
     if args.verdict != 'permanent':
@@ -186,7 +188,7 @@ def main():
     worker = threading.Thread(target=serve, daemon=True)
     worker.start()
     with console.open('w', encoding='utf-8') as output:
-        monitor = subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT)
+        monitor = start_monitor(command, stdout=output, stderr=subprocess.STDOUT)
         try:
             deadline = time.monotonic() + 8
             while f'Running for {duration} second(s)' not in console.read_text(errors='replace'):
@@ -195,7 +197,7 @@ def main():
                 time.sleep(0.1)
             local_port = 0
             for index in range(args.repeats):
-                assert monitor.poll() is None, 'monitor duration ended during test'
+                check_monitor(monitor, minimum_seconds=4)
                 assert not diagnostics(), diagnostics()
                 offset = len(text())
                 recipe = dict(ipv6=args.ipv6, local=local, remote=remote, server_port=port,
@@ -227,7 +229,23 @@ def main():
             worker.join(1)
             server.close()
             worker.join(3)
-            code = monitor.wait(timeout=duration + 60)
+            if failure is None:
+                try:
+                    deadline = time.monotonic() + 5
+                    while True:
+                        check_monitor(monitor)
+                        _, ends = events()
+                        expected = {case['client']['port'] for case in cases}
+                        closed = {event['rp'] for event in ends
+                                  if event['direction'] == 'inbound' and event['local'] == remote
+                                  and event['lp'] == port and event['pid'] == os.getpid()}
+                        if expected <= closed:
+                            break
+                        assert time.monotonic() < deadline, 'Missing server END while driver loaded'
+                        time.sleep(0.05)
+                except Exception:
+                    failure = traceback.format_exc()
+            code = wait_for_cleanup(monitor, timeout=duration + 60)
 
     if not failure:
         try:

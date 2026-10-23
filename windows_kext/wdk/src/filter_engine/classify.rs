@@ -96,6 +96,21 @@ impl ClassifyOut {
         (self.action_type as u64, self.flags as u64)
     }
 
+    /// Bypass an inactive callout without violating its filter's action contract.
+    /// Terminating callouts must explicitly permit; inspection callouts continue.
+    /// Leave action-write rights intact so another provider can still veto traffic.
+    pub(super) fn bypass_callout(&mut self, filter_action: u32) {
+        if !self.can_set_action() {
+            return;
+        }
+        if filter_action == FWP_ACTION_CALLOUT_TERMINATING {
+            self.action_permit();
+        } else {
+            self.action_continue();
+        }
+        self.clear_absorb_flag();
+    }
+
     // Checks if write action flag is set. Indicates if the callout can change the action.
     pub fn can_set_action(&self) -> bool {
         self.rights & FWPS_RIGHT_ACTION_WRITE > 0
@@ -137,5 +152,64 @@ impl ClassifyOut {
     // Clear the write flag permission. Next filter in the chain will not change the action.
     pub fn clear_write_flag(&mut self) {
         self.rights &= !FWPS_RIGHT_ACTION_WRITE;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inactive_terminating_callout_permits_without_absorbing() {
+        let mut output = ClassifyOut::test_writable();
+        output.action_block();
+        output.set_absorb();
+        output.bypass_callout(FWP_ACTION_CALLOUT_TERMINATING);
+        assert!(output.test_is_permit());
+        assert!(!output.test_absorbs());
+        assert!(output.can_set_action());
+    }
+
+    #[test]
+    fn inactive_inspection_and_unknown_callouts_continue() {
+        for filter_action in [FWP_ACTION_CALLOUT_INSPECTION, FWP_ACTION_CALLOUT_UNKNOWN] {
+            let mut output = ClassifyOut::test_writable();
+            output.action_block();
+            output.set_absorb();
+            output.bypass_callout(filter_action);
+            assert_eq!(output.action_type, FWP_ACTION_CONTINUE);
+            assert!(!output.test_absorbs());
+            assert!(output.can_set_action());
+        }
+    }
+
+    #[test]
+    fn bypass_does_not_override_a_nonwritable_block() {
+        for filter_action in [FWP_ACTION_CALLOUT_TERMINATING, FWP_ACTION_CALLOUT_INSPECTION] {
+            let mut output = ClassifyOut::test_writable();
+            output.action_block();
+            output.set_absorb();
+            output.clear_write_flag();
+            output.bypass_callout(filter_action);
+            assert!(output.test_is_block());
+            assert!(output.test_absorbs());
+            assert!(!output.can_set_action());
+        }
+    }
+
+    #[test]
+    fn bypass_preserves_other_classify_fields_and_flags() {
+        let mut output = ClassifyOut::test_writable();
+        output._out_context = 17;
+        output._filter_id = 42;
+        output.reserved = 23;
+        output.rights |= 0x80;
+        output.flags = FWPS_CLASSIFY_OUT_FLAG_ABSORB | 0x80;
+        output.bypass_callout(FWP_ACTION_CALLOUT_TERMINATING);
+        assert_eq!(output._out_context, 17);
+        assert_eq!(output._filter_id, 42);
+        assert_eq!(output.reserved, 23);
+        assert_eq!(output.rights, FWPS_RIGHT_ACTION_WRITE | 0x80);
+        assert_eq!(output.flags, 0x80);
     }
 }

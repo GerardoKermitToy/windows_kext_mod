@@ -45,15 +45,17 @@ while it is running does not change its behavior. See
 
 ## Special ports
 
-The monitor always writes `IgnoreSpecialPorts=1` as a `REG_DWORD` in
-`HKLM\SYSTEM\CurrentControlSet\Services\PortmasterKext\Parameters` before starting
-it. Ports `PM_DNS_PORT`, `PM_SPN_PORT`, and `PM_SPLIT_TUN_PORT` then use normal
-connection processing instead of the driver's port-based special handling. This
-is independent of `--no-inbound-udp-pid-fallback` and has no monitor opt-out flag.
+The monitor does not write `IgnoreSpecialPorts` in
+`HKLM\SYSTEM\CurrentControlSet\Services\PortmasterKext\Parameters` and has no
+command-line option for this setting. `--no-inbound-udp-pid-fallback` controls only
+`EnableInboundUdpCacheMissPidFallback`; it does not change special-port handling.
 
-The driver reads this value once at load. When started by another controller,
-an absent/invalid value or any DWORD other than `1` preserves special handling.
-See [the driver setting documentation](../windows_kext/IGNORE_SPECIAL_PORTS.md).
+The driver reads this value once at load. Only `REG_DWORD` value `1`
+disables port-based special handling for `PM_DNS_PORT` (53), `PM_SPN_PORT` (717),
+and `PM_SPLIT_TUN_PORT` (719), treating them as ordinary ports. An absent/invalid
+value or any DWORD other than `1` preserves special handling, including when
+started by the monitor. Changing the value while loaded has no effect until the
+next driver load. See [the driver setting documentation](../windows_kext/IGNORE_SPECIAL_PORTS.md).
 
 ## Connection thread IDs
 

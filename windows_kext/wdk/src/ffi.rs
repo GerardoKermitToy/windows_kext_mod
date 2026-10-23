@@ -8,10 +8,12 @@ use windows_sys::{
     Win32::{
         Foundation::{BOOLEAN, HANDLE, NTSTATUS, UNICODE_STRING},
         NetworkManagement::WindowsFilteringPlatform::{
-            FWPM_PROVIDER_CONTEXT3, FWP_CONDITION_VALUE0, FWP_MATCH_TYPE, FWP_VALUE0,
+            FWPM_CALLOUT0, FWPM_FILTER0, FWPM_PROVIDER_CONTEXT3, FWPM_SESSION0, FWPM_SUBLAYER0,
+            FWP_CONDITION_VALUE0, FWP_MATCH_TYPE, FWP_VALUE0,
         },
         Networking::WinSock::{ADDRESS_FAMILY, SCOPE_ID},
-        System::Kernel::COMPARTMENT_ID,
+        Security::PSECURITY_DESCRIPTOR,
+        System::{Kernel::COMPARTMENT_ID, Rpc::SEC_WINNT_AUTH_IDENTITY_W},
     },
 };
 
@@ -74,6 +76,12 @@ pub(crate) struct FWPS_FILTER3 {
     pub(crate) action: FWPS_ACTION0,
     pub(crate) context: u64,
     pub(crate) providerContext: *mut FWPM_PROVIDER_CONTEXT3,
+}
+
+impl FWPS_FILTER3 {
+    pub(crate) fn action_type(&self) -> u32 {
+        self.action.r#type
+    }
 }
 
 /// The FWPS_CALLOUT3 structure defines the data that is required for a callout driver to register a callout with the filter engine.
@@ -353,6 +361,45 @@ const _: () = {
 // #[link(name = "ndis", kind = "static")]
 #[link(name = "c_helper", kind = "static")]
 extern "system" {
+    // fwpmk.h exports from fwpkclnt.sys return NTSTATUS. Do not use the
+    // DWORD-returning fwpmu.h declarations from windows-sys for kernel calls.
+    pub(crate) fn FwpmEngineOpen0(
+        serverName: PCWSTR,
+        authnService: u32,
+        authIdentity: *mut SEC_WINNT_AUTH_IDENTITY_W,
+        session: *const FWPM_SESSION0,
+        engineHandle: *mut HANDLE,
+    ) -> NTSTATUS;
+
+    pub(crate) fn FwpmEngineClose0(engineHandle: HANDLE) -> NTSTATUS;
+
+    pub(crate) fn FwpmSubLayerAdd0(
+        engineHandle: HANDLE,
+        subLayer: *const FWPM_SUBLAYER0,
+        sd: PSECURITY_DESCRIPTOR,
+    ) -> NTSTATUS;
+
+    pub(crate) fn FwpmSubLayerDeleteByKey0(engineHandle: HANDLE, key: *const GUID) -> NTSTATUS;
+
+    pub(crate) fn FwpmCalloutAdd0(
+        engineHandle: HANDLE,
+        callout: *const FWPM_CALLOUT0,
+        sd: PSECURITY_DESCRIPTOR,
+        id: *mut u32,
+    ) -> NTSTATUS;
+
+    pub(crate) fn FwpmFilterAdd0(
+        engineHandle: HANDLE,
+        filter: *const FWPM_FILTER0,
+        sd: PSECURITY_DESCRIPTOR,
+        id: *mut u64,
+    ) -> NTSTATUS;
+
+    pub(crate) fn FwpmFilterDeleteById0(engineHandle: HANDLE, id: u64) -> NTSTATUS;
+    pub(crate) fn FwpmTransactionBegin0(engineHandle: HANDLE, flags: u32) -> NTSTATUS;
+    pub(crate) fn FwpmTransactionCommit0(engineHandle: HANDLE) -> NTSTATUS;
+    pub(crate) fn FwpmTransactionAbort0(engineHandle: HANDLE) -> NTSTATUS;
+
     /// The FwpsCalloutUnregisterById0 function unregisters a callout from the filter engine.
     pub(crate) fn FwpsCalloutUnregisterById0(id: u32) -> NTSTATUS;
 

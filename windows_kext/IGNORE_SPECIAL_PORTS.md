@@ -18,11 +18,14 @@ driver is running has no effect until it is unloaded and loaded again.
 
 ## Monitor behavior
 
-`kext_monitor` always writes `IgnoreSpecialPorts=1` before starting the driver.
-There is no opt-out flag for this setting. It is independent of
-`--no-inbound-udp-pid-fallback`, which controls only
-`EnableInboundUdpCacheMissPidFallback`. If either registry write fails, the
-monitor reports the error and does not start the driver.
+`kext_monitor` does not write `IgnoreSpecialPorts` and has no command-line option
+for it. The driver uses the value available when it loads; an absent or invalid
+value preserves special handling, as described above.
+
+`--no-inbound-udp-pid-fallback` controls only
+`EnableInboundUdpCacheMissPidFallback`, which the monitor does write before
+starting the driver. If that write fails, the monitor reports the error and does
+not start the driver; there is no `IgnoreSpecialPorts` write in this path.
 
 For a bounded run from the repository root:
 

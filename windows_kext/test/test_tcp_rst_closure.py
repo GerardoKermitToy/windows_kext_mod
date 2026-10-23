@@ -20,6 +20,8 @@ import threading
 import time
 import traceback
 
+from monitor_window import start_monitor, check_monitor, wait_for_cleanup
+
 ROOT = Path(__file__).resolve().parents[2]
 CLIENT = r'''
 import json, os, socket, struct, sys, time
@@ -65,7 +67,7 @@ CONN = re.compile(
 def owners():
     result = subprocess.run([
         'powershell.exe', '-NoProfile', '-Command',
-        "Get-Process | Where-Object ProcessName -eq kext_monitor | ForEach-Object { 'monitor=' + $_.Id }; "
+        "Add-Type -AssemblyName System.ServiceProcess; Get-Process | Where-Object ProcessName -eq kext_monitor | ForEach-Object { 'monitor=' + $_.Id }; "
         "([System.ServiceProcess.ServiceController]::GetServices() + [System.ServiceProcess.ServiceController]::GetDevices()) | "
         "Where-Object ServiceName -eq PortmasterKext | "
         "ForEach-Object { 'service=' + $_.Status }; exit 0",
@@ -216,7 +218,7 @@ def main():
                        for event in CONN.finditer(data)), 'missing matching redirect verdict'
         return dict(ends=ends, rst_request_ids=resets)
 
-    duration = args.repeats + 10
+    duration = args.repeats * 4 + 20
     command = [str(args.monitor.resolve()), '--duration', str(duration), '--poll', '200', '--timestamps',
                '--payload', '--no-bandwidth', '--filter-ip', local if redirect else remote, '--out', str(records.resolve())]
     if args.verdict != 'permanent':
@@ -231,7 +233,7 @@ def main():
     worker = threading.Thread(target=serve, daemon=True)
     worker.start()
     with console.open('w', encoding='utf-8') as output:
-        monitor = subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT)
+        monitor = start_monitor(command, stdout=output, stderr=subprocess.STDOUT)
         try:
             deadline = time.monotonic() + 8
             while f'Running for {duration} second(s)' not in console.read_text(errors='replace'):
@@ -240,7 +242,7 @@ def main():
                 time.sleep(0.1)
             local_port = 0
             for index in range(args.repeats):
-                assert monitor.poll() is None, 'monitor duration ended during test'
+                check_monitor(monitor, minimum_seconds=4)
                 offset = len(text())
                 recipe = dict(ipv6=args.ipv6, local=local, remote=remote, server_port=client_port,
                               port=local_port if args.reuse_port else 0, reuse=args.reuse_port,
@@ -283,7 +285,7 @@ def main():
             if original is not None:
                 original.close()
             worker.join(5)
-            code = monitor.wait(timeout=duration + 45)
+            code = wait_for_cleanup(monitor, timeout=duration + 45)
     remaining = owners()
     problems = [line for line in text().splitlines()
                 if re.search(r'\[LOG\s+(?:ERROR|WARN|CRIT)|\[WARN\]|verdict FAILED', line)]

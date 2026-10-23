@@ -18,7 +18,9 @@ import subprocess
 import time
 import traceback
 
-from test_tcp_rst_closure import owners, receive_exact
+from monitor_window import start_monitor, check_monitor, wait_for_cleanup
+
+from test_tcp_rst_closure import owners
 
 ROOT = Path(__file__).resolve().parents[2]
 CONN = re.compile(
@@ -90,8 +92,8 @@ def main():
         listener.listen(args.repeats)
         listener.settimeout(4)
         port = listener.getsockname()[1]
-        # No driver owns these sockets yet. Native echo verifies both directions
-        # and the exact peer before the later reauthorization/reset is exercised.
+        # Establish the fixture before loading filters; exercise only the reset
+        # after the monitor confirms that the driver is loaded.
         for index in range(args.repeats):
             client = socket.socket(family, socket.SOCK_STREAM)
             pairs.append((client, None))
@@ -106,27 +108,23 @@ def main():
             assert str(ipaddress.ip_address(address[0])) == local
             assert str(ipaddress.ip_address(client.getpeername()[0])) == remote
             assert client.getpeername()[1] == port
-            payload = ('native-reset-control-%d' % index).encode()
-            client.sendall(payload)
-            assert receive_exact(server, len(payload)) == payload
-            server.sendall(payload)
-            assert receive_exact(client, len(payload)) == payload
             observations.append(dict(index=index, pid=os.getpid(), local=client.getsockname(),
-                                     remote=client.getpeername(), native_echo=True))
+                                     remote=client.getpeername(), preexisting_connection_established=True))
         time.sleep(0.15)
-        assert not owners(), 'driver owner appeared during native controls'
+        assert not owners(), 'driver owner appeared during fixture setup'
         match = f'[{remote}]:{port}' if args.ipv6 else f'{remote}:{port}'
         command = [str(args.monitor.resolve()), '--duration', '20', '--poll', '100',
                    '--timestamps', '--no-bandwidth', '--payload', '--verdict', args.verdict,
                    '--match', match, '--verdict-delay-ms', str(args.verdict_delay_ms),
                    '--out', str(records.resolve()), str(args.driver.resolve())]
         with console.open('w', encoding='utf-8') as handle:
-            monitor = subprocess.Popen(command, stdout=handle, stderr=subprocess.STDOUT)
+            monitor = start_monitor(command, stdout=handle, stderr=subprocess.STDOUT)
             deadline = time.monotonic() + 8
             while 'Running for 20 second(s)' not in console.read_text(errors='replace'):
                 assert monitor.poll() is None and time.monotonic() < deadline, console.read_text(errors='replace')
                 time.sleep(0.05)
             for index, (client, server) in enumerate(pairs):
+                check_monitor(monitor, minimum_seconds=4)
                 text = records.read_text(errors='replace') if records.exists() else ''
                 assert not driver_errors(text), driver_errors(text)
                 sender, receiver = (client, server) if args.reset_side == 'client' else (server, client)
@@ -151,7 +149,7 @@ def main():
                     peer.close()
         listener.close()
         if monitor is not None:
-            monitor.wait(timeout=80)
+            wait_for_cleanup(monitor, timeout=80)
     text = records.read_text(errors='replace') if records.exists() else ''
     errors = driver_errors(text)
     remaining = owners()

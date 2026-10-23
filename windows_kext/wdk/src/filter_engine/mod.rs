@@ -328,8 +328,8 @@ unsafe extern "system" fn catch_all_callout(
     // This must be acquired before touching `filter.context`: the Callout box
     // containing that context is owned by Device and is freed during unload.
     // A callback that arrives after admission closes is from a WFP teardown race;
-    // leave the classify result untouched and, most importantly, do not
-    // dereference memory owned by the retiring Device.
+    // bypass it using only WFP-owned arguments, never memory owned by the
+    // retiring Device.
     let Some(callback_admission) =
         crate::callback_barrier::CALLBACK_BARRIER.enter_classify()
     else {
@@ -345,9 +345,10 @@ unsafe extern "system" fn catch_all_callout(
         // SAFETY: WFP supplies either null or a live writable FWPS_CLASSIFY_OUT0
         // for the duration of this classify callback.
         if let Some(classify_out) = unsafe { classify_out.as_mut() } {
-            if classify_out.can_set_action() {
-                classify_out.action_continue();
-                classify_out.clear_absorb_flag();
+            // SAFETY: WFP owns this live filter. Its action contract is readable
+            // without dereferencing the retiring Device through filter.context.
+            if let Some(filter) = unsafe { filter.as_ref() } {
+                classify_out.bypass_callout(filter.action_type());
             }
         }
         return;

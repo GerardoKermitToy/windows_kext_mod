@@ -16,6 +16,8 @@ import sys
 import threading
 import time
 
+from monitor_window import start_monitor, check_monitor, wait_for_cleanup
+
 
 ROOT = Path(__file__).resolve().parents[2]
 CLIENT = """
@@ -34,9 +36,10 @@ def driver_owners():
     result = subprocess.run(
         ["powershell.exe", "-NoProfile", "-Command",
          "$ErrorActionPreference = 'Stop'; "
-         "Get-Process | Where-Object ProcessName -eq kext_monitor | "
+         "Add-Type -AssemblyName System.ServiceProcess; Get-Process | Where-Object ProcessName -eq kext_monitor | "
          "ForEach-Object { 'monitor=' + $_.Id }; "
-         "[System.ServiceProcess.ServiceController]::GetServices() | "
+         "([System.ServiceProcess.ServiceController]::GetServices() + "
+         "[System.ServiceProcess.ServiceController]::GetDevices()) | "
          "Where-Object ServiceName -eq PortmasterKext | "
          "ForEach-Object { 'service=' + $_.Status }; exit 0"],
         capture_output=True, timeout=30,
@@ -116,7 +119,7 @@ def main():
             rf"{re.escape(endpoint)} -> 127\.0\.0\.1:(\d+)", data,
         )
         connections = re.findall(
-            rf"\[CONN v4\].*pid={server_pid} inbound proto=17\(UDP\).*\r?\n"
+            rf"\[CONN v4\].*pid={server_pid} (?:tid=\d+ )?inbound proto=17\(UDP\).*\r?\n"
             rf"\s+{re.escape(endpoint)} -> 127\.0\.0\.1:(\d+)", data,
         )
         phase = {"phase": label, "seconds": round(time.monotonic() - started, 2),
@@ -126,6 +129,7 @@ def main():
         return phase
 
     def send(local_port=0):
+        check_monitor(monitor, minimum_seconds=12)
         process = subprocess.run(
             [sys.executable, "-c", CLIENT, str(port), str(local_port)],
             capture_output=True, text=True, timeout=12,
@@ -153,7 +157,7 @@ def main():
             if args.verdict:
                 command += ["--verdict", args.verdict, "--match", endpoint]
             command.append(str(args.driver.resolve()))
-            monitor = subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT)
+            monitor = start_monitor(command, stdout=output, stderr=subprocess.STDOUT)
             try:
                 time.sleep(4)
                 if monitor.poll() is not None:
@@ -173,7 +177,7 @@ def main():
                     # authorization: the server flow may survive the idle period
                     # and our loopback reinjection has its own inbound fast path.
                     assert re.search(
-                        rf"\[CONN v4\].*pid={reused_client['pid']} outbound proto=17\(UDP\).*\r?\n"
+                        rf"\[CONN v4\].*pid={reused_client['pid']} (?:tid=\d+ )?outbound proto=17\(UDP\).*\r?\n"
                         rf"\s+127\.0\.0\.1:{reused_client['port']} -> {re.escape(endpoint)}", text(),
                     ), reused_client
                 for _ in range(12):
@@ -183,10 +187,25 @@ def main():
                 close_listener()
                 time.sleep(2)
                 observe("listener_closed")
+                cleanup_deadline = time.monotonic() + 35
+                while True:
+                    check_monitor(monitor)
+                    data = text()
+                    inbound = set(re.findall(
+                        rf"\[END\s+v4\] pid={server_pid} inbound proto=17\(UDP\) "
+                        rf"{re.escape(endpoint)} -> 127\.0\.0\.1:(\d+)", data))
+                    outbound = all(re.search(
+                        rf"\[END\s+v4\] pid={client['pid']} outbound proto=17\(UDP\) "
+                        rf"127\.0\.0\.1:{client['port']} -> {re.escape(endpoint)}", data)
+                        for client in clients)
+                    if inbound == {str(client['port']) for client in clients} and outbound:
+                        break
+                    assert time.monotonic() < cleanup_deadline, 'Missing lifecycle END after listener close'
+                    time.sleep(0.1)
             finally:
                 # Never terminate a monitor with an open driver handle. Its own
                 # --duration closes the handle and unloads the owned service.
-                code = monitor.wait(timeout=duration + 60)
+                code = wait_for_cleanup(monitor, timeout=duration + 60)
                 if code:
                     raise RuntimeError(f"monitor failed ({code}): {console.read_text(errors='replace')}")
     finally:
@@ -206,7 +225,8 @@ def main():
         assert marker not in data, marker
     owners = driver_owners()
     assert not owners, f"monitor did not release its driver: {owners}"
-    result_path.write_text(json.dumps({"listener": endpoint, "server_pid": server_pid,
+    result_path.write_text(json.dumps({"command": command, "monitor_exit": code, "owners_after": owners,
+                                      "listener": endpoint, "server_pid": server_pid,
                                       "clients": clients, "phases": phases}, indent=2),
                            encoding="utf-8")
     print(f"PASS: {len(clients)} request/reply cycles; client and server lifecycle verified.")

@@ -1,13 +1,18 @@
 use alloc::string::{String, ToString};
 use likely_stable::likely;
 use ntstatus::ntstatus::NtStatus;
-use windows_sys::Wdk::System::SystemServices::{
-    KeDelayExecutionThread, KeGetCurrentIrql, KeQueryInterruptTimePrecise, PASSIVE_LEVEL,
+use windows_sys::{
+    Wdk::System::SystemServices::{
+        KeDelayExecutionThread, KeGetCurrentIrql, KeQueryInterruptTimePrecise, PASSIVE_LEVEL,
+    },
+    Win32::Foundation::NTSTATUS,
 };
 
 use crate::ffi;
 
-pub fn check_ntstatus(status: i32) -> Result<(), String> {
+/// Checks a kernel NTSTATUS, including fwpmk.h and Fwps* results.
+/// User-mode Win32/DWORD errors use a different success contract.
+pub fn check_ntstatus(status: NTSTATUS) -> Result<(), String> {
     // Match the native NT_SUCCESS macro: informational and warning-free positive
     // statuses are successful too, not only STATUS_SUCCESS (zero).
     if likely(status >= 0) {
@@ -69,4 +74,50 @@ pub fn current_process_id() -> u64 {
 /// Safe at IRQL <= DISPATCH_LEVEL.
 pub fn current_thread_id() -> u64 {
     unsafe { ffi::PsGetCurrentThreadId() as u64 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_ntstatus;
+    use windows_sys::Win32::Foundation::NTSTATUS;
+
+    #[test]
+    fn nt_success_accepts_zero_pending_and_informational_statuses() {
+        for status in [0, 1, 0x0000_0103, 0x4000_0000] {
+            assert!(check_ntstatus(status).is_ok(), "{status:#010x}");
+        }
+    }
+
+    #[test]
+    fn nt_success_uses_the_sign_bit_not_zero_equality() {
+        assert!(check_ntstatus(i32::MAX).is_ok());
+        assert!(check_ntstatus(i32::MIN).is_err());
+    }
+
+    #[test]
+    fn kernel_access_and_parameter_errors_remain_errors() {
+        for status in [0xc000_0022u32, 0xc000_000d] {
+            assert!(check_ntstatus(status as NTSTATUS).is_err(), "{status:#010x}");
+        }
+    }
+
+    #[test]
+    fn kernel_rpc_and_wfp_errors_remain_errors() {
+        for status in [0xc002_0017u32, 0xc002_001b, 0xc022_0001, 0xc022_000a] {
+            assert!(check_ntstatus(status as NTSTATUS).is_err(), "{status:#010x}");
+        }
+    }
+
+    #[test]
+    fn warning_statuses_are_not_nt_success() {
+        assert!(check_ntstatus(0x8000_0005u32 as NTSTATUS).is_err());
+    }
+
+    #[test]
+    fn unknown_error_preserves_all_native_status_bits() {
+        assert_eq!(
+            check_ntstatus(0xe123_4567u32 as NTSTATUS).unwrap_err(),
+            "NTSTATUS(0xe1234567)"
+        );
+    }
 }

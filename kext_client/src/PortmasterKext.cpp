@@ -266,16 +266,7 @@ bool Driver::Install(const std::wstring& sys_path, std::string& error,
         CloseServiceHandle(service);
         return false;
     }
-    const DWORD ignore_special_ports = 1;
-    registry_status = RegSetValueExW(
-        parameters, L"IgnoreSpecialPorts", 0, REG_DWORD,
-        reinterpret_cast<const BYTE*>(&ignore_special_ports), sizeof(ignore_special_ports));
     RegCloseKey(parameters);
-    if (registry_status != ERROR_SUCCESS) {
-        error = "RegSetValueEx for IgnoreSpecialPorts failed: " + LastErrorText(registry_status);
-        CloseServiceHandle(service);
-        return false;
-    }
 
     if (StartServiceW(service, 0, nullptr) == 0) {
         const DWORD err = GetLastError();

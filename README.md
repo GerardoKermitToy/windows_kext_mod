@@ -540,7 +540,7 @@ The [kext_client/include/PortmasterKext.h](kext_client/include/PortmasterKext.h)
 | Method | Purpose |
 |---|---|
 | `Driver(service_name)` | Constructs a controller; the default name is `PortmasterKext` |
-| `Install(sys_path, error, inbound_udp_pid_fallback = true)` | Creates and starts a demand-start kernel service using an absolute path; writes `EnableInboundUdpCacheMissPidFallback` from the optional argument and always writes `IgnoreSpecialPorts = 1` before loading; an existing service is treated as a conflict |
+| `Install(sys_path, error, inbound_udp_pid_fallback = true)` | Creates and starts a demand-start kernel service using an absolute path; writes `EnableInboundUdpCacheMissPidFallback` from the optional argument but does not write `IgnoreSpecialPorts`; an existing service is treated as a conflict |
 | `Open(error)` | Opens the overlapped device handle and starts the named-pipe bridge server |
 | `Run(handlers, poll_interval_ms)` | Reads and dispatches events until `Stop`; calls `on_poll` at the requested interval |
 | `Stop()` | Signals `Run` and submits the shutdown IOCTL once |
