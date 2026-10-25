@@ -57,32 +57,52 @@ value or any DWORD other than `1` preserves special handling, including when
 started by the monitor. Changing the value while loaded has no effect until the
 next driver load. See [the driver setting documentation](../windows_kext/IGNORE_SPECIAL_PORTS.md).
 
-## Connection thread IDs
+## Connection metadata
 
-Displayed `CONN` records include `tid=...`. The monitor queries the driver's
-`IOCTL_GET_THREAD_ID` before sending or scheduling a verdict, including when
-`--no-verdicts` is active. Hidden connection records do not trigger this query.
-A failed query is reported as a warning without withholding the verdict.
+`ConnectionIpv4` uses `InfoType = 7`; `ConnectionIpv6` uses `InfoType = 8`.
+Values `1` and `2` remain reserved for the legacy connection format and are not
+parsed as the new events. Driver and client must be updated together. Other
+InfoType values, including `ConnectionEnd`, are unchanged.
 
-`Driver::GetThreadId(connection_id, thread_id, error)` returns the saved thread
-ID for the `id` from a `CONN` record, not the driver's internal connection instance
-ID. The event wire format and the named-pipe bridge are unchanged.
+The connection payload has this field order, with no padding and all integers
+little-endian:
 
-The driver snapshots the exact live connection generation's TID when publishing
-CONN and indexes it by request ID. The IOCTL only reads this index under the packet
-cache's existing lock: no packet/connection array search, allocation, or per-query
-log record. Query before sending the verdict: the snapshot is discarded when
-verdict processing finishes or the pending request is retired. Outbound UDP
-requests retained after socket closure keep their snapshot until their verdict
-finishes. A successful query returns `0` for an unknown, completed, or unattributed
-request, including ID `0`.
+```text
+id: u64
+process_id: u64
+tid: u64
+compartment_id: u32
+interface_index: u32
+sub_interface_index: u32
+direction: u8
+protocol: u8
+local_ip: [u8; 4 or 16]
+remote_ip: [u8; 4 or 16]
+local_port: u16
+remote_port: u16
+payload_layer: u8
+payload_size: u32
+payload: [u8; payload_size]
+```
 
-The IOCTL is `CTL_CODE(40000, 0x802, METHOD_BUFFERED,
-FILE_READ_DATA | FILE_WRITE_DATA)` (`0x9c40e008`). Input is an eight-byte
-little-endian CONN ID; output is an eight-byte little-endian thread ID.
-Input shorter than eight bytes fails with `STATUS_INVALID_PARAMETER`; output
-shorter than eight bytes fails with `STATUS_BUFFER_TOO_SMALL`, without partial
-output. A successful response contains exactly eight bytes.
+The fixed payload prefix is 55 bytes for IPv4 and 79 bytes for IPv6, excluding
+the five-byte record header and captured packet bytes. The named-pipe bridge
+forwards these complete raw records unchanged.
+
+`CONN` output includes `tid=...` in its header and the three routing fields on a
+separate line. The driver snapshots the exact live connection generation's TID
+when publishing the event. Existing outbound execution-context and ICMP echo
+attribution still apply; an unavailable TID is `0`.
+
+Routing values describe the current WFP indication, not an immutable route for
+the connection. Unavailable metadata is `0`; interface and subinterface fields
+can legitimately be zero at ALE layers. A zero value does not distinguish
+unavailable metadata from a native zero.
+
+TID and routing metadata are part of the event even when the monitor hides it,
+delays its verdict, or uses `--no-verdicts`. No extra IOCTL query is needed and
+metadata does not depend on the pending request still existing. The former
+GetThreadId IOCTL (`0x9c40e008`) and client method have been removed.
 
 ## Verdict delay
 

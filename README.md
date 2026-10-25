@@ -1,28 +1,29 @@
 # Modified Portmaster Windows Kernel Extension
 
-This repository contains a modified version of the original Portmaster Windows Kernel Extension. It is not the original implementation, but it remains fully compatible with the original driver's external API.
+This repository contains a modified version of the original Portmaster Windows Kernel Extension. **Version 3.0.0.0 is not API-compatible with the original Portmaster Windows Kernel Extension.** The driver and its user-mode client must both support the version 3 connection-event format described below.
 
 The modified driver is implemented in Rust as a `no_std` KMDF non-PnP Windows network driver. It registers Windows Filtering Platform (WFP) callouts, intercepts IPv4 and IPv6 traffic, delegates packet decisions to a user-mode process, caches verdicts, blocks or redirects traffic, and collects TCP/UDP bandwidth statistics.
 
-## API compatibility
+## API version and compatibility
 
-The modifications change the internal implementation without changing the API exposed to existing Portmaster clients. Compatibility includes:
+The current API version is **3.0.0.0**, stored as `[3, 0, 0, 0]` in [windows_kext/kextinterface/version.txt](windows_kext/kextinterface/version.txt) and returned as four raw bytes by `IOCTL_VERSION`.
 
-- the `\Device\PortmasterKext` device name and `\\.\PortmasterKext` Win32 path;
-- device access and I/O semantics;
-- event framing, IDs, field order, field widths, and byte order;
-- command IDs, payload layouts, and verdict values;
-- IOCTL values and responses.
+This is a **breaking API change**, not a drop-in replacement for the original driver or clients using the legacy connection-event layout:
 
-A client written for the original Portmaster Windows Kernel Extension can communicate with this modified driver without protocol changes. The optional [`IOCTL_GET_THREAD_ID`](#ioctl_get_thread_id) is an additive extension: existing IOCTL values and responses and all command/event layouts remain unchanged. Unless stated otherwise, references to "the driver" below mean this modified, API-compatible implementation.
+- `ConnectionIpv4` now uses `info_type = 7`, and `ConnectionIpv6` uses `info_type = 8`. Values `1` and `2` remain reserved for the legacy format; the version 3 driver does not emit that format.
+- Both connection events include `tid: u64`, `compartment_id: u32`, `interface_index: u32`, and `sub_interface_index: u32` immediately after `process_id`. Their fixed payload sizes are now 55 bytes for IPv4 and 79 bytes for IPv6.
+- The former `IOCTL_GET_THREAD_ID` (`0x9C40E008`) and C++ `Driver::GetThreadId` method have been removed. Read `Connection::tid` directly from the decoded event; no per-request IOCTL lookup is needed.
+- The device paths, five-byte event framing, command IDs and layouts, verdict values, and log, connection-end, and bandwidth event formats are unchanged. These unchanged parts do **not** make the complete API compatible with the original implementation.
+
+Update the driver and client together. Clients must check `IOCTL_VERSION` and support the corresponding event IDs and layouts before processing traffic. A legacy client may reject or ignore the new decision requests and leave retained packets without verdicts. Unless stated otherwise, references to "the driver" below mean this modified version 3 implementation.
 
 The driver and its user-mode controller operate as one system:
 
 - `windows_kext/driver` — the driver and WFP callout handlers;
 - `windows_kext/protocol` — the source of truth for the binary protocol;
 - `windows_kext/wdk` and `windows_kext/c_helper` — wrappers around WDK, KMDF, WFP, and NDIS;
-- `windows_kext/kextinterface` — the Go implementation of the client protocol;
-- `kext_client` — the C++ client library.
+- `windows_kext/kextinterface` — legacy Go protocol reference and the shared driver-version file; its Go connection-event decoder has not been migrated to API version 3;
+- `kext_client` — the C++ client library and `kext_monitor`, updated for API version 3.
 
 The packet path through WFP is described in detail in [windows_kext/PacketFlow.md](windows_kext/PacketFlow.md). This document defines the complete external driver API: the control device, `ReadFile`/`WriteFile`, IOCTLs, commands, events, and enumeration values. Internal Rust functions are not part of the driver API.
 
@@ -158,52 +159,61 @@ When no event is available, the read waits. During shutdown, an already waiting 
 | `info_type` | Name | Payload |
 |---:|---|---|
 | `0` | `LogLine` | Severity and message text |
-| `1` | `ConnectionIpv4` | IPv4 packet-decision request |
-| `2` | `ConnectionIpv6` | IPv6 packet-decision request |
+| `1`, `2` | Reserved | Legacy connection formats; not emitted by the version 3 driver |
 | `3` | `ConnectionEndEventV4` | IPv4 connection ended |
 | `4` | `ConnectionEndEventV6` | IPv6 connection ended |
 | `5` | `BandwidthStatsV4` | IPv4 bandwidth counters |
 | `6` | `BandwidthStatsV6` | IPv6 bandwidth counters |
+| `7` | `ConnectionIpv4` | IPv4 packet-decision request with thread and routing metadata |
+| `8` | `ConnectionIpv6` | IPv6 packet-decision request with thread and routing metadata |
 
-### `ConnectionIpv4` (`info_type = 1`)
+### `ConnectionIpv4` (`info_type = 7`)
 
-The fixed payload is 35 bytes, followed by the captured packet bytes:
+The fixed payload is 55 bytes, followed by the captured packet bytes. Offsets are relative to the payload, excluding the five-byte record header:
 
 | Offset | Size | Field | Description |
 |---:|---:|---|---|
 | `0` | 8 | `id` | Request ID for a `Verdict` command; `0` is reserved as invalid |
-| `8` | 8 | `process_id` | Owning PID, or `0` when it cannot be determined |
-| `16` | 1 | `direction` | Direction of the packet being decided |
-| `17` | 1 | `protocol` | IP protocol number |
-| `18` | 4 | `local_ip` | Local IPv4 address |
-| `22` | 4 | `remote_ip` | Remote IPv4 address |
-| `26` | 2 | `local_port` | Local port, or `0` for a protocol without ports |
-| `28` | 2 | `remote_port` | Remote port, or `0` for a protocol without ports |
-| `30` | 1 | `payload_layer` | Layer represented by the captured bytes |
-| `31` | 4 | `captured_length` | Number of bytes that follow |
-| `35` | N | `captured_bytes` | Captured packet bytes |
+| `8` | 8 | `process_id` | Attributed PID, or `0` when it cannot be determined |
+| `16` | 8 | `tid` | Captured Windows thread ID (`u64`), or `0` when unavailable |
+| `24` | 4 | `compartment_id` | WFP network compartment ID (`u32`), or `0` when unavailable |
+| `28` | 4 | `interface_index` | Interface index for the WFP indication (`u32`) |
+| `32` | 4 | `sub_interface_index` | Subinterface index for the WFP indication (`u32`) |
+| `36` | 1 | `direction` | Direction of the packet being decided |
+| `37` | 1 | `protocol` | IP protocol number |
+| `38` | 4 | `local_ip` | Local IPv4 address |
+| `42` | 4 | `remote_ip` | Remote IPv4 address |
+| `46` | 2 | `local_port` | Local port, or `0` for a protocol without ports |
+| `48` | 2 | `remote_port` | Remote port, or `0` for a protocol without ports |
+| `50` | 1 | `payload_layer` | Layer represented by the captured bytes |
+| `51` | 4 | `captured_length` | Number of bytes that follow |
+| `55` | N | `captured_bytes` | Captured packet bytes |
 
-A valid payload length is `35 + captured_length`.
+A valid payload length is `55 + captured_length`. A complete framed record is `5 + 55 + captured_length` bytes.
 
-### `ConnectionIpv6` (`info_type = 2`)
+### `ConnectionIpv6` (`info_type = 8`)
 
-The fixed payload is 59 bytes:
+The fixed payload is 79 bytes. The metadata prefix and its offsets are identical to IPv4; the larger addresses shift the following fields:
 
 | Offset | Size | Field | Description |
 |---:|---:|---|---|
 | `0` | 8 | `id` | Request ID for a `Verdict` command |
-| `8` | 8 | `process_id` | Owning PID, or `0` when unknown |
-| `16` | 1 | `direction` | Direction of the packet being decided |
-| `17` | 1 | `protocol` | IP protocol number |
-| `18` | 16 | `local_ip` | Local IPv6 address |
-| `34` | 16 | `remote_ip` | Remote IPv6 address |
-| `50` | 2 | `local_port` | Local port, or `0` |
-| `52` | 2 | `remote_port` | Remote port, or `0` |
-| `54` | 1 | `payload_layer` | Layer represented by the captured bytes |
-| `55` | 4 | `captured_length` | Number of bytes that follow |
-| `59` | N | `captured_bytes` | Captured packet bytes |
+| `8` | 8 | `process_id` | Attributed PID, or `0` when unknown |
+| `16` | 8 | `tid` | Captured Windows thread ID (`u64`), or `0` when unavailable |
+| `24` | 4 | `compartment_id` | WFP network compartment ID (`u32`), or `0` when unavailable |
+| `28` | 4 | `interface_index` | Interface index for the WFP indication (`u32`) |
+| `32` | 4 | `sub_interface_index` | Subinterface index for the WFP indication (`u32`) |
+| `36` | 1 | `direction` | Direction of the packet being decided |
+| `37` | 1 | `protocol` | IP protocol number |
+| `38` | 16 | `local_ip` | Local IPv6 address |
+| `54` | 16 | `remote_ip` | Remote IPv6 address |
+| `70` | 2 | `local_port` | Local port, or `0` |
+| `72` | 2 | `remote_port` | Remote port, or `0` |
+| `74` | 1 | `payload_layer` | Layer represented by the captured bytes |
+| `75` | 4 | `captured_length` | Number of bytes that follow |
+| `79` | N | `captured_bytes` | Captured packet bytes |
 
-A valid payload length is `59 + captured_length`.
+A valid payload length is `79 + captured_length`. A complete framed record is `5 + 79 + captured_length` bytes.
 
 #### Connection-event field semantics
 
@@ -225,7 +235,11 @@ In a connection event, this is the effective direction of the packet being decid
 
 A connection event is a decision request, not a guarantee of one event per logical connection. While a decision is temporary or the connection remains `Undecided`, multiple packets with the same five-tuple can receive distinct IDs. A WFP indication containing multiple `NET_BUFFER` objects is split into one event and one request ID per packet. Every nonzero ID should receive exactly one `Verdict`, even when a UI or display filter hides the event.
 
-Thread IDs are not included in the connection-event payload. To obtain the captured TID for an event's `id`, query [`IOCTL_GET_THREAD_ID`](#ioctl_get_thread_id) before sending that request's verdict.
+`tid` is included directly in every version 3 connection event. For connection-associated requests, publication snapshots the TID from the exact live cache generation. For outbound TCP/UDP ALE attribution, a TID is captured only when the PID is neither unknown/System (`0` or `4`) nor the controller owning the driver handle; existing outbound execution-context and ICMP echo attribution also apply. An unavailable TID is `0`. The value is attributed to the observed request or connection and is not necessarily the thread that sent each subsequent packet. It is not the monitor's reader thread. No IOCTL query is required, and consuming or retiring the request does not invalidate metadata already carried by its event.
+
+`compartment_id`, `interface_index`, and `sub_interface_index` describe the current WFP indication, not an immutable route for the connection. They are copied from ALE classification data or the packet-layer routing snapshot. Unavailable values are encoded as `0`; interface and subinterface indices may legitimately be zero at ALE layers. The format has no presence mask, so a native zero and unavailable metadata cannot be distinguished.
+
+The C++ client exposes these fields as `Connection::tid`, `Connection::compartment_id`, `Connection::interface_index`, and `Connection::sub_interface_index`. `kext_monitor` prints `tid` in the `CONN` header and the three routing fields on a separate line. Metadata is carried by the event regardless of display filters, delayed verdicts, or `--no-verdicts`. Connection-end records do not include these four fields and retain their existing format.
 
 A successful `WriteFile` for a verdict means that the driver accepted the command; it does not confirm delivery of the reinjected packet. WFP injection completes asynchronously, and a final injection failure is written to the driver's log ring. Independent UDP reinjections do not form a FIFO contract, so this API does not guarantee the delivery order of accepted UDP datagrams.
 
@@ -475,55 +489,24 @@ The device handle must therefore have both read and write access.
 |---|---:|---:|---:|---|
 | `IOCTL_VERSION` | `0x9C40E000` | None | Exactly 4 bytes | Wire-interface version |
 | `IOCTL_SHUTDOWN_REQUEST` | `0x9C40E004` | None | None | Final driver shutdown |
-| `IOCTL_GET_THREAD_ID` | `0x9C40E008` | 8-byte request ID | Exactly 8 bytes | Captured thread ID for a CONN request, or `0` |
 
 ### `IOCTL_VERSION`
 
-Returns the four raw bytes stored in `windows_kext/kextinterface/version.txt`. The current version is `[2, 1, 1, 0]`, conventionally displayed as `2.1.1.0`. If the output buffer is shorter than four bytes, the request completes with `STATUS_BUFFER_TOO_SMALL` and returns no partial result.
+Returns the four raw bytes stored in [windows_kext/kextinterface/version.txt](windows_kext/kextinterface/version.txt). The current version is `[3, 0, 0, 0]`, conventionally displayed as **3.0.0.0**; the returned bytes are `03 00 00 00`. This version requires the connection-event IDs and layouts documented above and is not compatible with the original Portmaster Windows Kernel Extension. If the output buffer is shorter than four bytes, the request completes with `STATUS_BUFFER_TOO_SMALL` and returns no partial result.
 
 ### `IOCTL_SHUTDOWN_REQUEST`
 
 Performs the same operation as the `Shutdown` command. The IOCTL provides a convenient out-of-band final request while an overlapped read is waiting. It has no output.
 
-### `IOCTL_GET_THREAD_ID`
-
-Uses function number `0x802`:
-
-```text
-CTL_CODE(40000, 0x802, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
-```
-
-Returns the Windows thread ID captured for the request `id` from a `ConnectionIpv4` or `ConnectionIpv6` event. This is the same ID used by the `Verdict` command, also named `external_connection_id` in some client headers; it is not a PID or the driver's internal connection-instance ID.
-
-| Buffer | Offset | Size | Field |
-|---|---:|---:|---|
-| Input | `0` | 8 | `id` (`u64` LE) |
-| Output | `0` | 8 | `thread_id` (`u64` LE) |
-
-A successful request returns exactly eight bytes. The value is `0` if the ID is unknown, `0`, already completed or retired, or has no attributed TID. A missing TID is a successful result, not an IOCTL error.
-
-- Input shorter than eight bytes fails with `STATUS_INVALID_PARAMETER`.
-- With valid input, output shorter than eight bytes fails with `STATUS_BUFFER_TOO_SMALL`.
-- Both failures report zero returned bytes, without partial output.
-- Larger input buffers are accepted; only the first eight bytes are read. Larger output buffers still receive exactly eight bytes.
-
-**Query before sending or scheduling the verdict.** The driver snapshots the exact live connection generation's TID when publishing CONN and retains it while the request is pending or its verdict is being applied. The snapshot is discarded when verdict processing finishes, the request is retired, or the pending cache is cleared. Outbound UDP requests retained after socket closure keep their snapshot until the verdict finishes, even though they are detached from the ended connection. Reusing the same connection tuple cannot redirect an old request ID to a replacement connection's TID.
-
-The saved TID originates from outbound TCP/UDP ALE authorization, excluding PID `0`, PID `4`, and the user-mode controller that owns the driver handle. It is not the thread that calls the IOCTL, nor necessarily the thread that sent each subsequent packet. Requests without that attribution return `0`; the connection-event wire format remains unchanged.
-
-The handler performs one indexed `BTreeMap<id, thread_id>` lookup (`O(log N)`) under the existing packet-cache lock. It does not search packet or connection arrays, allocate memory, or write a log record per query.
-
-This IOCTL is an extension of the modified driver, not a requirement for original Portmaster API compatibility. A driver without this extension can reject it with `STATUS_NOT_IMPLEMENTED`; clients should still send the required verdict if the optional query fails. The C++ wrapper is `Driver::GetThreadId(id, thread_id, error)`.
-
-An unknown IOCTL completes with `STATUS_NOT_IMPLEMENTED`.
+The former `IOCTL_GET_THREAD_ID` (`0x9C40E008`, function `0x802`) is not supported in version 3. Its per-request lookup has been removed; use the `tid` field in the connection event instead. Calling this removed IOCTL, like any other unknown IOCTL, completes with `STATUS_NOT_IMPLEMENTED`.
 
 ## Recommended client lifecycle
 
 1. Configure any [registry settings](#registry-settings) before starting the kernel-driver service, or use an already installed release driver.
 2. Open `\\.\PortmasterKext` with `GENERIC_READ | GENERIC_WRITE`, share mode `0`, and `FILE_FLAG_OVERLAPPED`.
-3. Check `IOCTL_VERSION` before beginning protocol communication.
+3. Check `IOCTL_VERSION` and verify that the client supports the returned version before beginning protocol communication; version 3 requires `info_type` values `7`/`8` and the extended connection-event layouts.
 4. Start one persistent overlapped read and assemble records independently of read boundaries.
-5. If a thread ID is needed, query `IOCTL_GET_THREAD_ID` using the event's `id` before sending or scheduling its verdict. Respond to every nonzero connection request ID, even if the optional query fails. Display filters must not suppress verdicts.
+5. Read TID and routing metadata directly from each connection event. Respond to every nonzero connection request ID with a verdict; no metadata IOCTL is needed. Display filters must not suppress verdicts.
 6. Send `CleanEndedConnections` periodically and request logs or bandwidth statistics as needed.
 7. To terminate, issue `IOCTL_SHUTDOWN_REQUEST` or the `Shutdown` command.
 8. Wait for and reap the pending read, then close the device handle.
@@ -535,6 +518,17 @@ Do not forcibly terminate a controller with an open handle and then expect `sc s
 
 The [kext_client/include/PortmasterKext.h](kext_client/include/PortmasterKext.h) header provides the `pmkext` namespace and decoded `Connection`, `ConnectionEnd`, `LogLine`, `BandwidthEntry`, and `BandwidthStats` structures.
 
+In addition to `process_id`, every decoded `Connection` exposes the version 3 metadata:
+
+| Field | C++ type | Meaning |
+|---|---|---|
+| `tid` | `uint64_t` | Captured Windows thread ID, or `0` when unavailable |
+| `compartment_id` | `uint32_t` | WFP network compartment ID, or `0` when unavailable |
+| `interface_index` | `uint32_t` | Interface index for the current WFP indication |
+| `sub_interface_index` | `uint32_t` | Subinterface index for the current WFP indication |
+
+Read these members in `on_connection`; there is no `Driver::GetThreadId` method in this API. The decoder accepts connection events with types `7`/`8` and warns on the legacy types `1`/`2`. These are decoded C++ objects, not packed wire structs; use the wire layouts above rather than copying `sizeof(Connection)` bytes to or from the device. See [kext_client/README.md](kext_client/README.md#connection-metadata) for monitor output and client usage.
+
 ### `pmkext::Driver`
 
 | Method | Purpose |
@@ -545,7 +539,6 @@ The [kext_client/include/PortmasterKext.h](kext_client/include/PortmasterKext.h)
 | `Run(handlers, poll_interval_ms)` | Reads and dispatches events until `Stop`; calls `on_poll` at the requested interval |
 | `Stop()` | Signals `Run` and submits the shutdown IOCTL once |
 | `GetVersion(out, error)` | Calls `IOCTL_VERSION` |
-| `GetThreadId(id, thread_id, error)` | Calls `IOCTL_GET_THREAD_ID`; returns `true` on success and writes the captured TID or `0` to `thread_id` |
 | `RequestShutdown(error)` | Calls `IOCTL_SHUTDOWN_REQUEST` |
 | `SendVerdict(id, verdict, error)` | Encodes and sends a `Verdict` command |
 | `RequestLogs(error)` | Sends `GetLogs` |
@@ -568,7 +561,7 @@ The [kext_client/include/PortmasterKext.h](kext_client/include/PortmasterKext.h)
 
 Event callbacks run on the reader thread, while `on_poll` runs on the thread that called `Run`. When a named-pipe client is connected to the bridge, complete raw driver records are forwarded to that client instead of being passed to the local event callbacks. The connected client is then responsible for returning verdicts.
 
-The C++ class does not currently expose methods for `UpdateV4` or `UpdateV6`; these commands remain available through the raw driver protocol or the Go interface.
+The C++ class does not currently expose methods for `UpdateV4` or `UpdateV6`; these commands remain available through the raw driver protocol. The bundled Go reference still uses legacy connection-event IDs and layouts and must be migrated before it can serve as a version 3 controller.
 
 The `ToString`, `PayloadLayerToString`, `ProtocolToString`, `DirectionToString`, `FormatIpv4`, and `FormatIpv6` helpers only format already decoded values.
 

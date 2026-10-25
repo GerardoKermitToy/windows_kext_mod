@@ -15,9 +15,9 @@ use wdk::{err, info, interface, rw_spin_lock::RwSpinLock};
 use windows_sys::Wdk::{
     Foundation::IRP,
     System::SystemServices::{
-        ExAcquireRundownProtection, ExInitializeRundownProtection,
-        ExReInitializeRundownProtection, ExReleaseRundownProtection, ExRundownCompleted,
-        ExWaitForRundownProtectionRelease, EX_RUNDOWN_REF, EX_RUNDOWN_REF_0,
+        ExAcquireRundownProtection, ExInitializeRundownProtection, ExReInitializeRundownProtection,
+        ExReleaseRundownProtection, ExRundownCompleted, ExWaitForRundownProtectionRelease,
+        EX_RUNDOWN_REF, EX_RUNDOWN_REF_0,
     },
 };
 use windows_sys::Win32::Foundation::{
@@ -392,7 +392,10 @@ pub unsafe extern "system" fn driver_entry(
         DISPATCH_GATE.wait_for_all();
         DISPATCH_GATE.wait_for_lifetime();
         wdk::callback_barrier::CALLBACK_BARRIER.close_all_and_wait();
-        err!("driver_entry: failed to initialize registry settings: {}", status);
+        err!(
+            "driver_entry: failed to initialize registry settings: {}",
+            status
+        );
         return windows_sys::Win32::Foundation::STATUS_FAILED_DRIVER_ENTRY;
     }
 
@@ -437,7 +440,10 @@ pub unsafe extern "system" fn driver_entry(
     #[cfg(feature = "perf-etw")]
     if let Err(status) = wdk::perf::register() {
         // Profiling is diagnostic-only and must not prevent normal filtering.
-        err!("ETW performance provider registration failed: NTSTATUS({:#010x})", status as u32);
+        err!(
+            "ETW performance provider registration failed: NTSTATUS({:#010x})",
+            status as u32
+        );
     }
 
     if !wdk::callback_barrier::CALLBACK_BARRIER.activate() {
@@ -786,16 +792,6 @@ unsafe extern "system" fn device_control(
         ControlCode::ShutdownRequest => {
             wdk::info!("IOCTL: {}", control_code);
             device.shutdown();
-        }
-        ControlCode::GetThreadId => {
-            let Some(id) = control_request.read_u64() else {
-                return control_request.fail(STATUS_INVALID_PARAMETER);
-            };
-            if control_request.free_space() < 8 {
-                return control_request.fail(STATUS_BUFFER_TOO_SMALL);
-            }
-            let thread_id = device.packet_cache.write_lock().get_thread_id(id);
-            control_request.write_exact(&thread_id.to_le_bytes());
         }
     };
 

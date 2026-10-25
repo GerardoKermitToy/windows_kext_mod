@@ -78,6 +78,11 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(connection_record_tests tests/connection_record_tests.cpp)
+    target_link_libraries(connection_record_tests PRIVATE pmkext)
+    add_test(NAME connection_record_tests COMMAND connection_record_tests)
+    set_tests_properties(connection_record_tests PROPERTIES TIMEOUT 10)
+
     add_executable(ip_address_tests tests/ip_address_tests.cpp)
     target_link_libraries(ip_address_tests PRIVATE pmkext)
     add_test(NAME ip_address_tests COMMAND ip_address_tests)

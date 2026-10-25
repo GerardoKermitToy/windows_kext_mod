@@ -6,6 +6,7 @@ use crate::ale_policy::{
 use crate::connection::{Connection, ConnectionV4, ConnectionV6, Direction, Verdict};
 use crate::connection_map::Key;
 use crate::device::{Device, Packet};
+use crate::id_cache::ConnectionMetadata;
 use crate::udp_flow_cache::UdpFlowRegistration;
 use alloc::{boxed::Box, string::String, vec::Vec};
 
@@ -63,6 +64,16 @@ impl AleLayerData {
             wdk::utils::current_thread_id()
         } else {
             0
+        }
+    }
+
+    fn connection_metadata(&self, data: &CalloutData) -> ConnectionMetadata {
+        ConnectionMetadata {
+            // Publication copies the TID from the exact live cache generation.
+            thread_id: 0,
+            compartment_id: data.get_compartment_id().unwrap_or(0),
+            interface_index: self.interface_index,
+            sub_interface_index: self.sub_interface_index,
         }
     }
 
@@ -270,17 +281,18 @@ fn track_tcp_endpoint_instance(
         wdk::utils::get_monotonic_timestamp_ms()
     };
     let mut endpoint_cache = device.tcp_endpoint_cache.write_lock();
-    let associated = device
-        .connection_cache
-        .with_live_connection_instance(&key, instance_id, |_| {
-            Some(endpoint_cache.associate_instance_at(
-                endpoint_handle,
-                key,
-                parent_endpoint_handle,
-                instance_id,
-                initial_authorization_at_ms,
-            ))
-        });
+    let associated =
+        device
+            .connection_cache
+            .with_live_connection_instance(&key, instance_id, |_| {
+                Some(endpoint_cache.associate_instance_at(
+                    endpoint_handle,
+                    key,
+                    parent_endpoint_handle,
+                    instance_id,
+                    initial_authorization_at_ms,
+                ))
+            });
     if unlikely(matches!(associated, Some(false))) {
         crate::err!(
             "TCP endpoint handle {} is already associated with another connection: {}",
@@ -312,7 +324,8 @@ fn track_udp_endpoint_instance(
         device
             .connection_cache
             .with_live_connection_instance(&key, instance_id, |_| {
-                let _ = endpoint_cache.associate_instance_at(endpoint_handle, key, instance_id, now);
+                let _ =
+                    endpoint_cache.associate_instance_at(endpoint_handle, key, instance_id, now);
                 Some(())
             })
             .is_some()
@@ -341,9 +354,7 @@ fn track_endpoint_instance(
             instance_id,
             reauthorize_outbound,
         ),
-        IpProtocol::Udp => {
-            track_udp_endpoint_instance(device, endpoint_handle, key, instance_id)
-        }
+        IpProtocol::Udp => track_udp_endpoint_instance(device, endpoint_handle, key, instance_id),
         _ => {}
     }
 }
@@ -420,8 +431,8 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
         ale_data.packet_direction,
     );
     let key = ale_data.as_key();
-    let reauthorize_outbound = ale_data.reauthorize
-        && matches!(ale_data.connection_direction, Direction::Outbound);
+    let reauthorize_outbound =
+        ale_data.reauthorize && matches!(ale_data.connection_direction, Direction::Outbound);
 
     // An outbound self-injected indication has no application send context, so its
     // transport endpoint handle belongs to the injector and is shared by every
@@ -633,7 +644,7 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
                             (key, packet),
                             Some(connection_instance_id),
                             ale_data.process_id,
-                            0,
+                            ale_data.connection_metadata(&data),
                             ale_data.packet_direction,
                             true,
                         ) {
@@ -778,7 +789,7 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
             (key, packet),
             Some(registration.instance_id),
             ale_data.process_id,
-            0,
+            ale_data.connection_metadata(&data),
             ale_data.packet_direction,
             true,
         ) {
@@ -1843,16 +1854,13 @@ pub fn ale_flow_established_monitor(data: CalloutData) {
         // handle with the child endpoint used by FLOW_ESTABLISHED and CLOSURE.
         let (endpoint, rebind_failed) = {
             let mut endpoint_cache = device.tcp_endpoint_cache.write_lock();
-            let endpoint = endpoint_cache.resolve_live_instance(
-                &key,
-                parent_endpoint_handle,
-                |instance_id| {
+            let endpoint =
+                endpoint_cache.resolve_live_instance(&key, parent_endpoint_handle, |instance_id| {
                     device
                         .connection_cache
                         .with_live_connection_instance(&key, instance_id, Some)
                         .is_some()
-                },
-            );
+                });
             let rebind_failed = endpoint.is_some_and(|endpoint| {
                 !endpoint_cache.rebind_established(established_endpoint_handle, endpoint)
             });
@@ -1864,7 +1872,10 @@ pub fn ale_flow_established_monitor(data: CalloutData) {
             return;
         }
         let Some(endpoint) = endpoint else {
-            crate::err!("failed to resolve TCP authorization for established flow: {}", key);
+            crate::err!(
+                "failed to resolve TCP authorization for established flow: {}",
+                key
+            );
             return;
         };
 

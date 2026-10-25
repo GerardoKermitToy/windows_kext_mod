@@ -58,10 +58,20 @@ struct PendingIdentity {
 
 #[cfg(not(test))]
 #[derive(Clone, Copy)]
+pub(crate) struct ConnectionMetadata {
+    pub thread_id: u64,
+    pub compartment_id: u32,
+    pub interface_index: u32,
+    pub sub_interface_index: u32,
+}
+
+#[cfg(not(test))]
+#[derive(Clone, Copy)]
 struct PendingContext {
     key: Key,
     connection_instance_id: Option<u64>,
     process_id: u64,
+    metadata: ConnectionMetadata,
     direction: Direction,
     ale_layer: bool,
 }
@@ -145,8 +155,6 @@ pub struct IdCache {
     /// from this queue.
     pending_by_instance: BTreeMap<u64, PendingIds>,
     active: BTreeMap<u64, PendingIdentity>,
-    /// CONN request ID -> captured TID, retained until the request finishes.
-    thread_id_by_request: BTreeMap<u64, u64>,
     lock: RwSpinLock,
     next_id: u64,
 }
@@ -157,7 +165,6 @@ impl IdCache {
             values: VecDeque::with_capacity(1000),
             pending_by_instance: BTreeMap::new(),
             active: BTreeMap::new(),
-            thread_id_by_request: BTreeMap::new(),
             lock: RwSpinLock::default(),
             next_id: 1, // 0 is invalid id
         }
@@ -169,7 +176,7 @@ impl IdCache {
         value: (Key, Packet),
         connection_instance_id: Option<u64>,
         process_id: u64,
-        thread_id: u64,
+        metadata: ConnectionMetadata,
         direction: Direction,
         ale_layer: bool,
     ) -> Vec<(u64, Info)> {
@@ -179,6 +186,7 @@ impl IdCache {
             key,
             connection_instance_id,
             process_id,
+            metadata,
             direction,
             ale_layer,
         };
@@ -207,15 +215,8 @@ impl IdCache {
         };
         for (id, _) in &queued {
             add_pending_request(&mut self.pending_by_instance, connection_instance_id, *id);
-            if thread_id != 0 {
-                self.thread_id_by_request.insert(*id, thread_id);
-            }
         }
         queued
-    }
-
-    pub fn get_thread_id(&self, id: u64) -> u64 {
-        self.thread_id_by_request.get(&id).copied().unwrap_or(0)
     }
 
     /// Recognizes late verdicts for requests already retired by endpoint release
@@ -250,7 +251,6 @@ impl IdCache {
     pub fn finish_id(&mut self, id: u64) {
         let _guard = self.lock.write_lock();
         self.active.remove(&id);
-        self.thread_id_by_request.remove(&id);
     }
 
     /// Snapshots packet decisions already queued or being applied for one closing
@@ -322,13 +322,7 @@ impl IdCache {
         if sorted_instance_ids.len() == 1 {
             let instance_id = sorted_instance_ids[0];
             if let Some(ids) = self.pending_by_instance.remove(&instance_id) {
-                retire_pending_ids(
-                    &mut self.values,
-                    &mut self.thread_id_by_request,
-                    instance_id,
-                    ids,
-                    &mut removed,
-                );
+                retire_pending_ids(&mut self.values, instance_id, ids, &mut removed);
             }
             return removed;
         }
@@ -358,13 +352,7 @@ impl IdCache {
                 .find(|instance_id| self.pending_by_instance.contains_key(instance_id))
             {
                 if let Some(ids) = self.pending_by_instance.remove(&instance_id) {
-                    retire_pending_ids(
-                        &mut self.values,
-                        &mut self.thread_id_by_request,
-                        instance_id,
-                        ids,
-                        &mut removed,
-                    );
+                    retire_pending_ids(&mut self.values, instance_id, ids, &mut removed);
                 }
             }
             return removed;
@@ -385,13 +373,7 @@ impl IdCache {
         }
         pending_ids.sort_unstable_by_key(|(id, _)| *id);
         for (id, instance_id) in pending_ids {
-            retire_pending_id(
-                &mut self.values,
-                &mut self.thread_id_by_request,
-                id,
-                instance_id,
-                &mut removed,
-            );
+            retire_pending_id(&mut self.values, id, instance_id, &mut removed);
         }
         removed
     }
@@ -407,7 +389,6 @@ impl IdCache {
         let _guard = self.lock.write_lock();
         mem::swap(&mut self.values, &mut values);
         self.pending_by_instance.clear();
-        self.thread_id_by_request.clear();
 
         return values;
     }
@@ -451,17 +432,15 @@ fn remove_pending_request(
 
 fn retire_pending_ids(
     values: &mut VecDeque<Entry<PendingPacket>>,
-    thread_id_by_request: &mut BTreeMap<u64, u64>,
     instance_id: u64,
     ids: PendingIds,
     removed: &mut VecDeque<Entry<PendingPacket>>,
 ) {
-    ids.for_each(|id| retire_pending_id(values, thread_id_by_request, id, instance_id, removed));
+    ids.for_each(|id| retire_pending_id(values, id, instance_id, removed));
 }
 
 fn retire_pending_id(
     values: &mut VecDeque<Entry<PendingPacket>>,
-    thread_id_by_request: &mut BTreeMap<u64, u64>,
     id: u64,
     instance_id: u64,
     removed: &mut VecDeque<Entry<PendingPacket>>,
@@ -480,7 +459,6 @@ fn retire_pending_id(
     {
         values[index].value.connection_instance_id = None;
     } else if let Some(entry) = values.remove(index) {
-        thread_id_by_request.remove(&id);
         removed.push_back(entry);
     }
 }
@@ -499,6 +477,7 @@ fn push_packet(
         &context.key,
         id,
         context.process_id,
+        context.metadata,
         context.direction,
         &packet,
         context.ale_layer,
@@ -533,6 +512,7 @@ fn build_info(
     key: &Key,
     packet_id: u64,
     process_id: u64,
+    metadata: ConnectionMetadata,
     direction: Direction,
     packet: &Packet,
     ale_layer: bool,
@@ -558,6 +538,10 @@ fn build_info(
             Some(protocol::info::connection_info_v6(
                 packet_id,
                 process_id,
+                metadata.thread_id,
+                metadata.compartment_id,
+                metadata.interface_index,
+                metadata.sub_interface_index,
                 direction as u8,
                 u8::from(key.protocol),
                 local_ip.0,
@@ -572,6 +556,10 @@ fn build_info(
             Some(protocol::info::connection_info_v4(
                 packet_id,
                 process_id,
+                metadata.thread_id,
+                metadata.compartment_id,
+                metadata.interface_index,
+                metadata.sub_interface_index,
                 direction as u8,
                 u8::from(key.protocol),
                 local_ip.0,
@@ -624,7 +612,6 @@ mod tests {
             id,
         });
         add_pending_request(&mut cache.pending_by_instance, connection_instance_id, id);
-        cache.thread_id_by_request.insert(id, 1000 + id);
     }
 
     #[test]
@@ -660,30 +647,15 @@ mod tests {
     }
 
     #[test]
-    fn thread_id_lookup_uses_only_the_request_index() {
-        let mut cache = IdCache::new();
-        for id in [0, 1, u64::MAX] {
-            assert_eq!(cache.get_thread_id(id), 0);
-        }
-        cache.thread_id_by_request.insert(u64::MAX, 1234);
-        assert!(cache.values.is_empty());
-        assert_eq!(cache.get_thread_id(u64::MAX), 1234);
-        assert_eq!(cache.get_thread_id(1), 0);
-    }
-
-    #[test]
-    fn icmp_thread_id_survives_without_a_connection_instance() {
+    fn icmp_request_without_a_connection_instance_remains_claimable() {
         let mut cache = IdCache::new();
         queue(&mut cache, 1, None, false);
         cache.values[0].value.key.protocol = IpProtocol::Icmp;
 
         assert!(cache.retire_connection_instances(&[10]).is_empty());
-        assert_eq!(cache.get_thread_id(1), 1001);
         let packet = cache.pop_id(1).expect("ICMP request");
         assert_eq!(packet.connection_instance_id, None);
-        assert_eq!(cache.get_thread_id(1), 1001);
         cache.finish_id(1);
-        assert_eq!(cache.get_thread_id(1), 0);
     }
 
     #[test]
@@ -703,14 +675,11 @@ mod tests {
         assert!(!cache.pending_by_instance.contains_key(&20));
         assert!(cache.pending_by_instance.contains_key(&10));
         assert!(cache.pending_by_instance.contains_key(&30));
-        assert_eq!(cache.get_thread_id(2), 1002);
 
         let detached = cache.pop_id(2).expect("detached request remains claimable");
         assert_eq!(detached.connection_instance_id, None);
         assert_eq!(queued_ids(&cache), vec![1, 3]);
-        assert_eq!(cache.get_thread_id(2), 1002);
         cache.finish_id(2);
-        assert_eq!(cache.get_thread_id(2), 0);
     }
 
     #[test]
@@ -737,9 +706,6 @@ mod tests {
         assert!(!cache.pending_by_instance.contains_key(&30));
         assert!(cache.pending_by_instance.contains_key(&10));
         assert!(cache.pending_by_instance.contains_key(&40));
-        assert_eq!(cache.get_thread_id(2), 0);
-        assert_eq!(cache.get_thread_id(4), 0);
-        assert_eq!(cache.get_thread_id(3), 1003);
     }
 
     #[test]
@@ -768,10 +734,8 @@ mod tests {
         assert_eq!(queued_ids(&cache), vec![3]);
         assert!(cache.pending_by_instance.get(&10).is_none());
         assert!(cache.active.contains_key(&1));
-        assert_eq!(cache.get_thread_id(1), 1001);
-        assert_eq!(cache.get_thread_id(2), 0);
         cache.finish_id(1);
-        assert_eq!(cache.get_thread_id(1), 0);
+        assert!(!cache.active.contains_key(&1));
     }
 
     #[test]
@@ -807,8 +771,6 @@ mod tests {
             vec![1]
         );
         assert_eq!(queued_ids(&cache), vec![2]);
-        assert_eq!(cache.get_thread_id(1), 0);
-        assert_eq!(cache.get_thread_id(2), 1002);
     }
 
     #[test]
@@ -828,6 +790,5 @@ mod tests {
         );
         assert!(cache.values.is_empty());
         assert!(cache.pending_by_instance.is_empty());
-        assert!(cache.thread_id_by_request.is_empty());
     }
 }

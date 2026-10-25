@@ -58,6 +58,7 @@ print(json.dumps(meta), flush=True)
 CONN = re.compile(
     r'\[CONN v[46]\] id=(\d+) pid=(\d+) (?:tid=\d+ )?(\w+) proto=17\(UDP\) layer=\d+\([^)]*\)\r?\n'
     r'\s+(\S+):(\d+) -> (\S+):(\d+)\s+payload=\d+ bytes\r?\n'
+    r'(?:\s+compartment_id=\d+ interface_index=\d+ sub_interface_index=\d+\r?\n)?'
     r'(?:\s+payload: (?:[0-9a-f]+|\(none\))\r?\n)?'
     r'\s+-> verdict (\w+) sent'
 )

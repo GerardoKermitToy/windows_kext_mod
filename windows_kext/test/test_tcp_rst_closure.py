@@ -60,6 +60,7 @@ CONN = re.compile(
     r"\[CONN v[46]\] id=(?P<id>\d+) pid=(?P<pid>\d+) (?:tid=\d+ )?(?P<direction>\w+) proto=6\(TCP\) "
     r"layer=(?P<layer>\d+)\([^)]*\)\r?\n"
     r"\s+(?P<local>\S+):(?P<lp>\d+) -> (?P<remote>\S+):(?P<rp>\d+)\s+payload=\d+ bytes\r?\n"
+    r"(?:\s+compartment_id=\d+ interface_index=\d+ sub_interface_index=\d+\r?\n)?"
     r"\s+payload: (?P<payload>[0-9a-f]+|\(none\))\r?\n\s+-> verdict (?P<verdict>\w+) sent"
 )
 

@@ -28,7 +28,6 @@ constexpr uint32_t MakeCtlCode(uint32_t function) {
 
 constexpr uint32_t kIoctlVersion = MakeCtlCode(0x800);
 constexpr uint32_t kIoctlShutdown = MakeCtlCode(0x801);
-constexpr uint32_t kIoctlGetThreadId = MakeCtlCode(0x802);
 
 // Every record is [InfoType: u8, size: u32 LE, payload: size bytes].
 constexpr size_t kRecordHeaderSize = 5;
@@ -402,8 +401,7 @@ private:
 
 } // namespace
 
-bool Driver::DeviceControl(uint32_t code, uint8_t* out, uint32_t out_len, std::string& error,
-                           void* input, uint32_t input_len) {
+bool Driver::DeviceControl(uint32_t code, uint8_t* out, uint32_t out_len, std::string& error) {
     if (device_ == nullptr) {
         error = "device not open";
         return false;
@@ -415,28 +413,13 @@ bool Driver::DeviceControl(uint32_t code, uint8_t* out, uint32_t out_len, std::s
     }
     HANDLE device = static_cast<HANDLE>(device_);
     DWORD returned = 0;
-    const BOOL ok = DeviceIoControl(device, code, input, input_len, out, out_len,
+    const BOOL ok = DeviceIoControl(device, code, nullptr, 0, out, out_len,
                                     &returned, ov.get());
     return FinishOverlapped(device, ov.get(), ok, "DeviceIoControl", nullptr, error);
 }
 
 bool Driver::GetVersion(uint8_t out[4], std::string& error) {
     return DeviceControl(kIoctlVersion, out, 4, error);
-}
-
-bool Driver::GetThreadId(uint64_t id, uint64_t& thread_id, std::string& error) {
-    uint8_t input[8] = {};
-    uint8_t output[8] = {};
-    thread_id = 0;
-    for (int i = 0; i < 8; ++i) {
-        input[i] = static_cast<uint8_t>((id >> (i * 8)) & 0xFF);
-    }
-    if (!DeviceControl(kIoctlGetThreadId, output, sizeof(output), error,
-                       input, sizeof(input))) {
-        return false;
-    }
-    thread_id = ReadU64(output);
-    return true;
 }
 
 bool Driver::RequestShutdown(std::string& error) {
@@ -586,9 +569,9 @@ size_t Driver::Dispatch(const Handlers& handlers) {
             case InfoType::ConnectionIpv6: {
                 const bool v6 = (type == InfoType::ConnectionIpv6);
                 const size_t addr_len = v6 ? 16 : 4;
-                // id(8) pid(8) dir(1) proto(1) local_ip remote_ip
-                // lport(2) rport(2) layer(1) payload_len(4)
-                const size_t fixed = 8 + 8 + 1 + 1 + addr_len * 2 + 2 + 2 + 1 + 4;
+                // id(8) pid(8) tid(8) compartment(4) interface(4) subinterface(4)
+                // dir(1) proto(1) local_ip remote_ip lport(2) rport(2) layer(1) payload_len(4)
+                const size_t fixed = 8 + 8 + 8 + 4 + 4 + 4 + 1 + 1 + addr_len * 2 + 2 + 2 + 1 + 4;
                 if (n < fixed) {
                     if (handlers.on_warning) handlers.on_warning("Connection record too short");
                     break;
@@ -598,6 +581,10 @@ size_t Driver::Dispatch(const Handlers& handlers) {
                 size_t o = 0;
                 c.id = ReadU64(p + o);          o += 8;
                 c.process_id = ReadU64(p + o);  o += 8;
+                c.tid = ReadU64(p + o);         o += 8;
+                c.compartment_id = ReadU32(p + o);      o += 4;
+                c.interface_index = ReadU32(p + o);     o += 4;
+                c.sub_interface_index = ReadU32(p + o); o += 4;
                 c.direction = p[o];             o += 1;
                 c.protocol = p[o];              o += 1;
                 std::memcpy(c.local_ip, p + o, addr_len);  o += addr_len;

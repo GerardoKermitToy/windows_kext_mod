@@ -4,8 +4,9 @@ use alloc::vec::Vec;
 #[derive(Clone, Copy)]
 enum InfoType {
     LogLine = 0,
-    ConnectionIpv4 = 1,
-    ConnectionIpv6 = 2,
+    // Values 1 and 2 are reserved for the legacy connection format.
+    ConnectionIpv4 = 7,
+    ConnectionIpv6 = 8,
     ConnectionEndEventV4 = 3,
     ConnectionEndEventV6 = 4,
     BandwidthStatsV4 = 5,
@@ -141,6 +142,10 @@ impl core::fmt::Write for Info {
 pub fn connection_info_v4(
     id: u64,
     process_id: u64,
+    tid: u64,
+    compartment_id: u32,
+    interface_index: u32,
+    sub_interface_index: u32,
     direction: u8,
     protocol: u8,
     local_ip: [u8; 4],
@@ -153,6 +158,10 @@ pub fn connection_info_v4(
     let mut size = get_combined_size!(
         id,
         process_id,
+        tid,
+        compartment_id,
+        interface_index,
+        sub_interface_index,
         direction,
         protocol,
         local_ip,
@@ -168,6 +177,10 @@ pub fn connection_info_v4(
     let vec = &mut info.0;
     push_bytes!(vec, id);
     push_bytes!(vec, process_id);
+    push_bytes!(vec, tid);
+    push_bytes!(vec, compartment_id);
+    push_bytes!(vec, interface_index);
+    push_bytes!(vec, sub_interface_index);
     push_bytes!(vec, direction);
     push_bytes!(vec, protocol);
     push_bytes!(vec, local_ip);
@@ -183,6 +196,10 @@ pub fn connection_info_v4(
 pub fn connection_info_v6(
     id: u64,
     process_id: u64,
+    tid: u64,
+    compartment_id: u32,
+    interface_index: u32,
+    sub_interface_index: u32,
     direction: u8,
     protocol: u8,
     local_ip: [u8; 16],
@@ -195,6 +212,10 @@ pub fn connection_info_v6(
     let mut size = get_combined_size!(
         id,
         process_id,
+        tid,
+        compartment_id,
+        interface_index,
+        sub_interface_index,
         direction,
         protocol,
         local_ip,
@@ -209,6 +230,10 @@ pub fn connection_info_v6(
     let vec = &mut info.0;
     push_bytes!(vec, id);
     push_bytes!(vec, process_id);
+    push_bytes!(vec, tid);
+    push_bytes!(vec, compartment_id);
+    push_bytes!(vec, interface_index);
+    push_bytes!(vec, sub_interface_index);
     push_bytes!(vec, direction);
     push_bytes!(vec, protocol);
     push_bytes!(vec, local_ip);
@@ -410,10 +435,86 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        bandiwth_stats_array_v4, bandiwth_stats_array_v6, BandwidthValueV4, BandwidthValueV6,
+        bandiwth_stats_array_v4, bandiwth_stats_array_v6, connection_info_v4, connection_info_v6,
+        BandwidthValueV4, BandwidthValueV6,
     };
     use alloc::{collections::BTreeMap, vec};
     use core::cell::Cell;
+
+    #[test]
+    fn connection_v4_preserves_metadata_order_and_little_endian() {
+        let info = connection_info_v4(
+            0x0102_0304_0506_0708,
+            0x1112_1314_1516_1718,
+            0x2122_2324_2526_2728,
+            0x3132_3334,
+            0x4142_4344,
+            0x5152_5354,
+            1,
+            17,
+            [1, 2, 3, 4],
+            [5, 6, 7, 8],
+            0x6162,
+            0x7172,
+            3,
+            &[0xaa, 0xbb, 0xcc],
+        );
+        assert_eq!(
+            info.as_bytes(),
+            &[
+                7, 58, 0, 0, 0, 8, 7, 6, 5, 4, 3, 2, 1, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12,
+                0x11, 0x28, 0x27, 0x26, 0x25, 0x24, 0x23, 0x22, 0x21, 0x34, 0x33, 0x32, 0x31, 0x44,
+                0x43, 0x42, 0x41, 0x54, 0x53, 0x52, 0x51, 1, 17, 1, 2, 3, 4, 5, 6, 7, 8, 0x62,
+                0x61, 0x72, 0x71, 3, 3, 0, 0, 0, 0xaa, 0xbb, 0xcc,
+            ]
+        );
+        info.assert_size();
+    }
+
+    #[test]
+    fn connection_v6_preserves_metadata_order_and_little_endian() {
+        let info = connection_info_v6(
+            0x0102_0304_0506_0708,
+            0x1112_1314_1516_1718,
+            0x2122_2324_2526_2728,
+            0x3132_3334,
+            0x4142_4344,
+            0x5152_5354,
+            1,
+            17,
+            core::array::from_fn(|i| i as u8 + 1),
+            core::array::from_fn(|i| i as u8 + 17),
+            0x6162,
+            0x7172,
+            4,
+            &[0xaa, 0xbb, 0xcc],
+        );
+        let mut expected = vec![
+            8, 82, 0, 0, 0, 8, 7, 6, 5, 4, 3, 2, 1, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11,
+            0x28, 0x27, 0x26, 0x25, 0x24, 0x23, 0x22, 0x21, 0x34, 0x33, 0x32, 0x31, 0x44, 0x43,
+            0x42, 0x41, 0x54, 0x53, 0x52, 0x51, 1, 17,
+        ];
+        expected.extend(1..=16);
+        expected.extend(17..=32);
+        expected.extend_from_slice(&[0x62, 0x61, 0x72, 0x71, 4, 3, 0, 0, 0, 0xaa, 0xbb, 0xcc]);
+        assert_eq!(info.as_bytes(), expected.as_slice());
+        info.assert_size();
+    }
+
+    #[test]
+    fn connection_without_metadata_or_payload_keeps_fixed_fields() {
+        let v4 = connection_info_v4(1, 2, 0, 0, 0, 0, 0, 6, [1; 4], [2; 4], 3, 4, 4, &[]);
+        let v6 = connection_info_v6(1, 2, 0, 0, 0, 0, 0, 6, [1; 16], [2; 16], 3, 4, 4, &[]);
+        for (info, info_type, size) in [(v4, 7, 55), (v6, 8, 79)] {
+            let bytes = info.as_bytes();
+            assert_eq!(&bytes[..5], &[info_type, size, 0, 0, 0]);
+            assert_eq!(bytes.len(), size as usize + 5);
+            assert_eq!(&bytes[21..41], &[0; 20]);
+            assert_eq!(&bytes[41..43], &[0, 6]);
+            assert_eq!(&bytes[bytes.len() - 4..], &[0; 4]);
+            info.assert_size();
+        }
+    }
 
     #[test]
     fn empty_bandwidth_iterators_preserve_wire_headers() {
@@ -551,6 +652,10 @@ fn generate_test_info_file() -> Result<(), std::io::Error> {
     let mut info = connection_info_v6(
         1,
         2,
+        9,
+        10,
+        11,
+        12,
         3,
         4,
         [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
@@ -577,6 +682,10 @@ fn generate_test_info_file() -> Result<(), std::io::Error> {
                 let info = connection_info_v4(
                     1,
                     2,
+                    9,
+                    10,
+                    11,
+                    12,
                     3,
                     4,
                     [1, 2, 3, 4],
@@ -594,6 +703,10 @@ fn generate_test_info_file() -> Result<(), std::io::Error> {
                 let info = connection_info_v6(
                     1,
                     2,
+                    9,
+                    10,
+                    11,
+                    12,
                     3,
                     4,
                     [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],

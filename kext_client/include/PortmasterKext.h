@@ -22,8 +22,9 @@ namespace pmkext {
 // InfoType, from protocol/src/info.rs:5
 enum class InfoType : uint8_t {
     LogLine              = 0,
-    ConnectionIpv4       = 1,
-    ConnectionIpv6       = 2,
+    // Values 1 and 2 are reserved for the legacy connection format.
+    ConnectionIpv4       = 7,
+    ConnectionIpv6       = 8,
     ConnectionEndEventV4 = 3,
     ConnectionEndEventV6 = 4,
     BandwidthStatsV4     = 5,
@@ -88,6 +89,10 @@ struct Connection {
     bool     ipv6 = false;
     uint64_t id = 0;
     uint64_t process_id = 0;
+    uint64_t tid = 0;
+    uint32_t compartment_id = 0;
+    uint32_t interface_index = 0;
+    uint32_t sub_interface_index = 0;
     uint8_t  direction = 0;
     uint8_t  protocol = 0;
     uint8_t  local_ip[16] = {};
@@ -218,9 +223,6 @@ public:
 
     // IOCTL_VERSION: returns the 4-byte driver version.
     bool GetVersion(uint8_t out[4], std::string& error);
-    // IOCTL_GET_THREAD_ID: CONN request ID -> captured TID, or 0 if unavailable.
-    // Query before sending the verdict; completed request IDs are discarded.
-    bool GetThreadId(uint64_t id, uint64_t& thread_id, std::string& error);
     // IOCTL_SHUTDOWN_REQUEST: asks the driver to release pending packets.
     bool RequestShutdown(std::string& error);
 
@@ -237,9 +239,10 @@ public:
     void Cleanup();
 
 private:
+    friend struct DriverTestAccess;
+
     bool SendCommand(const uint8_t* data, size_t len, std::string& error);
-    bool DeviceControl(uint32_t code, uint8_t* out, uint32_t out_len, std::string& error,
-                       void* input = nullptr, uint32_t input_len = 0);
+    bool DeviceControl(uint32_t code, uint8_t* out, uint32_t out_len, std::string& error);
     // Consumes whole records from buffer_, returns bytes consumed.
     size_t Dispatch(const Handlers& handlers);
     void ReaderLoop(const Handlers& handlers);

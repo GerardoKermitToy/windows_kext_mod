@@ -20,16 +20,20 @@ PROJECT = Path(__file__).resolve().parents[2]
 CONN = re.compile(
     r'\[CONN v[46]\] id=(?P<id>\d+) pid=(?P<pid>\d+) tid=(?P<tid>\d+) '
     r'(?P<direction>\w+) proto=(?P<proto>\d+)\([^)]*\) layer=\d+\([^)]*\)\r?\n'
-    r'\s+(?P<local>\S+):(?P<lp>\d+) -> (?P<remote>\S+):(?P<rp>\d+)\s+payload=\d+ bytes')
+    r'\s+(?P<local>\S+):(?P<lp>\d+) -> (?P<remote>\S+):(?P<rp>\d+)\s+payload=\d+ bytes\r?\n'
+    r'\s+compartment_id=(?P<compartment_id>\d+) interface_index=(?P<interface_index>\d+) '
+    r'sub_interface_index=(?P<sub_interface_index>\d+)')
 END = re.compile(r'\[END\s+v[46]\] pid=(?P<pid>\d+) (?P<direction>\w+) '
                  r'proto=(?P<proto>\d+)\([^)]*\) (?P<local>\S+):(?P<lp>\d+) -> (?P<remote>\S+):(?P<rp>\d+)')
 CHILD = r'''
-import json, os, socket, sys, threading, time
+import ctypes, json, os, socket, sys, threading, time
+compartment = ctypes.WinDLL('iphlpapi').GetCurrentThreadCompartmentId
+compartment.restype = ctypes.c_uint32
 c=json.loads(sys.argv[1]); f=socket.AF_INET6 if c['ipv6'] else socket.AF_INET
 kind=socket.SOCK_STREAM if c['proto']==6 else socket.SOCK_DGRAM
 s=socket.socket(f,kind);s.setsockopt(socket.SOL_SOCKET,socket.SO_EXCLUSIVEADDRUSE,1)
 s.bind((c['ip'],c.get('port',0)));s.settimeout(8)
-print(json.dumps(dict(pid=os.getpid(),tid=threading.get_native_id(),port=s.getsockname()[1])),flush=True)
+print(json.dumps(dict(pid=os.getpid(),tid=threading.get_native_id(),port=s.getsockname()[1],compartment_id=compartment())),flush=True)
 assert sys.stdin.readline().strip()=='go'
 start=time.monotonic(); outcome={}
 if c['mode']=='close':
@@ -103,7 +107,7 @@ def events(text, pattern):
     result = []
     for match in pattern.finditer(text):
         e = match.groupdict()
-        for key in ('pid', 'tid', 'proto', 'lp', 'rp', 'id'):
+        for key in ('pid', 'tid', 'proto', 'lp', 'rp', 'id', 'compartment_id', 'interface_index', 'sub_interface_index'):
             if key in e:
                 e[key] = int(e[key])
         for key in ('local', 'remote'):
@@ -247,7 +251,7 @@ def run(args):
                 for event in owned:
                     assert event['tid'] == threading.get_native_id(), ('Wrong control TID', event)
                     block = text()[text().index(f'[CONN v{6 if args.ipv6 else 4}] id={event["id"]}'):]
-                    block = '\n'.join(block.splitlines()[:4])
+                    block = '\n'.join(block.splitlines()[:5])
                     assert re.search(r'-> verdict PermanentAccept sent(?:\r?\n|$)', block), ('Control verdict delayed or matched', event, block)
                 checks.append(dict(test='nonmatching_immediate_control', pid=os.getpid(), proto=proto,
                                    local_port=client_port, remote_port=target, connections=owned))
@@ -259,6 +263,10 @@ def run(args):
         check_monitor(monitor)
         conn = wait_for(lambda: selected(CONN, child, proto), 6, ('Missing owned CONN', child.meta, proto, text()))
         assert all(e['tid'] == child.meta['tid'] for e in conn), ('Wrong outbound TID', child.meta, conn)
+        assert all(e['compartment_id'] == child.meta['compartment_id'] for e in conn), \
+            ('Wrong compartment ID', child.meta, conn)
+        if proto == 17:
+            assert all(e['interface_index'] > 0 for e in conn), ('Missing packet interface', conn)
         return conn
     def verify_end(child, proto):
         check_monitor(monitor)

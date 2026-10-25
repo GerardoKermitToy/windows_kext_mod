@@ -16,6 +16,7 @@ use crate::connection::{
 use crate::connection_cache::ConnectionCache;
 use crate::connection_map::Key;
 use crate::device::{Device, Packet};
+use crate::id_cache::ConnectionMetadata;
 use crate::packet_metadata::{IcmpError, PacketInspector, PacketMetadataError};
 use crate::packet_util::{packet_reader, recalc_header_checksums, Redirect};
 
@@ -606,19 +607,15 @@ fn ip_packet_layer(
         }
 
         // Only temporary/stateless decisions reach the pending-packet path.
-        let packet = match clone_packet(
-            device,
-            nbl,
-            packet_inject_info(
-                &data,
-                &fields,
-                &mut routing_info,
-                effective_direction,
-                ipv6,
-                key.is_loopback(),
-            ),
-            CloneChecksum::Recalculate,
-        ) {
+        let inject_info = packet_inject_info(
+            &data,
+            &fields,
+            &mut routing_info,
+            effective_direction,
+            ipv6,
+            key.is_loopback(),
+        );
+        let packet = match clone_packet(device, nbl, inject_info, CloneChecksum::Recalculate) {
             Ok(p) => p,
             Err(err) => {
                 crate::err!("failed to clone packet: {}", err);
@@ -634,7 +631,12 @@ fn ip_packet_layer(
             (key, packet),
             connection_instance_id,
             process_id,
-            thread_id,
+            ConnectionMetadata {
+                thread_id,
+                compartment_id: inject_info.compartment_id.unwrap_or(0),
+                interface_index: inject_info.interface_index,
+                sub_interface_index: inject_info.sub_interface_index,
+            },
             effective_direction,
             false,
         ) {

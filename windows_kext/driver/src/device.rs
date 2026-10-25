@@ -36,7 +36,7 @@ use crate::{
     connection_map::Key,
     dbg, err,
     icmp_echo_cache::IcmpEchoCache,
-    id_cache::{IdCache, PendingPacket},
+    id_cache::{ConnectionMetadata, IdCache, PendingPacket},
     logger,
     packet_util::Redirect,
     tcp_closure_cache::{PendingTcpClosure, TcpClosureCache},
@@ -309,10 +309,8 @@ impl Device {
     /// Called when handle. Read is called from user-space.
     pub fn read(&self, read_request: &mut ReadRequest) -> NTSTATUS {
         #[cfg(feature = "perf-etw")]
-        let _perf_span = wdk::perf::Span::new(
-            wdk::perf::Operation::Read,
-            read_request.free_space() as u64,
-        );
+        let _perf_span =
+            wdk::perf::Span::new(wdk::perf::Operation::Read, read_request.free_space() as u64);
         // Keep one exclusive owner across the entire operation. Locking only the
         // individual load/save calls permits two overlapped reads to consume the
         // same logical stream concurrently and overwrite each other's fragment.
@@ -372,10 +370,7 @@ impl Device {
 
     /// Applies commands in buffer order until the write is exhausted or one is invalid.
     /// Commands completed before an error remain applied.
-    pub(crate) fn write(
-        &self,
-        write_request: &WriteRequest,
-    ) -> Result<(), CommandWriteError> {
+    pub(crate) fn write(&self, write_request: &WriteRequest) -> Result<(), CommandWriteError> {
         let mut remaining = write_request.get_buffer();
         if unlikely(remaining.is_empty()) {
             err!("Rejecting empty command write");
@@ -469,7 +464,11 @@ impl Device {
                         verdict.id,
                         perf_stamp,
                         u8::from(key.protocol),
-                        if matches!(key.local_address, IpAddress::Ipv4(_)) { 4 } else { 6 },
+                        if matches!(key.local_address, IpAddress::Ipv4(_)) {
+                            4
+                        } else {
+                            6
+                        },
                         verdict.verdict,
                     );
                     let _request_guard = PendingRequestGuard {
@@ -998,7 +997,7 @@ impl Device {
         value: (Key, Packet),
         connection_instance_id: Option<u64>,
         process_id: u64,
-        thread_id: u64,
+        mut metadata: ConnectionMetadata,
         direction: crate::connection::Direction,
         ale_layer: bool,
     ) -> Option<PendingPacket> {
@@ -1020,15 +1019,16 @@ impl Device {
                     instance_id,
                     pending,
                     |_, pending, thread_id| {
+                        metadata.thread_id = thread_id;
                         self.enqueue_pending_packet(
-                            pending, process_id, thread_id, direction, ale_layer,
+                            pending, process_id, metadata, direction, ale_layer,
                         );
                     },
                 )
                 .err();
         }
 
-        self.enqueue_pending_packet(pending, process_id, thread_id, direction, ale_layer);
+        self.enqueue_pending_packet(pending, process_id, metadata, direction, ale_layer);
         None
     }
 
@@ -1036,7 +1036,7 @@ impl Device {
         &self,
         pending: PendingPacket,
         mut process_id: u64,
-        mut thread_id: u64,
+        mut metadata: ConnectionMetadata,
         direction: crate::connection::Direction,
         ale_layer: bool,
     ) {
@@ -1050,8 +1050,11 @@ impl Device {
             if process_id == 0 {
                 process_id = wdk::utils::current_process_id();
             }
-            if thread_id == 0 && !matches!(process_id, 0 | 4) && !self.is_owner_pid(process_id as u32) {
-                thread_id = wdk::utils::current_thread_id();
+            if metadata.thread_id == 0
+                && !matches!(process_id, 0 | 4)
+                && !self.is_owner_pid(process_id as u32)
+            {
+                metadata.thread_id = wdk::utils::current_thread_id();
             }
         }
         let infos = {
@@ -1068,7 +1071,7 @@ impl Device {
                     (pending.key, pending.packet),
                     connection_instance_id,
                     process_id,
-                    thread_id,
+                    metadata,
                     direction,
                     ale_layer,
                 )
