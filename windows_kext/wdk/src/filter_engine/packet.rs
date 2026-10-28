@@ -11,7 +11,7 @@ use core::{
     pin::Pin,
     sync::atomic::{AtomicBool, AtomicPtr, Ordering},
 };
-use likely_stable::unlikely;
+use likely_stable::{likely, unlikely};
 use windows_sys::{
     Wdk::{
         Foundation::KDPC,
@@ -191,7 +191,7 @@ impl InjectionCompletion {
     fn report_if_failed(self, status: NTSTATUS) {
         // Match NT_SUCCESS: zero and positive informational statuses are not
         // failures. Immediate negative statuses never reach this completion path.
-        if status >= 0 {
+        if likely(status >= 0) {
             return;
         }
         if let Some(callback) = self.failure_callback {
@@ -563,7 +563,7 @@ impl Injector {
     ) -> Result<TransportPacketList, String> {
         let control_data = capture_ale_control_data(inbound, || callout_data.get_control_data());
 
-        let address_length = if ipv6 { 16 } else { 4 };
+        let address_length = if unlikely(ipv6) { 16 } else { 4 };
         if remote_ip_slice.len() != address_length {
             return Err("invalid remote address length".to_string());
         }
@@ -731,7 +731,11 @@ impl Injector {
                 header_include_header_length: 0,
             };
 
-            let address_family = if boxed.ipv6 { AF_INET6 } else { AF_INET };
+            let address_family = if unlikely(boxed.ipv6) {
+                AF_INET6
+            } else {
+                AF_INET
+            };
             let compartment_id = resolve_compartment_id(boxed.compartment_id);
             let raw_ptr = Box::into_raw(boxed);
 
@@ -862,7 +866,7 @@ impl Injector {
         nbl: *const NET_BUFFER_LIST,
         ipv6: bool,
     ) {
-        let handle = if ipv6 {
+        let handle = if unlikely(ipv6) {
             self.packet_inject_handle_v6.load(Ordering::Acquire)
         } else {
             self.packet_inject_handle_v4.load(Ordering::Acquire)

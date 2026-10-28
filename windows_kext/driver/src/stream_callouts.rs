@@ -15,7 +15,7 @@ fn get_stream_direction_and_length(data: &mut CalloutData) -> Option<(Direction,
     // WFP also reports stream lifecycle indications that carry no payload.
     // They must not create zero-valued bandwidth entries.
     let data_length = packet.get_data_len();
-    if data_length == 0 {
+    if unlikely(data_length == 0) {
         return None;
     }
     Some((direction, data_length))
@@ -162,7 +162,7 @@ pub fn stream_layer_udp_v4(data: CalloutData) {
     }
 
     let data_length = get_datagram_payload_length(&data, direction);
-    if data_length == 0 {
+    if unlikely(data_length == 0) {
         return;
     }
 
@@ -213,7 +213,7 @@ pub fn stream_layer_udp_v6(data: CalloutData) {
     }
 
     let data_length = get_datagram_payload_length(&data, direction);
-    if data_length == 0 {
+    if unlikely(data_length == 0) {
         return;
     }
 

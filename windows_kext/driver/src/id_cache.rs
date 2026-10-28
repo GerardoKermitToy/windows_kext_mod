@@ -517,10 +517,12 @@ fn build_info(
     packet: &Packet,
     ale_layer: bool,
 ) -> Option<Info> {
-    let (local_port, remote_port) = match key.protocol {
-        IpProtocol::Tcp | IpProtocol::Udp => (key.local_port, key.remote_port),
-        _ => (0, 0),
-    };
+    let (local_port, remote_port) =
+        if likely(matches!(key.protocol, IpProtocol::Tcp | IpProtocol::Udp)) {
+            (key.local_port, key.remote_port)
+        } else {
+            (0, 0)
+        };
 
     let payload_layer = if ale_layer {
         4 // Transport layer

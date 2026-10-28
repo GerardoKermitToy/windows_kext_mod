@@ -166,7 +166,7 @@ pub trait Connection {
     type RemoteAddressKey: Copy + Ord;
 
     fn redirect_info(&self) -> Option<RedirectInfo> {
-        let redirect_address = if self.is_ipv6() {
+        let redirect_address = if unlikely(self.is_ipv6()) {
             IpAddress::Ipv6(Ipv6Address::LOOPBACK)
         } else {
             IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1))

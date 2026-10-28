@@ -100,11 +100,13 @@ fn get_protocol(data: &CalloutData, index: usize) -> IpProtocol {
 }
 
 fn get_protocol_if_present(data: &CalloutData, index: usize) -> Option<IpProtocol> {
-    matches!(data.get_value_type(index), ValueType::FwpUint8).then(|| get_protocol(data, index))
+    likely(matches!(data.get_value_type(index), ValueType::FwpUint8))
+        .then(|| get_protocol(data, index))
 }
 
 fn get_u16_if_present(data: &CalloutData, index: usize) -> Option<u16> {
-    matches!(data.get_value_type(index), ValueType::FwpUint16).then(|| data.get_value_u16(index))
+    likely(matches!(data.get_value_type(index), ValueType::FwpUint16))
+        .then(|| data.get_value_u16(index))
 }
 
 /// Reads a `FWP_UINT32` field, returning 0 when the field is not populated.
@@ -141,7 +143,7 @@ fn get_ipv4_address(data: &CalloutData, index: usize) -> IpAddress {
 }
 
 fn get_ipv4_address_if_present(data: &CalloutData, index: usize) -> Option<IpAddress> {
-    matches!(data.get_value_type(index), ValueType::FwpUint32)
+    likely(matches!(data.get_value_type(index), ValueType::FwpUint32))
         .then(|| get_ipv4_address(data, index))
 }
 
@@ -150,8 +152,11 @@ fn get_ipv6_address(data: &CalloutData, index: usize) -> IpAddress {
 }
 
 fn get_ipv6_address_if_present(data: &CalloutData, index: usize) -> Option<IpAddress> {
-    matches!(data.get_value_type(index), ValueType::FwpByteArray16Type)
-        .then(|| get_ipv6_address(data, index))
+    likely(matches!(
+        data.get_value_type(index),
+        ValueType::FwpByteArray16Type
+    ))
+    .then(|| get_ipv6_address(data, index))
 }
 
 pub fn ale_layer_connect_v4(data: CalloutData) {
