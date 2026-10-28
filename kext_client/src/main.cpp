@@ -64,9 +64,8 @@ struct Options {
     // Everything else keeps getting PermanentAccept.
     //
     // Without --match the verdict applies to every connection instead. That is
-    // what the option is for, but it is worth knowing what it costs: a redirect
-    // sends all traffic to a local port that is probably not listening, and a
-    // block cuts the network - including whatever remote session would be needed
+    // what the option is for, but it is worth knowing what it costs: a block
+    // or drop cuts the network - including whatever remote session would be needed
     // to stop this program. Use --duration so the run ends on its own.
     pmkext::Verdict alt_verdict = pmkext::Verdict::PermanentAccept;
     bool has_alt = false;
@@ -213,10 +212,6 @@ void PrintUsage() {
         "                   and do not suppress logs or warnings.\n"
         "\n"
         "Behaviour:\n"
-        "  Does not set IgnoreSpecialPorts. The driver reads it once at load;\n"
-        "  missing/invalid values keep special handling for ports 53/717/719.\n"
-        "  Only REG_DWORD 1 disables special handling. No monitor switch sets it.\n"
-        "\n"
         "  --no-inbound-udp-pid-fallback\n"
         "                   write EnableInboundUdpCacheMissPidFallback=0 before load.\n"
         "                   Default: 1; the driver reads it once at startup.\n"
@@ -245,7 +240,6 @@ void PrintUsage() {
         "  --verdict V [--match IP[:PORT]]\n"
         "                   answer connections with verdict V.\n"
         "                   V: accept | permanent-accept\n"
-        "                      | redirect-tunnel | redirect-split | redirect-dns\n"
         "                      | block | drop | permanent-block | permanent-drop\n"
         "\n"
         "                   accept permits the packet without caching the\n"
@@ -260,7 +254,7 @@ void PrintUsage() {
         "                   get PermanentAccept. Without --match V applies to\n"
         "                   EVERY connection.\n"
         "\n"
-        "                   Applying redirect, block or drop to all traffic can\n"
+        "                   Applying block or drop to all traffic can\n"
         "                   take this machine off the network, including the\n"
         "                   session you would need to stop this program. Pair it\n"
         "                   with --duration so the run ends on its own.\n"
@@ -273,9 +267,7 @@ void PrintUsage() {
         "  kext_monitor.exe --duration 30 --filter-pid 1234 --filter-protocol 6\n"
         "  kext_monitor.exe --duration 30 --filter-protocol 58\n"
         "  kext_monitor.exe --duration 30 --verdict accept --match 192.168.219.15\n"
-        "  kext_monitor.exe --duration 30 --verdict-delay-ms 250\n"
-        "  kext_monitor.exe --duration 30 --verdict redirect-tunnel \\\n"
-        "                   --match 192.168.219.15:9999\n");
+        "  kext_monitor.exe --duration 30 --verdict-delay-ms 250\n");
 }
 
 // Returns false on a malformed argument list.
@@ -354,12 +346,6 @@ bool ParseArgs(int argc, wchar_t** argv, Options& opt) {
                 opt.alt_verdict = pmkext::Verdict::Accept;
             } else if (v == L"permanent-accept") {
                 opt.alt_verdict = pmkext::Verdict::PermanentAccept;
-            } else if (v == L"redirect-tunnel") {
-                opt.alt_verdict = pmkext::Verdict::RedirectTunnel;
-            } else if (v == L"redirect-split") {
-                opt.alt_verdict = pmkext::Verdict::RedirectSplitTunnel;
-            } else if (v == L"redirect-dns") {
-                opt.alt_verdict = pmkext::Verdict::RedirectNameServer;
             } else if (v == L"block") {
                 opt.alt_verdict = pmkext::Verdict::Block;
             } else if (v == L"drop") {
@@ -531,8 +517,8 @@ bool ParseArgs(int argc, wchar_t** argv, Options& opt) {
     }
 
     // --match is optional. Without it the verdict applies to every connection,
-    // which is a legitimate diagnostic mode but not a harmless one: a redirect
-    // sends all traffic to a local port, and a block or drop cuts the network
+    // which is a legitimate diagnostic mode but not a harmless one: a block
+    // or drop cuts the network
     // along with any remote session needed to stop this program. The run is
     // allowed, with a warning printed at startup.
     if (!opt.has_alt && opt.has_match) {
@@ -654,8 +640,8 @@ int wmain(int argc, wchar_t** argv) {
                         opt.alt_match_ip.c_str(), pmkext::ToString(opt.alt_verdict));
         }
     } else if (opt.has_alt) {
-        // No --match: this hits everything. Say so plainly, because a redirect or
-        // a block applied to all traffic can take the machine off the network
+        // No --match: this hits everything. Say so plainly, because a block or
+        // drop applied to all traffic can take the machine off the network
         // before the first record is written.
         std::printf("Answering EVERY connection with %s (no --match given).\n",
                     pmkext::ToString(opt.alt_verdict));

@@ -10,15 +10,13 @@ use wdk::filter_engine::packet::InjectInfo;
 use crate::ale_policy::{
     classify_packet_injection, inbound_udp_fallback_pid, PacketInjectionAction,
 };
-use crate::connection::{
-    fast_track_pm_packets, Connection, ConnectionV4, ConnectionV6, Direction, RedirectInfo, Verdict,
-};
+use crate::connection::{Connection, ConnectionV4, ConnectionV6, Direction, Verdict};
 use crate::connection_cache::ConnectionCache;
 use crate::connection_map::Key;
 use crate::device::{Device, Packet};
 use crate::id_cache::ConnectionMetadata;
 use crate::packet_metadata::{IcmpError, PacketInspector, PacketMetadataError};
-use crate::packet_util::{packet_reader, recalc_header_checksums, Redirect};
+use crate::packet_util::{packet_reader, recalc_header_checksums};
 
 struct PacketLayerFields {
     interface_index: usize,
@@ -128,7 +126,6 @@ struct ConnectionInfo {
     process_id: u64,
     direction: Direction,
     instance_id: u64,
-    redirect_info: Option<RedirectInfo>,
 }
 
 impl ConnectionInfo {
@@ -139,18 +136,6 @@ impl ConnectionInfo {
             process_id: conn.get_process_id(),
             direction: conn.get_direction(),
             instance_id: conn.get_instance_id(),
-            // Avoid a second redirect-policy dispatch for the overwhelmingly
-            // common non-redirect verdicts.
-            redirect_info: if matches!(
-                verdict,
-                Verdict::RedirectNameServer
-                    | Verdict::RedirectTunnel
-                    | Verdict::RedirectSplitTunnel
-            ) {
-                conn.redirect_info()
-            } else {
-                None
-            },
         }
     }
 }
@@ -261,16 +246,11 @@ fn ip_packet_layer(
         };
         first = false;
 
-        if fast_track_pm_packets(&key) {
-            data.action_permit();
-            return;
-        }
-
         let transport_protocol = matches!(
             key.protocol,
             smoltcp::wire::IpProtocol::Tcp | smoltcp::wire::IpProtocol::Udp
         );
-        // Read connection state once for policy or redirect rewriting.
+        // Read connection state once for policy.
         let connection_info = if likely(transport_protocol) {
             get_connection_info(
                 &device.connection_cache,
@@ -283,16 +263,8 @@ fn ip_packet_layer(
             None
         };
 
-        // Resets never need a userspace verdict, but cached redirects must
-        // rewrite their tuple below, even after the sending endpoint closes.
-        if unlikely(
-            key.protocol == smoltcp::wire::IpProtocol::Tcp
-                && inspection.is_tcp_reset()
-                && connection_info
-                    .as_ref()
-                    .and_then(|info| info.redirect_info.as_ref())
-                    .is_none(),
-        ) {
+        // Resets never need a userspace verdict, even after endpoint closure.
+        if unlikely(key.protocol == smoltcp::wire::IpProtocol::Tcp && inspection.is_tcp_reset()) {
             data.action_permit();
             return;
         }
@@ -450,7 +422,7 @@ fn ip_packet_layer(
         }
 
         if likely(transport_protocol) {
-            if let Some(mut conn_info) = connection_info {
+            if let Some(conn_info) = connection_info {
                 // A new inbound connection must reach ALE_AUTH_RECV_ACCEPT so it
                 // can be attributed and authorized there. Keep permitting it while
                 // that authorization is still pending and the owning process is
@@ -458,8 +430,7 @@ fn ip_packet_layer(
                 // application PID is known, enforce it at the packet layer below.
                 //
                 // Connections authorized by ALE_AUTH_CONNECT are intentionally not
-                // bypassed here. Their packet path still handles temporary verdicts
-                // and reverse redirect rewriting on received packets.
+                // bypassed here. Their packet path still handles temporary verdicts.
                 if matches!(conn_info.direction, Direction::Inbound)
                     && matches!(conn_info.verdict, Verdict::Undecided)
                     && matches!(conn_info.process_id, 0 | 4)
@@ -482,44 +453,6 @@ fn ip_packet_layer(
                         continue;
                     }
                     Verdict::Undeterminable | Verdict::PermanentDrop | Verdict::Failed => {
-                        data.block_and_absorb();
-                        continue;
-                    }
-                    Verdict::RedirectNameServer
-                    | Verdict::RedirectTunnel
-                    | Verdict::RedirectSplitTunnel => {
-                        if let Some(redirect_info) = conn_info.redirect_info.take() {
-                            match clone_packet(
-                                device,
-                                nbl,
-                                packet_inject_info(
-                                    &data,
-                                    &fields,
-                                    &mut routing_info,
-                                    effective_direction,
-                                    ipv6,
-                                    key.is_loopback(),
-                                ),
-                                CloneChecksum::RedirectWillRecalculate,
-                            ) {
-                                Ok(mut packet) => match packet.redirect(redirect_info) {
-                                    Ok(()) => {
-                                        if let Err(err) = device.inject_packet(packet, false) {
-                                            crate::err!("failed to inject packet: {}", err);
-                                        }
-                                    }
-                                    Err(err) => {
-                                        // The original packet is absorbed below. Drop an
-                                        // unmodified or partially redirected clone rather
-                                        // than bypassing the redirect policy.
-                                        crate::err!("failed to redirect packet: {}", err);
-                                    }
-                                },
-                                Err(err) => crate::err!("failed to clone packet: {}", err),
-                            }
-                        }
-
-                        // This will block the original packet. Even if injection failed.
                         data.block_and_absorb();
                         continue;
                     }
@@ -615,7 +548,7 @@ fn ip_packet_layer(
             ipv6,
             key.is_loopback(),
         );
-        let packet = match clone_packet(device, nbl, inject_info, CloneChecksum::Recalculate) {
+        let packet = match clone_packet(device, nbl, inject_info) {
             Ok(p) => p,
             Err(err) => {
                 crate::err!("failed to clone packet: {}", err);
@@ -650,11 +583,6 @@ fn ip_packet_layer(
         }
         data.block_and_absorb();
     }
-}
-
-enum CloneChecksum {
-    Recalculate,
-    RedirectWillRecalculate,
 }
 
 struct PacketRoutingInfo {
@@ -693,19 +621,16 @@ fn clone_packet(
     device: &Device,
     nbl: NetBufferList,
     inject_info: InjectInfo,
-    checksum: CloneChecksum,
 ) -> Result<Packet, String> {
     let mut clones = nbl.clone_packets(&device.network_allocator)?;
 
-    if matches!(checksum, CloneChecksum::Recalculate) {
-        match &mut clones {
-            NetBufferListClones::Single(clone) => {
+    match &mut clones {
+        NetBufferListClones::Single(clone) => {
+            recalculate_clone_checksum(clone, inject_info.ipv6)?;
+        }
+        NetBufferListClones::Batch(clones) => {
+            for clone in clones {
                 recalculate_clone_checksum(clone, inject_info.ipv6)?;
-            }
-            NetBufferListClones::Batch(clones) => {
-                for clone in clones {
-                    recalculate_clone_checksum(clone, inject_info.ipv6)?;
-                }
             }
         }
     }
@@ -724,8 +649,7 @@ fn recalculate_clone_checksum(clone: &mut NetBufferList, ipv6: bool) -> Result<(
     // pseudo-header checksum because the TCP/IP stack asked the NIC to finish
     // checksum offload. Packet cloning copies the bytes into a fresh NBL but does
     // not copy the original checksum-offload metadata, so a pending clone needs
-    // complete software checksums. Cached redirects defer this pass because they
-    // immediately write the final addresses, port and checksum in one traversal.
+    // complete software checksums.
     recalc_header_checksums(data, ipv6)
 }
 

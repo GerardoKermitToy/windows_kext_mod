@@ -671,11 +671,7 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
                 data.block_and_absorb();
             }
             // There is a verdict
-            Verdict::PermanentAccept
-            | Verdict::Accept
-            | Verdict::RedirectNameServer
-            | Verdict::RedirectTunnel
-            | Verdict::RedirectSplitTunnel => {
+            Verdict::PermanentAccept | Verdict::Accept => {
                 // Authorize at ALE. Outbound traffic continues to the packet
                 // layer; inbound traffic has already passed it.
                 data.action_permit();
@@ -836,8 +832,7 @@ fn save_packet(
     }
     // A reset's send endpoint is already closing; replaying it after a verdict
     // fails with STATUS_NOT_FOUND. Inspect only the clone we already had to save,
-    // with no extra NBL reads on the cached-verdict path. Packet layers retain
-    // responsibility for cached redirect rewriting.
+    // with no extra NBL reads on the cached-verdict path.
     if packet_list.as_ref().is_some_and(|packet| {
         packet.get_event_data().is_some_and(|header| {
             should_permit_ale_tcp_reset(ale_data.protocol, ale_data.reauthorize, header)

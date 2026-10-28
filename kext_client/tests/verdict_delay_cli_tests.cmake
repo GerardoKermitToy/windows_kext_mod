@@ -25,14 +25,8 @@ function(check_parse expected)
     if(expected EQUAL 0 AND NOT output MATCHES "EnableInboundUdpCacheMissPidFallback=0")
         message(FATAL_ERROR "Help does not document the disabled registry value")
     endif()
-    if(expected EQUAL 0 AND NOT output MATCHES "Does not set IgnoreSpecialPorts")
-        message(FATAL_ERROR "Help does not document that the monitor does not write IgnoreSpecialPorts")
-    endif()
-    if(expected EQUAL 0 AND NOT output MATCHES "Only REG_DWORD 1 disables special handling")
-        message(FATAL_ERROR "Help does not document the driver's special-port registry contract")
-    endif()
-    if(expected EQUAL 0 AND output MATCHES "Always writes IgnoreSpecialPorts=1")
-        message(FATAL_ERROR "Help still promises unconditional special-port bypass")
+    if(expected EQUAL 0 AND output MATCHES "redirect-|IgnoreSpecialPorts")
+        message(FATAL_ERROR "Help still advertises unsupported redirection or special-port settings")
     endif()
     if(expected EQUAL 2 AND NOT output MATCHES "ERROR: --verdict-delay-ms")
         message(FATAL_ERROR "Invalid delay did not produce the expected error: ${output}")
@@ -73,3 +67,20 @@ if(NOT "${result}" STREQUAL "2")
     message(FATAL_ERROR "Empty delay: expected exit 2, got ${result}")
 endif()
 message(STATUS "PASS: verdict delay CLI validation")
+
+foreach(verdict IN ITEMS accept permanent-accept block drop permanent-block permanent-drop)
+    check_parse(0 --verdict "${verdict}")
+endforeach()
+
+foreach(verdict IN ITEMS redirect-dns redirect-tunnel redirect-split)
+    execute_process(
+        COMMAND "${MONITOR}" --duration 1 --help --verdict "${verdict}"
+        RESULT_VARIABLE result
+        OUTPUT_VARIABLE output
+        ERROR_VARIABLE error
+        TIMEOUT 5
+    )
+    if(NOT "${result}" STREQUAL "2" OR NOT output MATCHES "ERROR: unknown verdict")
+        message(FATAL_ERROR "Unsupported verdict '${verdict}' was not rejected: ${result}\n${output}${error}")
+    endif()
+endforeach()

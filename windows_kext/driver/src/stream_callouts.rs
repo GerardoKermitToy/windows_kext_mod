@@ -101,8 +101,8 @@ fn get_datagram_payload_length(data: &CalloutData, direction: Direction) -> usiz
 /// driver re-injected itself.
 ///
 /// Pending packets are absorbed and re-injected when accepted. Temporary verdicts
-/// can repeat this path for later packets, and cached redirects also re-inject
-/// packets after rewriting them. Cached PermanentAccept traffic passes in place.
+/// can repeat this path for later packets. Cached PermanentAccept traffic passes
+/// in place.
 ///
 /// The caller must combine this with the direction, because the meaning of a
 /// self-injected copy differs per direction:

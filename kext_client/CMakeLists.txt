@@ -69,6 +69,10 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(verdict_tests tests/verdict_tests.cpp)
+    target_link_libraries(verdict_tests PRIVATE pmkext)
+    add_test(NAME verdict_tests COMMAND verdict_tests)
+
     add_executable(connection_record_tests tests/connection_record_tests.cpp)
     target_link_libraries(connection_record_tests PRIVATE pmkext)
     add_test(NAME connection_record_tests COMMAND connection_record_tests)

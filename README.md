@@ -2,7 +2,7 @@
 
 This repository contains a modified version of the original Portmaster Windows Kernel Extension. **Version 3.0.0.0 is not API-compatible with the original Portmaster Windows Kernel Extension.** The driver and its user-mode client must both support the version 3 connection-event format described below.
 
-The modified driver is implemented in Rust as a `no_std` KMDF non-PnP Windows network driver. It registers Windows Filtering Platform (WFP) callouts, intercepts IPv4 and IPv6 traffic, delegates packet decisions to a user-mode process, caches verdicts, blocks or redirects traffic, and collects TCP/UDP bandwidth statistics.
+The modified driver is implemented in Rust as a `no_std` KMDF non-PnP Windows network driver. It registers Windows Filtering Platform (WFP) callouts, intercepts IPv4 and IPv6 traffic, delegates packet decisions to a user-mode process, caches verdicts, blocks or permits traffic, and collects TCP/UDP bandwidth statistics.
 
 ## API version and compatibility
 
@@ -43,20 +43,19 @@ A new packet without a permanent cached decision is blocked and retained until t
 
 ## Registry settings
 
-The driver supports two optional `REG_DWORD` values under:
+The driver supports an optional `REG_DWORD` value under:
 
 ```text
 HKLM\SYSTEM\CurrentControlSet\Services\PortmasterKext\Parameters
 ```
 
-Only a DWORD value of exactly `1` enables an option. A missing value, a different registry type, malformed data, or any other DWORD value leaves it disabled. Both options are read **once in `DriverEntry`, before WFP filtering starts**. The driver does not monitor registry changes; a change takes effect only after unloading and reloading the driver, not after reopening the device or clearing the cache.
+Only a DWORD value of exactly `1` enables the option. A missing value, a different registry type, malformed data, or any other DWORD value leaves it disabled. The option is read **once in `DriverEntry`, before WFP filtering starts**. The driver does not monitor registry changes; a change takes effect only after unloading and reloading the driver, not after reopening the device or clearing the cache.
 
 | Value name | Driver default when absent |
 |---|---:|
 | `EnableInboundUdpCacheMissPidFallback` | `0` (disabled) |
-| `IgnoreSpecialPorts` | `0` (disabled) |
 
-These registry options do not add commands or change the driver wire protocol.
+This registry option does not add commands or change the driver wire protocol.
 
 ### `EnableInboundUdpCacheMissPidFallback`
 
@@ -70,24 +69,8 @@ Until associated with a native UDP endpoint, the heuristic entry is eligible for
 
 See [windows_kext/INBOUND_UDP_PID_FALLBACK.md](windows_kext/INBOUND_UDP_PID_FALLBACK.md) for matching and cache-lifecycle details.
 
-### `IgnoreSpecialPorts`
-
-Despite its name, setting this option to `1` does **not** exempt traffic on special ports from filtering. It disables the historical port-based packet bypasses and reverse-redirect cache lookup. Such packets use ordinary exact-tuple cache lookup and policy handling instead of receiving an implicit exception or being matched to another connection through the special-port reverse lookup.
-
-When `IgnoreSpecialPorts = 0`, the following historical shortcuts remain active for IPv4 and IPv6:
-
-| Shortcut | Condition |
-|---|---|
-| Automatic packet permit | Local and remote IP addresses are equal, and the **local port** is `53` (DNS), `717` (tunnel), or `719` (split tunnel) |
-| DNS reverse-redirect lookup | The **remote port** is `53` and the remote address is the IP family's loopback address |
-| Tunnel reverse-redirect lookup | The **remote port** is `717` and local and remote IP addresses are equal |
-| Split-tunnel reverse-redirect lookup | The **remote port** is `719` and local and remote IP addresses are equal |
-
-The port conditions can match TCP or UDP and apply in either packet direction. They use the cache-normalized local/remote endpoints, not fixed source/destination positions: the local port is the source port outbound and the destination port inbound. There is no blanket bypass for all traffic whose remote port is one of these special ports. Reverse lookup searches redirect aliases within the same protocol/local-port cache group.
-
-Explicit redirect verdicts remain available with `IgnoreSpecialPorts = 1`, including forward address/port rewriting, but special-port reverse-redirect lookup is disabled; clients relying on the historical reply-matching behavior must account for this setting.
-
-See [windows_kext/IGNORE_SPECIAL_PORTS.md](windows_kext/IGNORE_SPECIAL_PORTS.md) for the affected ports and matching rules.
+Ports `53`, `717`, and `719` use ordinary exact-tuple connection lookup and policy
+handling. There are no port-based bypasses or address/port rewriting.
 
 ## Device access
 
@@ -391,12 +374,11 @@ Payload:
 | `5` | `PermanentBlock` | Hard-block the current and later packets for this cache instance |
 | `6` | `Drop` | Silently absorb the current packet; the decision is temporary |
 | `7` | `PermanentDrop` | Silently absorb later packets for this cache instance |
-| `8` | `RedirectNameServer` | Redirect TCP/UDP traffic to loopback port `53` |
-| `9` | `RedirectTunnel` | Redirect TCP/UDP traffic to the local address on port `717` |
 | `10` | `Failed` | Fail closed, representing a persistent policy-decision failure |
-| `11` | `RedirectSplitTunnel` | Redirect TCP/UDP traffic to the local address on port `719` |
 
-Redirect verdicts are cached for the connection. Outbound packets receive a rewritten destination address and port with recalculated IP/TCP/UDP checksums. With `IgnoreSpecialPorts = 0`, the historical reverse-redirect lookup allows reply traffic to be rewritten back so that the application continues to observe the original remote endpoint. `IgnoreSpecialPorts = 1` disables this lookup, as described in [Registry settings](#ignorespecialports). Redirects are meaningful only for a live TCP/UDP cache instance. If redirect state is unavailable or a packet cannot be rewritten safely, the packet is dropped and an error is recorded in the log ring.
+Values `8`, `9`, and `11` are reserved and rejected with `STATUS_INVALID_PARAMETER`
+by `Verdict`, `UpdateV4`, and `UpdateV6`. Remaining verdict values are unchanged,
+including `Failed = 10`. The driver does not support traffic redirection.
 
 For a stateless packet with no connection instance, such as some ICMP traffic or externally injected traffic observed after the original endpoint closed, the verdict applies only to the specified request ID. Even `PermanentAccept` does not create a persistent entry for later stateless packets.
 
@@ -534,7 +516,7 @@ Read these members in `on_connection`; there is no `Driver::GetThreadId` method 
 | Method | Purpose |
 |---|---|
 | `Driver(service_name)` | Constructs a controller; the default name is `PortmasterKext` |
-| `Install(sys_path, error, inbound_udp_pid_fallback = true)` | Creates and starts a demand-start kernel service using an absolute path; writes `EnableInboundUdpCacheMissPidFallback` from the optional argument but does not write `IgnoreSpecialPorts`; an existing service is treated as a conflict |
+| `Install(sys_path, error, inbound_udp_pid_fallback = true)` | Creates and starts a demand-start kernel service using an absolute path; writes `EnableInboundUdpCacheMissPidFallback` from the optional argument; an existing service is treated as a conflict |
 | `Open(error)` | Opens the overlapped device handle and starts the named-pipe bridge server |
 | `Run(handlers, poll_interval_ms)` | Reads and dispatches events until `Stop`; calls `on_poll` at the requested interval |
 | `Stop()` | Signals `Run` and submits the shutdown IOCTL once |
@@ -867,7 +849,7 @@ With the default Ninja build, the monitor is `C:\portmaster_v3\kext_client\build
 & 'C:\portmaster_v3\kext_client\build\kext_monitor.exe' --duration 10 'C:\portmaster_v3\windows_kext\portmaster-kext.sys'
 ```
 
-The monitor creates/starts the driver service itself, opens the device, and on normal completion closes the device, stops/unloads the driver, and removes its service. **Do not create the service manually.** The default verdict is `PermanentAccept`; avoid global blocking/redirect verdicts for an initial smoke test. Wait for the timed run to finish and clean up; do not forcibly kill the process or stop its service while the device handle is open. Do not run the monitor without a duration limit for unattended tests.
+The monitor creates/starts the driver service itself, opens the device, and on normal completion closes the device, stops/unloads the driver, and removes its service. **Do not create the service manually.** The default verdict is `PermanentAccept`; avoid global blocking/drop verdicts for an initial smoke test. Wait for the timed run to finish and clean up; do not forcibly kill the process or stop its service while the device handle is open. Do not run the monitor without a duration limit for unattended tests.
 
 ## License
 

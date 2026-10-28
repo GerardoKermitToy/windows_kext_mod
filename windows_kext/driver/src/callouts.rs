@@ -176,7 +176,7 @@ pub fn get_callout_vec() -> Vec<Callout> {
         // Packet layers
         Callout::new(
             "Portmaster Packet Outbound IPv4",
-            "Portmaster uses this layer to redirect/block/permit outgoing ipv4 packets",
+            "Portmaster uses this layer to block/permit outgoing ipv4 packets",
             0xf3183afe_dc35_49f1_8ea2_b16b5666dd36,
             Layer::OutboundIppacketV4,
             consts::FWP_ACTION_CALLOUT_TERMINATING,
@@ -185,7 +185,7 @@ pub fn get_callout_vec() -> Vec<Callout> {
         ),
         Callout::new(
             "Portmaster Packet Inbound IPv4",
-            "Portmaster uses this layer to redirect/block/permit inbound ipv4 packets",
+            "Portmaster uses this layer to block/permit inbound ipv4 packets",
             0xf0369374_203d_4bf0_83d2_b2ad3cc17a50,
             Layer::InboundIppacketV4,
             consts::FWP_ACTION_CALLOUT_TERMINATING,
@@ -194,7 +194,7 @@ pub fn get_callout_vec() -> Vec<Callout> {
         ),
         Callout::new(
             "Portmaster Packet Outbound IPv6",
-            "Portmaster uses this layer to redirect/block/permit outgoing ipv6 packets",
+            "Portmaster uses this layer to block/permit outgoing ipv6 packets",
             0x91daf8bc_0908_4bf8_9f81_2c538ab8f25a,
             Layer::OutboundIppacketV6,
             consts::FWP_ACTION_CALLOUT_TERMINATING,
@@ -203,7 +203,7 @@ pub fn get_callout_vec() -> Vec<Callout> {
         ),
         Callout::new(
             "Portmaster Packet Inbound IPv6",
-            "Portmaster uses this layer to redirect/block/permit inbound ipv6 packets",
+            "Portmaster uses this layer to block/permit inbound ipv6 packets",
             0xfe9faf5f_ceb2_4cd9_9995_f2f2b4f5fcc0,
             Layer::InboundIppacketV6,
             consts::FWP_ACTION_CALLOUT_TERMINATING,

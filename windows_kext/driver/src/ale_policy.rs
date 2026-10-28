@@ -139,7 +139,7 @@ pub(crate) fn should_capture_ale_packet(
 }
 
 /// Resets observed during reauthorization have no live send endpoint to replay
-/// through. Leave their delivery and any cached redirect rewrite to packet layers.
+/// through. Leave their delivery to packet layers.
 pub(crate) fn should_permit_ale_tcp_reset(
     protocol: IpProtocol,
     reauthorize: bool,

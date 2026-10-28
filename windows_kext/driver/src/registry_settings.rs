@@ -5,7 +5,6 @@ use windows_sys::Win32::System::Registry::REG_DWORD;
 const PARAMETERS_SUFFIX: &[u16] = &ascii_utf16(b"\\Parameters");
 const INBOUND_UDP_PID_FALLBACK_VALUE: &[u16] =
     &ascii_utf16(b"EnableInboundUdpCacheMissPidFallback");
-const IGNORE_SPECIAL_PORTS_VALUE: &[u16] = &ascii_utf16(b"IgnoreSpecialPorts");
 
 const fn ascii_utf16<const N: usize>(text: &[u8; N]) -> [u16; N] {
     let mut buffer = [0; N];
@@ -29,18 +28,11 @@ fn build_parameters_path(path: &[u16]) -> Option<Vec<u16>> {
 }
 
 static INBOUND_UDP_PID_FALLBACK_ENABLED: AtomicBool = AtomicBool::new(false);
-static IGNORE_SPECIAL_PORTS: AtomicBool = AtomicBool::new(false);
 
 /// The value is read once during DriverEntry and stays fixed until driver unload.
 #[inline]
 pub(crate) fn inbound_udp_pid_fallback_enabled() -> bool {
     INBOUND_UDP_PID_FALLBACK_ENABLED.load(Ordering::Relaxed)
-}
-
-/// The value is read once during DriverEntry and stays fixed until driver unload.
-#[inline]
-pub(crate) fn ignore_special_ports() -> bool {
-    IGNORE_SPECIAL_PORTS.load(Ordering::Relaxed)
 }
 
 fn dword_enabled(value_type: u32, data: &[u8]) -> bool {
@@ -53,8 +45,8 @@ pub(crate) use kernel::initialize;
 #[cfg(not(test))]
 mod kernel {
     use super::{
-        build_parameters_path, dword_enabled, IGNORE_SPECIAL_PORTS, IGNORE_SPECIAL_PORTS_VALUE,
-        INBOUND_UDP_PID_FALLBACK_ENABLED, INBOUND_UDP_PID_FALLBACK_VALUE,
+        build_parameters_path, dword_enabled, INBOUND_UDP_PID_FALLBACK_ENABLED,
+        INBOUND_UDP_PID_FALLBACK_VALUE,
     };
     use core::{mem::size_of, ptr, sync::atomic::Ordering};
     use windows_sys::{
@@ -124,9 +116,6 @@ mod kernel {
         let enabled = read_enabled(&parameters_path, INBOUND_UDP_PID_FALLBACK_VALUE);
         INBOUND_UDP_PID_FALLBACK_ENABLED.store(enabled, Ordering::Relaxed);
         crate::info!("EnableInboundUdpCacheMissPidFallback={}", u8::from(enabled));
-        let ignore_special_ports = read_enabled(&parameters_path, IGNORE_SPECIAL_PORTS_VALUE);
-        IGNORE_SPECIAL_PORTS.store(ignore_special_ports, Ordering::Relaxed);
-        crate::info!("IgnoreSpecialPorts={}", u8::from(ignore_special_ports));
         Ok(())
     }
 
@@ -174,8 +163,7 @@ mod kernel {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_parameters_path, dword_enabled, IGNORE_SPECIAL_PORTS_VALUE,
-        INBOUND_UDP_PID_FALLBACK_VALUE, PARAMETERS_SUFFIX,
+        build_parameters_path, dword_enabled, INBOUND_UDP_PID_FALLBACK_VALUE, PARAMETERS_SUFFIX,
     };
     use windows_sys::Win32::System::Registry::{
         REG_BINARY, REG_DWORD, REG_DWORD_BIG_ENDIAN, REG_QWORD, REG_SZ,
@@ -190,10 +178,6 @@ mod tests {
         assert_eq!(
             String::from_utf16(INBOUND_UDP_PID_FALLBACK_VALUE).unwrap(),
             "EnableInboundUdpCacheMissPidFallback"
-        );
-        assert_eq!(
-            String::from_utf16(IGNORE_SPECIAL_PORTS_VALUE).unwrap(),
-            "IgnoreSpecialPorts"
         );
     }
 
@@ -229,7 +213,6 @@ mod tests {
     #[test]
     fn settings_default_to_disabled() {
         assert!(!super::inbound_udp_pid_fallback_enabled());
-        assert!(!super::ignore_special_ports());
     }
 
     #[test]

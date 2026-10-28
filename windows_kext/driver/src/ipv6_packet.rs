@@ -193,7 +193,7 @@ impl fmt::Display for Ipv6TransportError {
         let message = match self {
             Self::InvalidPacket => "invalid IPv6 packet",
             Self::UnresolvedHeaders => "IPv6 extension header chain did not resolve",
-            Self::FragmentedPacket => "cannot rewrite an individual IPv6 fragment",
+            Self::FragmentedPacket => "cannot calculate a checksum for an individual IPv6 fragment",
             Self::ActiveRoutingHeader => {
                 "cannot calculate a checksum through an active IPv6 routing header"
             }
@@ -202,12 +202,6 @@ impl fmt::Display for Ipv6TransportError {
         };
         formatter.write_str(message)
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PortRewrite {
-    Source(u16),
-    Destination(u16),
 }
 
 struct TransportContext {
@@ -267,57 +261,6 @@ fn validate_transport(packet: &[u8], context: &TransportContext) -> Result<(), I
             .map_err(|_| Ipv6TransportError::InvalidTransportHeader),
         _ => Err(Ipv6TransportError::UnsupportedProtocol),
     }
-}
-
-/// Rewrites both IPv6 addresses and one TCP/UDP port, then computes the
-/// upper-layer checksum over the bytes after the extension-header chain.
-///
-/// Validation is completed before any byte is modified, so malformed,
-/// fragmented or unsupported packets are returned unchanged.
-pub(crate) fn rewrite_ipv6_tcp_udp(
-    packet: &mut [u8],
-    source: Ipv6Address,
-    destination: Ipv6Address,
-    port: PortRewrite,
-) -> Result<(), Ipv6TransportError> {
-    let context = transport_context(packet)?;
-    validate_transport(packet, &context)?;
-
-    // The base header was fully validated above and neither operation changes a
-    // length field, so the transport offset remains valid after this mutation.
-    let mut ip_packet = Ipv6Packet::new_unchecked(&mut packet[..context.total_len]);
-    ip_packet.set_src_addr(source);
-    ip_packet.set_dst_addr(destination);
-
-    let transport = packet
-        .get_mut(context.offset..context.total_len)
-        .ok_or(Ipv6TransportError::InvalidTransportHeader)?;
-    let source = IpAddress::Ipv6(source);
-    let destination = IpAddress::Ipv6(destination);
-
-    match context.protocol {
-        IpProtocol::Udp => {
-            let mut udp_packet = UdpPacket::new_checked(transport)
-                .map_err(|_| Ipv6TransportError::InvalidTransportHeader)?;
-            match port {
-                PortRewrite::Source(value) => udp_packet.set_src_port(value),
-                PortRewrite::Destination(value) => udp_packet.set_dst_port(value),
-            }
-            udp_packet.fill_checksum(&source, &destination);
-        }
-        IpProtocol::Tcp => {
-            let mut tcp_packet = TcpPacket::new_checked(transport)
-                .map_err(|_| Ipv6TransportError::InvalidTransportHeader)?;
-            match port {
-                PortRewrite::Source(value) => tcp_packet.set_src_port(value),
-                PortRewrite::Destination(value) => tcp_packet.set_dst_port(value),
-            }
-            tcp_packet.fill_checksum(&source, &destination);
-        }
-        _ => return Err(Ipv6TransportError::UnsupportedProtocol),
-    }
-
-    Ok(())
 }
 
 /// Recomputes a TCP or UDP checksum using the upper-layer length, excluding all
@@ -530,7 +473,7 @@ mod tests {
     }
 
     #[test]
-    fn rewrites_udp_after_multiple_extension_headers() {
+    fn recalculates_udp_checksum_after_multiple_extension_headers() {
         let source = source_address();
         let destination = destination_address();
         let transport_offset = IPV6_HEADER_LEN + 16;
@@ -548,37 +491,20 @@ mod tests {
             12000,
             53,
         );
-        let extension_headers = packet[IPV6_HEADER_LEN..transport_offset].to_vec();
+        let headers = packet[..transport_offset].to_vec();
+        packet[transport_offset + 6..transport_offset + 8].fill(0);
 
-        let redirected_source = Ipv6Address::LOOPBACK;
-        let redirected_destination = Ipv6Address::new(0xfd00, 1, 2, 3, 4, 5, 6, 7);
-        rewrite_ipv6_tcp_udp(
-            &mut packet,
-            redirected_source,
-            redirected_destination,
-            PortRewrite::Destination(5353),
-        )
-        .unwrap();
+        recalculate_ipv6_transport_checksum(&mut packet).unwrap();
 
-        let ip_packet = Ipv6Packet::new_checked(&packet).unwrap();
-        assert_eq!(ip_packet.src_addr(), redirected_source);
-        assert_eq!(ip_packet.dst_addr(), redirected_destination);
-        assert_eq!(
-            &packet[IPV6_HEADER_LEN..transport_offset],
-            &extension_headers
-        );
-
+        assert_eq!(&packet[..transport_offset], &headers);
         let udp_packet = UdpPacket::new_checked(&packet[transport_offset..]).unwrap();
         assert_eq!(udp_packet.src_port(), 12000);
-        assert_eq!(udp_packet.dst_port(), 5353);
-        assert!(udp_packet.verify_checksum(
-            &IpAddress::Ipv6(redirected_source),
-            &IpAddress::Ipv6(redirected_destination),
-        ));
+        assert_eq!(udp_packet.dst_port(), 53);
+        assert!(udp_packet.verify_checksum(&IpAddress::Ipv6(source), &IpAddress::Ipv6(destination)));
     }
 
     #[test]
-    fn rewrites_tcp_after_inactive_routing_header() {
+    fn recalculates_tcp_checksum_after_inactive_routing_header() {
         let source = source_address();
         let destination = destination_address();
         let transport_offset = IPV6_HEADER_LEN + 8;
@@ -596,24 +522,16 @@ mod tests {
             443,
             40000,
         );
+        let headers = packet[..transport_offset].to_vec();
+        packet[transport_offset + 16..transport_offset + 18].fill(0);
 
-        let redirected_source = Ipv6Address::new(0x2001, 0xdb8, 20, 0, 0, 0, 0, 1);
-        let redirected_destination = Ipv6Address::new(0x2001, 0xdb8, 30, 0, 0, 0, 0, 2);
-        rewrite_ipv6_tcp_udp(
-            &mut packet,
-            redirected_source,
-            redirected_destination,
-            PortRewrite::Source(8443),
-        )
-        .unwrap();
+        recalculate_ipv6_transport_checksum(&mut packet).unwrap();
 
+        assert_eq!(&packet[..transport_offset], &headers);
         let tcp_packet = TcpPacket::new_checked(&packet[transport_offset..]).unwrap();
-        assert_eq!(tcp_packet.src_port(), 8443);
+        assert_eq!(tcp_packet.src_port(), 443);
         assert_eq!(tcp_packet.dst_port(), 40000);
-        assert!(tcp_packet.verify_checksum(
-            &IpAddress::Ipv6(redirected_source),
-            &IpAddress::Ipv6(redirected_destination),
-        ));
+        assert!(tcp_packet.verify_checksum(&IpAddress::Ipv6(source), &IpAddress::Ipv6(destination)));
     }
 
     #[test]
@@ -640,12 +558,7 @@ mod tests {
         let original = packet.clone();
 
         assert_eq!(
-            rewrite_ipv6_tcp_udp(
-                &mut packet,
-                Ipv6Address::LOOPBACK,
-                destination_address(),
-                PortRewrite::Destination(5353),
-            ),
+            recalculate_ipv6_transport_checksum(&mut packet),
             Err(Ipv6TransportError::UnresolvedHeaders)
         );
         assert_eq!(packet, original);
@@ -673,12 +586,7 @@ mod tests {
         let original = packet.clone();
 
         assert_eq!(
-            rewrite_ipv6_tcp_udp(
-                &mut packet,
-                Ipv6Address::LOOPBACK,
-                destination,
-                PortRewrite::Source(8443),
-            ),
+            recalculate_ipv6_transport_checksum(&mut packet),
             Err(Ipv6TransportError::ActiveRoutingHeader)
         );
         assert_eq!(packet, original);

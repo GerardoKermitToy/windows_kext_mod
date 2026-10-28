@@ -9,10 +9,6 @@ use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Address, Ipv6Address};
 
 use crate::connection_map::Key;
 
-pub const PM_DNS_PORT: u16 = 53;
-pub const PM_SPN_PORT: u16 = 717;
-pub const PM_SPLIT_TUN_PORT: u16 = 719;
-
 static NEXT_CONNECTION_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 fn next_connection_instance_id() -> u64 {
@@ -51,39 +47,6 @@ fn get_monotonic_timestamp_ms() -> u64 {
     }
 }
 
-/// Returns true if redirect lookup is enabled for `remote_port`.
-///
-/// Every arm of `redirect_equals` rejects the key unless its remote port equals
-/// the port belonging to that redirect verdict. When IgnoreSpecialPorts is set,
-/// these ports use exact lookup only. `ConnectionMap::read` uses this to skip the
-/// linear redirect scan, keeping ordinary misses off the O(n) path.
-///
-/// Keep in sync with `redirect_equals`: a new redirect verdict needs its port
-/// added here, or connections carrying it will never be found.
-#[inline]
-pub fn is_redirect_port(remote_port: u16) -> bool {
-    is_redirect_port_with_setting(remote_port, crate::registry_settings::ignore_special_ports)
-}
-
-#[inline]
-fn is_redirect_port_with_setting(port: u16, ignore_special_ports: impl FnOnce() -> bool) -> bool {
-    matches!(port, PM_DNS_PORT | PM_SPN_PORT | PM_SPLIT_TUN_PORT) && !ignore_special_ports()
-}
-
-#[inline]
-pub(crate) fn fast_track_pm_packets(key: &Key) -> bool {
-    fast_track_pm_packets_with_setting(key, crate::registry_settings::ignore_special_ports)
-}
-
-#[inline]
-fn fast_track_pm_packets_with_setting(
-    key: &Key,
-    ignore_special_ports: impl FnOnce() -> bool,
-) -> bool {
-    key.local_address == key.remote_address
-        && is_redirect_port_with_setting(key.local_port, ignore_special_ports)
-}
-
 // Make sure this in sync with the Go version
 #[derive(Copy, Clone, FromPrimitive)]
 #[repr(u8)]
@@ -97,11 +60,8 @@ pub enum Verdict {
     PermanentBlock     = 5,
     Drop               = 6,
     PermanentDrop      = 7,
-    RedirectNameServer = 8,  // redirect to PM_DNS_PORT port
-    RedirectTunnel     = 9,  // redirect to PM_SPN_PORT port
+    // Values 8, 9 and 11 are reserved and must not be reused.
     Failed             = 10,
-    RedirectSplitTunnel= 11, // redirect to PM_SPLIT_TUN_PORT port
-    // RedirectSplitTunnel must stay last: older Portmaster versions only know verdicts 0–10 and would never send this value.
 }
 
 impl Display for Verdict {
@@ -116,9 +76,6 @@ impl Display for Verdict {
             Verdict::PermanentBlock     => write!(f, "PermanentBlock"),
             Verdict::Drop               => write!(f, "Drop"),
             Verdict::PermanentDrop      => write!(f, "PermanentDrop"),
-            Verdict::RedirectNameServer => write!(f, "RedirectNameServer"),
-            Verdict::RedirectTunnel     => write!(f, "RedirectTunnel"),
-            Verdict::RedirectSplitTunnel=> write!(f, "RedirectSplitTunnel"),
             Verdict::Failed             => write!(f, "Failed"),
         }
     }
@@ -165,42 +122,6 @@ pub trait Connection {
     /// discriminant and storage overhead of `IpAddress`.
     type RemoteAddressKey: Copy + Ord;
 
-    fn redirect_info(&self) -> Option<RedirectInfo> {
-        let redirect_address = if unlikely(self.is_ipv6()) {
-            IpAddress::Ipv6(Ipv6Address::LOOPBACK)
-        } else {
-            IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1))
-        };
-
-        match self.get_verdict() {
-            Verdict::RedirectNameServer => Some(RedirectInfo {
-                local_address: self.get_local_address(),
-                remote_address: self.get_remote_address(),
-                remote_port: self.get_remote_port(),
-                redirect_port: PM_DNS_PORT,
-                unify: false,
-                redirect_address,
-            }),
-            Verdict::RedirectTunnel => Some(RedirectInfo {
-                local_address: self.get_local_address(),
-                remote_address: self.get_remote_address(),
-                remote_port: self.get_remote_port(),
-                redirect_port: PM_SPN_PORT,
-                unify: true,
-                redirect_address,
-            }),
-            Verdict::RedirectSplitTunnel => Some(RedirectInfo {
-                local_address: self.get_local_address(),
-                remote_address: self.get_remote_address(),
-                remote_port: self.get_remote_port(),
-                redirect_port: PM_SPLIT_TUN_PORT,
-                unify: true,
-                redirect_address,
-            }),
-            _ => None,
-        }
-    }
-
     /// Returns the key of the connection.
     fn get_key(&self) -> Key {
         Key {
@@ -217,9 +138,6 @@ pub trait Connection {
     /// local address still has to be checked here: two local addresses can use
     /// the same port and remote endpoint at the same time.
     fn remote_equals(&self, key: &Key) -> bool;
-    /// Returns true if the connection is equal to the given key for redirecting.
-    /// The key is considered equal if it matches the redirect endpoint.
-    fn redirect_equals(&self, key: &Key) -> bool;
     /// Returns the protocol of the connection.
     fn get_protocol(&self) -> IpProtocol;
     /// Returns the verdict of the connection.
@@ -236,8 +154,6 @@ pub trait Connection {
     fn remote_address_key(key: &Key) -> Option<Self::RemoteAddressKey>;
     /// Returns the remote port of the connection.
     fn get_remote_port(&self) -> u16;
-    /// Returns true if the connection is an IPv6 connection.
-    fn is_ipv6(&self) -> bool;
     /// Returns the direction of the connection.
     fn get_direction(&self) -> Direction;
     /// Returns the unique cache-instance ID of the connection.
@@ -290,16 +206,6 @@ pub struct ConnectionV6 {
     pub(crate) instance_id: u64,
     pub(crate) last_accessed_timestamp: AtomicU64,
     pub(crate) extra: ConnectionExtra,
-}
-
-#[derive(Debug)]
-pub struct RedirectInfo {
-    pub(crate) local_address: IpAddress,
-    pub(crate) remote_address: IpAddress,
-    pub(crate) remote_port: u16,
-    pub(crate) redirect_port: u16,
-    pub(crate) unify: bool,
-    pub(crate) redirect_address: IpAddress,
 }
 
 impl ConnectionV4 {
@@ -388,34 +294,6 @@ impl Connection for ConnectionV4 {
         }
     }
 
-    fn redirect_equals(&self, key: &Key) -> bool {
-        match self.verdict {
-            Verdict::RedirectNameServer => {
-                if key.remote_port != PM_DNS_PORT {
-                    return false;
-                }
-
-                match key.remote_address {
-                    IpAddress::Ipv4(a) => a.is_loopback(),
-                    IpAddress::Ipv6(_) => false,
-                }
-            }
-            Verdict::RedirectTunnel => {
-                if key.remote_port != PM_SPN_PORT {
-                    return false;
-                }
-                key.local_address.eq(&key.remote_address)
-            }
-            Verdict::RedirectSplitTunnel => {
-                if key.remote_port != PM_SPLIT_TUN_PORT {
-                    return false;
-                }
-                key.local_address.eq(&key.remote_address)
-            }
-            _ => false,
-        }
-    }
-
     fn get_protocol(&self) -> IpProtocol {
         self.protocol
     }
@@ -451,10 +329,6 @@ impl Connection for ConnectionV4 {
 
     fn get_remote_port(&self) -> u16 {
         self.remote_port
-    }
-
-    fn is_ipv6(&self) -> bool {
-        false
     }
 
     fn get_instance_id(&self) -> u64 {
@@ -603,34 +477,6 @@ impl Connection for ConnectionV6 {
         }
     }
 
-    fn redirect_equals(&self, key: &Key) -> bool {
-        match self.verdict {
-            Verdict::RedirectNameServer => {
-                if key.remote_port != PM_DNS_PORT {
-                    return false;
-                }
-
-                match key.remote_address {
-                    IpAddress::Ipv4(_) => false,
-                    IpAddress::Ipv6(a) => a.is_loopback(),
-                }
-            }
-            Verdict::RedirectTunnel => {
-                if key.remote_port != PM_SPN_PORT {
-                    return false;
-                }
-                key.local_address.eq(&key.remote_address)
-            }
-            Verdict::RedirectSplitTunnel => {
-                if key.remote_port != PM_SPLIT_TUN_PORT {
-                    return false;
-                }
-                key.local_address.eq(&key.remote_address)
-            }
-            _ => false,
-        }
-    }
-
     fn get_protocol(&self) -> IpProtocol {
         self.protocol
     }
@@ -666,10 +512,6 @@ impl Connection for ConnectionV6 {
 
     fn get_remote_port(&self) -> u16 {
         self.remote_port
-    }
-
-    fn is_ipv6(&self) -> bool {
-        true
     }
 
     fn get_instance_id(&self) -> u64 {
@@ -736,91 +578,34 @@ impl Clone for ConnectionV6 {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        fast_track_pm_packets, fast_track_pm_packets_with_setting, is_redirect_port,
-        is_redirect_port_with_setting, PM_DNS_PORT, PM_SPLIT_TUN_PORT, PM_SPN_PORT,
-    };
-    use crate::connection_map::Key;
-    use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Address, Ipv6Address};
+    use super::Verdict;
+    use num_traits::FromPrimitive;
 
     #[test]
-    fn special_ports_keep_redirect_lookup_when_setting_is_off() {
-        for port in [PM_DNS_PORT, PM_SPN_PORT, PM_SPLIT_TUN_PORT] {
-            assert!(is_redirect_port(port));
-            assert!(is_redirect_port_with_setting(port, || false));
-        }
-    }
-
-    #[test]
-    fn special_ports_skip_redirect_lookup_when_setting_is_on() {
-        for port in [PM_DNS_PORT, PM_SPN_PORT, PM_SPLIT_TUN_PORT] {
-            assert!(!is_redirect_port_with_setting(port, || true));
-        }
-    }
-
-    #[test]
-    fn ordinary_ports_do_not_read_setting() {
-        for port in [0, 52, 54, 716, 718, 720, 12345, u16::MAX] {
-            assert!(!is_redirect_port_with_setting(port, || {
-                panic!("ordinary ports must not read the setting")
-            }));
-        }
-    }
-
-    #[test]
-    fn fast_track_requires_local_special_port_and_equal_addresses() {
-        for (local, remote) in [
-            (
-                IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1)),
-                IpAddress::Ipv4(Ipv4Address::new(192, 0, 2, 1)),
-            ),
-            (
-                IpAddress::Ipv6(Ipv6Address::LOOPBACK),
-                IpAddress::Ipv6(Ipv6Address::from_bytes(&[
-                    0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                ])),
-            ),
+    fn verdict_wire_values_are_stable() {
+        for (verdict, value) in [
+            (Verdict::Undecided, 0),
+            (Verdict::Undeterminable, 1),
+            (Verdict::Accept, 2),
+            (Verdict::PermanentAccept, 3),
+            (Verdict::Block, 4),
+            (Verdict::PermanentBlock, 5),
+            (Verdict::Drop, 6),
+            (Verdict::PermanentDrop, 7),
+            (Verdict::Failed, 10),
         ] {
-            for port in [PM_DNS_PORT, PM_SPN_PORT, PM_SPLIT_TUN_PORT] {
-                let mut key = Key {
-                    protocol: IpProtocol::Udp,
-                    local_address: local,
-                    local_port: port,
-                    remote_address: local,
-                    remote_port: 40000,
-                };
-                assert!(fast_track_pm_packets(&key));
-                assert!(fast_track_pm_packets_with_setting(&key, || false));
-                key.remote_address = remote;
-                assert!(!fast_track_pm_packets_with_setting(&key, || {
-                    panic!("non-local traffic must not read the setting")
-                }));
-                key.remote_address = local;
-                key.local_port = 40000;
-                key.remote_port = port;
-                assert!(!fast_track_pm_packets_with_setting(&key, || false));
-            }
+            assert_eq!(verdict as u8, value);
+            assert_eq!(Verdict::from_u8(value).unwrap() as u8, value);
         }
     }
 
     #[test]
-    fn ignore_special_ports_disables_fast_track_for_both_families() {
-        for address in [
-            IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1)),
-            IpAddress::Ipv6(Ipv6Address::LOOPBACK),
-        ] {
-            for protocol in [IpProtocol::Tcp, IpProtocol::Udp] {
-                for port in [PM_DNS_PORT, PM_SPN_PORT, PM_SPLIT_TUN_PORT] {
-                    let key = Key {
-                        protocol,
-                        local_address: address,
-                        local_port: port,
-                        remote_address: address,
-                        remote_port: 40000,
-                    };
-                    assert!(!fast_track_pm_packets_with_setting(&key, || true));
-                }
-            }
+    fn reserved_and_unknown_verdicts_are_rejected() {
+        for value in 0..=u8::MAX {
+            assert_eq!(
+                Verdict::from_u8(value).is_some(),
+                matches!(value, 0..=7 | 10)
+            );
         }
     }
 }

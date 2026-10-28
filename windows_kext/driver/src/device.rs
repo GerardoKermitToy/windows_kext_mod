@@ -38,7 +38,6 @@ use crate::{
     icmp_echo_cache::IcmpEchoCache,
     id_cache::{ConnectionMetadata, IdCache, PendingPacket},
     logger,
-    packet_util::Redirect,
     tcp_closure_cache::{PendingTcpClosure, TcpClosureCache},
     tcp_endpoint_cache::{TcpEndpointCache, TcpEndpointConnection},
     udp_endpoint_cache::UdpEndpointCache,
@@ -48,8 +47,8 @@ use crate::{
 pub enum Packet {
     /// One independently decided network-layer packet.
     Network(NetBufferList, InjectInfo),
-    /// Temporary owner used only while a WFP NBL batch is being cloned, redirected
-    /// immediately, or split into independent pending requests.
+    /// Temporary owner used only while a WFP NBL batch is being cloned
+    /// or split into independent pending requests.
     NetworkBatch(Vec<NetBufferList>, InjectInfo),
     AleLayer(ClassifyDefer),
 }
@@ -453,7 +452,7 @@ impl Device {
                 };
                 if let Some(PendingPacket {
                     key,
-                    mut packet,
+                    packet,
                     connection_instance_id,
                     #[cfg(feature = "perf-etw")]
                     perf_stamp,
@@ -483,13 +482,13 @@ impl Device {
                     // UDP network clone remains independently deliverable and is
                     // handled below as a packet-only decision.
                     let packet_survives_connection_end = packet.survives_connection_end(&key);
-                    let redirect_info = if let Some(instance_id) = connection_instance_id {
+                    if let Some(instance_id) = connection_instance_id {
                         match self.connection_cache.update_connection_instance(
                             key,
                             instance_id,
                             action,
                         ) {
-                            Some(update) => update.redirect_info,
+                            Some(()) => {}
                             None if packet_survives_connection_end => {
                                 // Endpoint closure does not revoke an outbound UDP
                                 // datagram whose send already completed before this
@@ -501,7 +500,6 @@ impl Device {
                                     instance_id,
                                     key
                                 );
-                                None
                             }
                             None => {
                                 #[cfg(feature = "perf-etw")]
@@ -517,9 +515,7 @@ impl Device {
                                 return Ok(());
                             }
                         }
-                    } else {
-                        None
-                    };
+                    }
 
                     match action {
                         crate::connection::Verdict::Accept
@@ -528,31 +524,6 @@ impl Device {
                                 err!("failed to inject packet: {}", err);
                             } else {
                                 dbg!("packet injected: {}", key);
-                            }
-                        }
-                        crate::connection::Verdict::RedirectNameServer
-                        | crate::connection::Verdict::RedirectTunnel
-                        | crate::connection::Verdict::RedirectSplitTunnel => {
-                            if let Some(redirect_info) = redirect_info {
-                                // Never inject a clone when redirect validation or
-                                // checksum reconstruction failed. The packet is dropped
-                                // with this verdict instead of escaping unredirected.
-                                match packet.redirect(redirect_info) {
-                                    Ok(()) => {
-                                        if let Err(err) = self.inject_verdict_packet(packet, false)
-                                        {
-                                            err!("failed to inject packet: {}", err);
-                                        }
-                                    }
-                                    Err(err) => err!("failed to redirect packet: {}", err),
-                                }
-                            } else {
-                                // The connection disappeared before its verdict was
-                                // applied. Complete an ALE pend, if this is one, but
-                                // do not inject a packet with no redirect state.
-                                if let Err(err) = self.inject_verdict_packet(packet, true) {
-                                    err!("failed to complete packet: {}", err);
-                                }
                             }
                         }
                         _ => {
@@ -586,7 +557,7 @@ impl Device {
                 if let Some(verdict) = FromPrimitive::from_u8(update.verdict) {
                     // Update with new action.
                     dbg!("Verdict update received {:?}: {}", update, verdict);
-                    _ = self.connection_cache.update_connection(
+                    self.connection_cache.update_connection(
                         Key {
                             protocol: IpProtocol::from(update.protocol),
                             local_address: IpAddress::Ipv4(Ipv4Address::from_bytes(
@@ -619,7 +590,7 @@ impl Device {
                 if let Some(verdict) = FromPrimitive::from_u8(update.verdict) {
                     // Update with new action.
                     dbg!("Verdict update received {:?}: {}", update, verdict);
-                    _ = self.connection_cache.update_connection(
+                    self.connection_cache.update_connection(
                         Key {
                             protocol: IpProtocol::from(update.protocol),
                             local_address: IpAddress::Ipv6(Ipv6Address::from_bytes(

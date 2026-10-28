@@ -68,10 +68,7 @@ const char* ToString(Verdict v) {
         case Verdict::PermanentBlock:      return "PermanentBlock";
         case Verdict::Drop:                return "Drop";
         case Verdict::PermanentDrop:       return "PermanentDrop";
-        case Verdict::RedirectNameServer:  return "RedirectNameServer";
-        case Verdict::RedirectTunnel:      return "RedirectTunnel";
         case Verdict::Failed:              return "Failed";
-        case Verdict::RedirectSplitTunnel: return "RedirectSplitTunnel";
     }
     return "Unknown";
 }

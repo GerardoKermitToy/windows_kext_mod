@@ -1,6 +1,6 @@
 use core::{fmt::Display, time::Duration};
 
-use crate::connection::{is_redirect_port, Connection, Direction};
+use crate::connection::{Connection, Direction};
 use alloc::{
     collections::{
         btree_map::{Entry, Values, ValuesMut},
@@ -561,7 +561,7 @@ impl<T: Connection + Clone> ConnectionMap<T> {
     /// Returns whether one exact connection-cache instance is still live.
     ///
     /// Unlike `read`, this check does not refresh activity and never falls back to
-    /// redirected or ended state. It is used to validate endpoint-owned identity.
+    /// ended state. It is used to validate endpoint-owned identity.
     pub fn has_live_instance(&self, key: &Key, instance_id: u64) -> bool {
         if unlikely(instance_id == 0) {
             return false;
@@ -576,95 +576,30 @@ impl<T: Connection + Clone> ConnectionMap<T> {
         })
     }
 
-    /// Returns one exact live instance matching either its original tuple or
-    /// its current reverse-redirect tuple.
-    ///
-    /// Pending packet publication uses the packet's observed key. A response from a
-    /// local redirect target no longer carries the original remote endpoint, but its
-    /// instance ID still identifies exactly one cached generation. The instance
-    /// check makes the otherwise ambiguous redirect scan safe for this operation.
+    /// Returns the exact live cache instance without refreshing activity.
     pub fn get_live_instance_matching(&self, key: &Key, instance_id: u64) -> Option<&T> {
         if unlikely(instance_id == 0) {
             return None;
         }
-        if let Some(conn) = self.bucket(key).and_then(|bucket| {
-            bucket.iter().find(|conn| {
-                conn.remote_equals(key)
-                    && conn.get_instance_id() == instance_id
-                    && !conn.has_ended()
-            })
-        }) {
-            return Some(conn);
-        }
-        if !is_redirect_port(key.remote_port) {
-            return None;
-        }
-
-        self.0
-            .get(&key.small())?
-            .values()
-            .flat_map(ConnectionBucket::iter)
-            .find(|conn| {
-                conn.redirect_equals(key)
-                    && conn.get_instance_id() == instance_id
-                    && !conn.has_ended()
-            })
+        self.bucket(key)?.iter().find(|conn| {
+            conn.remote_equals(key) && conn.get_instance_id() == instance_id && !conn.has_ended()
+        })
     }
 
     /// Returns the exact live cache instance for mutation.
     ///
     /// Pending verdicts carry the instance that existed when their packet was
     /// queued. Requiring both identities prevents a delayed verdict from mutating
-    /// a replacement connection that reused the same tuple. Redirected packet keys
-    /// are supported for the packet-layer path in the same way as `read_matching`.
+    /// a replacement connection that reused the same tuple.
     pub fn get_mut_instance(&mut self, key: &Key, instance_id: u64) -> Option<&mut T> {
         if unlikely(instance_id == 0) {
             return None;
         }
-
-        let endpoint = remote_endpoint_from_key::<T>(key)?;
-        let connections = self.0.get_mut(&key.small())?;
-
-        if !is_redirect_port(key.remote_port) {
-            let conn = connections.get_mut(&endpoint)?.iter_mut().find(|conn| {
-                conn.remote_equals(key)
-                    && conn.get_instance_id() == instance_id
-                    && !conn.has_ended()
-            })?;
-            refresh_untracked_activity(conn);
-            return Some(conn);
-        }
-
-        // Redirect ports need a fallback scan. Locate an exact candidate without
-        // retaining a mutable bucket borrow across that scan; this uncommon path
-        // may perform a second direct lookup so the normal packet path never does.
-        let exact_index = connections.get(&endpoint).and_then(|bucket| {
-            bucket.iter().position(|conn| {
-                conn.remote_equals(key)
-                    && conn.get_instance_id() == instance_id
-                    && !conn.has_ended()
-            })
-        });
-        if let Some(index) = exact_index {
-            let conn = connections.get_mut(&endpoint)?.iter_mut().nth(index)?;
-            refresh_untracked_activity(conn);
-            return Some(conn);
-        }
-
-        if let Some(conn) = connections
-            .values_mut()
-            .flat_map(ConnectionBucket::iter_mut)
-            .find(|conn| {
-                conn.redirect_equals(key)
-                    && conn.get_instance_id() == instance_id
-                    && !conn.has_ended()
-            })
-        {
-            refresh_untracked_activity(conn);
-            return Some(conn);
-        }
-
-        None
+        let conn = self.bucket_mut(key)?.iter_mut().find(|conn| {
+            conn.remote_equals(key) && conn.get_instance_id() == instance_id && !conn.has_ended()
+        })?;
+        refresh_untracked_activity(conn);
+        Some(conn)
     }
 
     /// Returns the PID of the first live UDP entry with these addresses and local
@@ -688,10 +623,9 @@ impl<T: Connection + Clone> ConnectionMap<T> {
             .map(Connection::get_process_id)
     }
 
-    /// Reads the best live connection matching `key`.
+    /// Reads the live connection matching the exact tuple `key`.
     ///
-    /// Live exact matches take precedence over live redirect matches. Ended
-    /// entries are deliberately ignored so connection-establishment and update
+    /// Ended entries are deliberately ignored so connection-establishment and update
     /// paths cannot mistake retained history for a current flow.
     pub fn read<C>(&self, key: &Key, read_connection: fn(&T) -> Option<C>) -> Option<C> {
         self.read_matching(key, read_connection, false)
@@ -699,7 +633,7 @@ impl<T: Connection + Clone> ConnectionMap<T> {
 
     /// Reads the best connection matching `key`, including retained history.
     ///
-    /// Live exact and redirect matches still take precedence. An ended match is
+    /// A live exact match takes precedence. An ended exact match is
     /// returned only when no live candidate exists, preserving policy for a
     /// packet already in flight after its connection closed.
     pub fn read_with_ended_fallback<C>(
@@ -713,7 +647,7 @@ impl<T: Connection + Clone> ConnectionMap<T> {
     /// Reads the most recently inserted ended generation for one exact tuple.
     ///
     /// This is used only to recognize a late ALE reauthorization after endpoint
-    /// closure. It deliberately ignores live and redirected entries and does not
+    /// closure. It deliberately ignores live entries and does not
     /// refresh activity, so it cannot turn retained history into current state.
     pub fn read_ended_exact<C>(
         &self,
@@ -753,53 +687,11 @@ impl<T: Connection + Clone> ConnectionMap<T> {
         read_connection: fn(&T) -> Option<C>,
         use_ended_fallback: bool,
     ) -> Option<C> {
-        if let Some(connections) = self.0.get(&key.small()) {
-            // Exact remote match first, using one direct endpoint lookup. The
-            // normally single-element bucket still validates the local address.
-            let (live_exact, ended_exact) = remote_endpoint_from_key::<T>(key)
-                .and_then(|endpoint| connections.get(&endpoint))
-                .map(|bucket| live_and_ended_match(bucket.iter(), |conn| conn.remote_equals(key)))
-                .unwrap_or((None, None));
-
-            if let Some(conn) = live_exact {
-                refresh_untracked_activity(conn);
-                return read_connection(conn);
-            }
-
-            // A redirected connection cannot be found by the search above: it is
-            // stored under its real remote endpoint, while the packet that comes
-            // back carries the redirect target instead (loopback:53 for a DNS
-            // redirect, for example). Those are found by scanning.
-            //
-            // The scan is guarded by the port test so it does not run on every
-            // miss. `redirect_equals` only ever accepts one of the three redirect
-            // ports, so for any other remote port the scan cannot match and is
-            // skipped - which is what keeps an inbound flood, where every lookup
-            // misses, off the O(n) path.
-            let (live_redirect, ended_redirect) = if is_redirect_port(key.remote_port) {
-                live_and_ended_match(
-                    connections.values().flat_map(ConnectionBucket::iter),
-                    |conn| conn.redirect_equals(key),
-                )
-            } else {
-                (None, None)
-            };
-
-            // Any live redirect is newer connection state than retained ended
-            // history, even if that history happens to be an exact match for the
-            // redirect endpoint. Exact matching still wins when both are live.
-            let ended_match = if use_ended_fallback {
-                ended_exact.or(ended_redirect)
-            } else {
-                None
-            };
-            if let Some(conn) = live_redirect.or(ended_match) {
-                refresh_untracked_activity(conn);
-                return read_connection(conn);
-            }
-        }
-
-        None
+        let bucket = self.bucket(key)?;
+        let (live, ended) = live_and_ended_match(bucket.iter(), |conn| conn.remote_equals(key));
+        let conn = live.or(if use_ended_fallback { ended } else { None })?;
+        refresh_untracked_activity(conn);
+        read_connection(conn)
     }
 
     /// Binds native endpoint/flow lifetime to one exact live fallback instance.
@@ -1025,9 +917,7 @@ mod tests {
         remote_endpoint_from_key, ConnectionBucket, ConnectionMap, Key, RemoteConnections,
         RemoteEndpoint,
     };
-    use crate::connection::{
-        Connection, ConnectionV4, ConnectionV6, Direction, Verdict, PM_DNS_PORT,
-    };
+    use crate::connection::{Connection, ConnectionV4, ConnectionV6, Direction};
     use core::{mem::size_of, time::Duration};
     use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Address, Ipv6Address};
 
@@ -1072,11 +962,6 @@ mod tests {
     fn ended_in_direction(key: &Key, process_id: u64, direction: Direction) -> ConnectionV4 {
         let mut conn = ConnectionV4::from_key(key, process_id, direction).expect("IPv4 key");
         conn.end(1);
-        conn
-    }
-
-    fn redirected(mut conn: ConnectionV4) -> ConnectionV4 {
-        conn.verdict = Verdict::RedirectNameServer;
         conn
     }
 
@@ -1447,17 +1332,14 @@ mod tests {
     #[test]
     fn ended_exact_lookup_selects_latest_retained_generation_only() {
         let tuple = key([8, 8, 4, 4], 443);
-        let redirect_target = key([127, 0, 0, 1], PM_DNS_PORT);
+        let other_tuple = key([127, 0, 0, 1], 53);
         let mut map = ConnectionMap::new();
         map.add(ended(&tuple, 10));
         map.add(ended(&tuple, 20));
-        map.add(redirected(ended(&key([1, 1, 1, 1], 53), 30)));
+        map.add(ended(&key([1, 1, 1, 1], 53), 30));
 
         assert_eq!(map.read_ended_exact(&tuple, read_process_id), Some(20));
-        assert_eq!(
-            map.read_ended_exact(&redirect_target, read_process_id),
-            None
-        );
+        assert_eq!(map.read_ended_exact(&other_tuple, read_process_id), None);
     }
 
     #[test]
@@ -1513,46 +1395,6 @@ mod tests {
         assert!(map.insert_if_absent(live(&tuple, 20)).is_ok());
         assert_eq!(map.get_count(), 2);
         assert_eq!(map.read(&tuple, read_process_id), Some(20));
-    }
-
-    #[test]
-    fn reused_live_redirect_entry_wins() {
-        let original = key([8, 8, 8, 8], 53);
-        let redirect_target = key([127, 0, 0, 1], PM_DNS_PORT);
-        let mut map = ConnectionMap::new();
-        map.add(redirected(ended(&original, 10)));
-        map.add(redirected(live(&original, 20)));
-
-        assert_eq!(map.read(&redirect_target, read_process_id), Some(20));
-        assert_eq!(
-            map.read_with_ended_fallback(&redirect_target, read_process_id),
-            Some(20)
-        );
-    }
-
-    #[test]
-    fn live_redirect_wins_over_ended_exact_fallback() {
-        let redirect_target = key([127, 0, 0, 1], PM_DNS_PORT);
-        let original = key([8, 8, 8, 8], 53);
-        let mut map = ConnectionMap::new();
-        map.add(ended(&redirect_target, 10));
-        map.add(redirected(live(&original, 20)));
-
-        assert_eq!(
-            map.read_with_ended_fallback(&redirect_target, read_process_id),
-            Some(20)
-        );
-    }
-
-    #[test]
-    fn live_exact_wins_over_live_redirect() {
-        let redirect_target = key([127, 0, 0, 1], PM_DNS_PORT);
-        let original = key([8, 8, 8, 8], 53);
-        let mut map = ConnectionMap::new();
-        map.add(redirected(live(&original, 20)));
-        map.add(live(&redirect_target, 10));
-
-        assert_eq!(map.read(&redirect_target, read_process_id), Some(10));
     }
 
     #[test]
@@ -1759,21 +1601,6 @@ mod tests {
     }
 
     #[test]
-    fn exact_instance_update_resolves_redirected_packet_key() {
-        let original = key([198, 51, 100, 8], 53);
-        let redirect_target = key([127, 0, 0, 1], PM_DNS_PORT);
-        let connection = redirected(live(&original, 10));
-        let instance_id = connection.get_instance_id();
-        let mut map = ConnectionMap::new();
-        map.add(connection);
-
-        map.get_mut_instance(&redirect_target, instance_id)
-            .expect("redirected instance")
-            .process_id = 40;
-        assert_eq!(map.read(&original, read_process_id), Some(40));
-    }
-
-    #[test]
     fn stale_instance_cannot_promote_reused_tuple() {
         let tuple = key([198, 51, 100, 2], 443);
         let old = untracked(&tuple, 10);
@@ -1787,37 +1614,88 @@ mod tests {
         assert_eq!(map.end_inactive_untracked_connections().len(), 1);
     }
 
-    #[test]
-    fn ended_redirect_is_late_packet_fallback() {
-        let original = key([8, 8, 8, 8], 53);
-        let redirect_target = key([127, 0, 0, 1], PM_DNS_PORT);
+    fn verify_exact_port_lookup<T: Connection + Clone>(connection: T, other_address: IpAddress) {
+        let tuple = connection.get_key();
+        let instance_id = connection.get_instance_id();
+        let pid = connection.get_process_id();
         let mut map = ConnectionMap::new();
-        map.add(redirected(ended(&original, 10)));
+        map.add(connection);
+        let read_pid = |conn: &T| Some(conn.get_process_id());
+        assert_eq!(map.read(&tuple, read_pid), Some(pid));
+        assert!(map
+            .get_live_instance_matching(&tuple, instance_id)
+            .is_some());
+        assert!(map.get_mut_instance(&tuple, instance_id).is_some());
+        assert!(map.get_live_instance_matching(&tuple, 0).is_none());
+        assert!(map.get_mut_instance(&tuple, 0).is_none());
 
-        assert_eq!(map.read(&redirect_target, read_process_id), None);
-        assert_eq!(
-            map.read_with_ended_fallback(&redirect_target, read_process_id),
-            Some(10)
-        );
+        for other in [
+            Key {
+                remote_address: other_address,
+                ..tuple
+            },
+            Key {
+                remote_address: tuple.local_address,
+                ..tuple
+            },
+            Key {
+                local_address: other_address,
+                ..tuple
+            },
+            Key {
+                remote_port: tuple.remote_port + 1,
+                ..tuple
+            },
+            Key {
+                local_port: tuple.local_port + 1,
+                ..tuple
+            },
+        ] {
+            assert_eq!(map.read(&other, read_pid), None);
+            assert_eq!(map.read_with_ended_fallback(&other, read_pid), None);
+            assert!(map
+                .get_live_instance_matching(&other, instance_id)
+                .is_none());
+            assert!(map.get_mut_instance(&other, instance_id).is_none());
+        }
+        assert!(map.end_instance(tuple, instance_id).is_some());
+        assert!(map
+            .get_live_instance_matching(&tuple, instance_id)
+            .is_none());
+        assert!(map.get_mut_instance(&tuple, instance_id).is_none());
+        assert_eq!(map.read(&tuple, read_pid), None);
+        assert_eq!(map.read_with_ended_fallback(&tuple, read_pid), Some(pid));
     }
 
     #[test]
-    fn ended_redirect_is_not_inbound_packet_fallback() {
-        let original = key([8, 8, 8, 8], 53);
-        let redirect_target = key([127, 0, 0, 1], PM_DNS_PORT);
+    fn all_ports_require_exact_tuple_and_live_instance_v4() {
+        for protocol in [IpProtocol::Tcp, IpProtocol::Udp] {
+            for port in [53, 717, 719, 443] {
+                let tuple = Key {
+                    protocol,
+                    ..key([203, 0, 113, 1], port)
+                };
+                verify_exact_port_lookup(
+                    live(&tuple, 42),
+                    IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1)),
+                );
+            }
+        }
+    }
 
-        for connection_direction in [Direction::Inbound, Direction::Outbound] {
-            let mut map = ConnectionMap::new();
-            map.add(redirected(ended_in_direction(
-                &original,
-                10,
-                connection_direction,
-            )));
-
-            assert_eq!(
-                map.read_for_packet(&redirect_target, Direction::Inbound, read_process_id),
-                None
-            );
+    #[test]
+    fn all_ports_require_exact_tuple_and_live_instance_v6() {
+        for protocol in [IpProtocol::Tcp, IpProtocol::Udp] {
+            for port in [53, 717, 719, 443] {
+                let tuple = Key {
+                    protocol,
+                    ..key_v6(Ipv6Address::new(0x2001, 0xdb8, 1, 0, 0, 0, 0, 1).0, port)
+                };
+                verify_exact_port_lookup(
+                    live_v6(&tuple, 42),
+                    IpAddress::Ipv6(Ipv6Address::LOOPBACK),
+                );
+            }
         }
     }
 }

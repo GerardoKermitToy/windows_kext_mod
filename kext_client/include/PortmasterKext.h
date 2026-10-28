@@ -49,10 +49,8 @@ enum class Verdict : uint8_t {
     PermanentBlock      = 5,
     Drop                = 6,
     PermanentDrop       = 7,
-    RedirectNameServer  = 8,
-    RedirectTunnel      = 9,
+    // Values 8, 9 and 11 are reserved and must not be reused.
     Failed              = 10,
-    RedirectSplitTunnel = 11,
 };
 
 // Severity, from protocol/src/info.rs:288
@@ -177,7 +175,6 @@ public:
     // PortmasterKext service already exists instead of taking ownership of an
     // independently managed driver instance. sys_path must be absolute.
     // Writes the inbound UDP cache-miss PID fallback setting before driver startup.
-    // Does not write IgnoreSpecialPorts; the driver reads its registry value at load.
     bool Install(const std::wstring& sys_path, std::string& error,
                  bool inbound_udp_pid_fallback = true);
 

@@ -1,5 +1,5 @@
 use crate::{
-    connection::{Connection, ConnectionV4, ConnectionV6, Direction, RedirectInfo, Verdict},
+    connection::{Connection, ConnectionV4, ConnectionV6, Direction, Verdict},
     connection_map::{ConnectionMap, Key},
 };
 use alloc::{string::String, vec::Vec};
@@ -44,11 +44,6 @@ pub struct ConnectionCache {
 pub struct ConnectionRegistration {
     pub inserted: bool,
     pub instance_id: u64,
-}
-
-/// Result of applying a verdict to one exact live cache instance.
-pub struct ConnectionUpdate {
-    pub redirect_info: Option<RedirectInfo>,
 }
 
 /// Merges process attribution using the same precedence for registration and
@@ -301,8 +296,7 @@ impl ConnectionCache {
     /// Runs `use_instance` only while the exact cache generation matching a packet
     /// key is still live.
     ///
-    /// Unlike the endpoint-oriented method above, this accepts a reverse-redirect
-    /// key. The map's shared guard remains held while `use_instance` publishes both
+    /// The map's shared guard remains held while `use_instance` publishes both
     /// the pending packet and its userspace event. A lifecycle end requires the
     /// exclusive guard, so it cannot emit END between validation and publication.
     /// The callback also receives the matched generation's captured thread ID.
@@ -403,21 +397,18 @@ impl ConnectionCache {
         }
     }
 
-    pub fn update_connection(&self, key: Key, verdict: Verdict) -> Option<RedirectInfo> {
+    pub fn update_connection(&self, key: Key, verdict: Verdict) {
         if unlikely(key.is_ipv6()) {
             let mut connections = self.connections_v6.write_lock();
             if let Some(conn) = connections.get_mut(&key) {
                 conn.verdict = verdict;
-                return conn.redirect_info();
             }
         } else {
             let mut connections = self.connections_v4.write_lock();
             if let Some(conn) = connections.get_mut(&key) {
                 conn.verdict = verdict;
-                return conn.redirect_info();
             }
         }
-        None
     }
 
     /// Applies a pending verdict only to the cache instance that queued it.
@@ -430,22 +421,18 @@ impl ConnectionCache {
         key: Key,
         instance_id: u64,
         verdict: Verdict,
-    ) -> Option<ConnectionUpdate> {
+    ) -> Option<()> {
         if unlikely(key.is_ipv6()) {
             let mut connections = self.connections_v6.write_lock();
             if let Some(conn) = connections.get_mut_instance(&key, instance_id) {
                 conn.verdict = verdict;
-                return Some(ConnectionUpdate {
-                    redirect_info: conn.redirect_info(),
-                });
+                return Some(());
             }
         } else {
             let mut connections = self.connections_v4.write_lock();
             if let Some(conn) = connections.get_mut_instance(&key, instance_id) {
                 conn.verdict = verdict;
-                return Some(ConnectionUpdate {
-                    redirect_info: conn.redirect_info(),
-                });
+                return Some(());
             }
         }
         None
@@ -752,7 +739,7 @@ impl ConnectionCache {
 mod tests {
     use super::ConnectionCache;
     use crate::{
-        connection::{Connection, Direction, Verdict, PM_DNS_PORT},
+        connection::{Connection, Direction, Verdict},
         connection_map::Key,
     };
     use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Address, Ipv6Address};
@@ -1113,58 +1100,6 @@ mod tests {
 
         assert_eq!(result, Err(42));
         assert!(!callback_ran);
-    }
-
-    #[test]
-    fn publication_accepts_exact_redirect_generation_only_while_live() {
-        let cache = ConnectionCache::new();
-        let original = key([203, 0, 113, 1], 53);
-        let redirect = key([127, 0, 0, 1], PM_DNS_PORT);
-        let registration = cache
-            .register_ale_connection(&original, 100, 1234, Direction::Outbound)
-            .expect("connection registration");
-        assert!(cache
-            .update_connection_instance(
-                original,
-                registration.instance_id,
-                Verdict::RedirectNameServer,
-            )
-            .is_some());
-
-        assert_eq!(
-            cache.with_live_connection_instance_matching(
-                &redirect,
-                registration.instance_id,
-                41,
-                |_, value, thread_id| {
-                    assert_eq!(thread_id, 1234);
-                    value + 1
-                },
-            ),
-            Ok(42)
-        );
-        assert_eq!(
-            cache.with_live_connection_instance_matching(
-                &redirect,
-                registration.instance_id.wrapping_add(1),
-                41,
-                |_, value, _| value + 1,
-            ),
-            Err(41)
-        );
-
-        assert!(cache
-            .end_connection_instance_v4(original, registration.instance_id)
-            .is_some());
-        assert_eq!(
-            cache.with_live_connection_instance_matching(
-                &redirect,
-                registration.instance_id,
-                41,
-                |_, value, _| value + 1,
-            ),
-            Err(41)
-        );
     }
 
     #[test]
