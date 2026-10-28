@@ -12,7 +12,6 @@ extern crate alloc;
 mod ale_callouts;
 mod ale_policy;
 mod array_holder;
-#[cfg(not(test))]
 mod bandwidth;
 #[cfg(not(test))]
 mod bugcheck;
