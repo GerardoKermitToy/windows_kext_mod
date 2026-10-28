@@ -627,7 +627,7 @@ Change to the repository root:
 Set-Location 'C:\portmaster_v3'
 ```
 
-Keep the complete repository layout: `windows_kext` contains the driver and signing scripts, while `kext_client` contains the C++ monitor and uses the sibling `winrpc` sources. Continue with certificate creation below before building and signing the driver.
+Keep the repository layout: `windows_kext` contains the driver and signing scripts, while `kext_client` contains the C++ monitor and communicates directly with the driver. Continue with certificate creation below before building and signing the driver.
 
 ### 1. Create the local certificates
 

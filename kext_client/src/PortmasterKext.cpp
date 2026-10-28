@@ -3,8 +3,6 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 
-#include "duplex_pipe/duplex_pipe_server.h"
-
 #include <windows.h>
 #include <winsvc.h>
 
@@ -190,23 +188,7 @@ std::string BandwidthEntry::RemoteIpString() const {
 // -------------------------------------------------------------- service setup
 
 Driver::Driver(std::wstring service_name)
-    : service_name_(std::move(service_name)),
-      server_(std::make_unique<duplex_pipe::Server>()) {
-    server_->SetConnectionCallback(
-        [this](const duplex_pipe::ClientConnectionEvent event) noexcept {
-            client_connected_.store(
-                event == duplex_pipe::ClientConnectionEvent::Connected,
-                std::memory_order_release);
-        });
-    server_->SetReceiveCallback(
-        [this](const byte* const note, const unsigned long note_size) {
-            std::string ignored;
-            SendCommand(
-                reinterpret_cast<const uint8_t*>(note),
-                static_cast<size_t>(note_size),
-                ignored);
-        });
-}
+    : service_name_(std::move(service_name)) {}
 
 Driver::~Driver() {
     Cleanup();
@@ -302,21 +284,10 @@ bool Driver::Open(std::string& error) {
     }
 
     shutdown_requested_.store(false, std::memory_order_release);
-    client_connected_.store(false, std::memory_order_release);
-    const RPC_STATUS server_status = server_->Start();
-    if (server_status != ERROR_SUCCESS) {
-        error = "named-pipe Server::Start failed: " + LastErrorText(server_status);
-        return false;
-    }
     return true;
 }
 
 void Driver::Cleanup() {
-    if (server_ != nullptr) {
-        server_->Stop();
-    }
-    client_connected_.store(false, std::memory_order_release);
-
     if (device_ != nullptr) {
         CloseHandle(static_cast<HANDLE>(device_));
         device_ = nullptr;
@@ -526,27 +497,6 @@ size_t Driver::Dispatch(const Handlers& handlers) {
         }
 
         const size_t record_size = kRecordHeaderSize + n;
-        if (client_connected_.load(std::memory_order_acquire)) {
-            RPC_STATUS status = ERROR_FILE_TOO_LARGE;
-            if (record_size <= duplex_pipe::kMaxNoteSize) {
-                status = server_->Send(
-                    reinterpret_cast<const byte*>(rec),
-                    static_cast<unsigned long>(record_size));
-            }
-
-            // A successful write belongs exclusively to the client. If sending
-            // failed but the connection callback still reports a live client,
-            // keep the same exclusive ownership rather than invoking handlers for
-            // a record that was selected for remote delivery. Transport failures
-            // synchronously end the session and clear the flag, so those records
-            // fall through to the original local parser.
-            if (status == ERROR_SUCCESS ||
-                client_connected_.load(std::memory_order_acquire)) {
-                offset += record_size;
-                continue;
-            }
-        }
-
         const auto type = static_cast<InfoType>(rec[0]);
         const uint8_t* p = rec + kRecordHeaderSize;
 

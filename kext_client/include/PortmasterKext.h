@@ -7,15 +7,10 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
-#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
-
-namespace duplex_pipe {
-class Server;
-}
 
 namespace pmkext {
 
@@ -186,9 +181,8 @@ public:
     bool Install(const std::wstring& sys_path, std::string& error,
                  bool inbound_udp_pid_fallback = true);
 
-    // Opens the device with FILE_FLAG_OVERLAPPED, then starts the named-pipe
-    // server. With no explicit Server path override, it trusts pipe_client.exe
-    // next to the current executable.
+    // Opens the device directly with FILE_FLAG_OVERLAPPED. No named-pipe or
+    // RPC server is started; all events are delivered to local handlers.
     //
     // Overlapped is mandatory, and not for asynchrony. Windows serialises I/O
     // on a handle opened WITHOUT that flag: the file object is marked
@@ -211,9 +205,8 @@ public:
     // handle releases a blocked read before this thread is joined.
     //
     // on_poll fires on a fixed cadence from Run()'s thread, independently of
-    // event traffic. Other handlers are invoked from the reader thread unless
-    // a named-pipe client is connected; complete raw records are sent to that
-    // client instead.
+    // event traffic. Other handlers are always invoked from the reader thread
+    // after a complete wire record has been accumulated.
     void Run(const Handlers& handlers, unsigned poll_interval_ms = 1000);
 
     // Signals Run() to return, then issues IOCTL_SHUTDOWN_REQUEST so the driver
@@ -248,8 +241,6 @@ private:
     void ReaderLoop(const Handlers& handlers);
 
     std::wstring         service_name_;
-    std::unique_ptr<duplex_pipe::Server> server_;
-    std::atomic<bool>    client_connected_{false};
     std::atomic<bool>    shutdown_requested_{false};
     void*                device_ = nullptr;   // HANDLE
     void*                scm_ = nullptr;      // SC_HANDLE

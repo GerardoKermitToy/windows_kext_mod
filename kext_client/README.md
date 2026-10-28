@@ -2,30 +2,35 @@
 
 User-space client and console monitor for the Portmaster Windows kernel extension.
 
-## Named-pipe bridge
+## Direct driver delivery
 
-Opening the driver also starts `duplex_pipe::Server` on
-`\\.\pipe\WinNamedPipeDuplex.Service`. The server keeps the authorization rule
-from `winrpc`: by default, only `pipe_client.exe` next to `kext_monitor.exe` is
-trusted. The client must likewise start with `kext_monitor.exe` as its trusted
-server path.
+`Driver::Open` opens the driver device directly. This client has no named-pipe
+or RPC server, does not accept remote commands, and does not depend on `winrpc`.
+Existing named-pipe clients can no longer attach to `kext_monitor.exe`.
 
-Each client `Data` message is passed to `Driver::SendCommand` with the original
-pointer and size. The bridge does not decode, validate, combine, or modify client
-commands, so every message must already contain one valid driver command.
-
-Driver reads are still accumulated until a complete wire record is available:
+Driver reads are accumulated until a complete wire record is available:
 
 ```text
 [InfoType: u8][payload size: u32 little-endian][payload]
 ```
 
-While a client is connected, each complete record (including the five-byte
-header) is sent in one `Server::Send` call and the local event handlers are not
-invoked for it. If sending detects that the client disconnected, that record
-falls back to the existing parser; subsequent records continue through the
-normal local handlers until another client connects. The periodic `on_poll`
-callback is independent of event dispatch and continues to run in both modes.
+Every complete record is parsed locally and delivered to its optional
+`Handlers` callback on the reader thread. The periodic `on_poll` callback
+continues independently on `Run`'s thread. Bandwidth snapshots larger than the
+former 64-MiB pipe-message limit are no longer skipped or diverted away from
+`on_bandwidth`: the reader accumulates them across 64-KiB reads, just like other
+records. The wire format, including its `u32` payload length, is unchanged.
+
+`bandwidth_record_tests` covers IPv4/IPv6 and TCP/UDP snapshots immediately below
+and above that former limit, including 2,396,745 IPv4 tuples or 1,290,555 IPv6
+tuples in one record. It checks every tuple and both 64-bit counters, split
+headers and payloads, exactly-once delivery, subsequent records, and empty
+buffer state after dispatch. After building the client, run the suite from the
+repository root:
+
+```bash
+ctest --test-dir kext_client/build -C Release --output-on-failure
+```
 
 ## Inbound UDP PID fallback
 
@@ -86,8 +91,7 @@ payload: [u8; payload_size]
 ```
 
 The fixed payload prefix is 55 bytes for IPv4 and 79 bytes for IPv6, excluding
-the five-byte record header and captured packet bytes. The named-pipe bridge
-forwards these complete raw records unchanged.
+the five-byte record header and captured packet bytes.
 
 `CONN` output includes `tid=...` in its header and the three routing fields on a
 separate line. The driver snapshots the exact live connection generation's TID
@@ -130,8 +134,7 @@ separate `[VERDICT] id=...` line. The final `verdicts sent` count includes only
 successful sends, not scheduled verdicts. Stopping discards unsent verdicts without
 waiting for their deadlines, and joins the sender before closing the device.
 
-`--no-verdicts` still disables automatic answers entirely. The option does not
-change or delay raw commands submitted by a connected named-pipe client.
+`--no-verdicts` still disables automatic answers entirely.
 
 ## Suspend processes during verdict delay
 

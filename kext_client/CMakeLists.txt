@@ -8,22 +8,13 @@ if(NOT WIN32)
     message(FATAL_ERROR "kext_client targets Windows only.")
 endif()
 
-# Named-pipe server used to bridge raw driver traffic to an attached client.
-set(WINRPC_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../winrpc/src")
-
-# Client library for the Portmaster kernel extension.
+# Client library for the Portmaster kernel extension (direct device I/O only).
 add_library(pmkext STATIC
     src/PortmasterKext.cpp
     src/ProcessSuspensions.cpp
-    "${WINRPC_SOURCE_DIR}/duplex_pipe/duplex_pipe_server.cpp"
-    "${WINRPC_SOURCE_DIR}/duplex_pipe/pipe_transport.cpp"
-    "${WINRPC_SOURCE_DIR}/pipe_support.cpp"
 )
 
-target_include_directories(pmkext
-    PUBLIC include
-    PRIVATE "${WINRPC_SOURCE_DIR}"
-)
+target_include_directories(pmkext PUBLIC include)
 
 # Advapi32 provides SCM functions; Ws2_32 provides IP literal parsing.
 target_link_libraries(pmkext PUBLIC advapi32 ws2_32)
@@ -82,6 +73,11 @@ if(BUILD_TESTING)
     target_link_libraries(connection_record_tests PRIVATE pmkext)
     add_test(NAME connection_record_tests COMMAND connection_record_tests)
     set_tests_properties(connection_record_tests PROPERTIES TIMEOUT 10)
+
+    add_executable(bandwidth_record_tests tests/bandwidth_record_tests.cpp)
+    target_link_libraries(bandwidth_record_tests PRIVATE pmkext)
+    add_test(NAME bandwidth_record_tests COMMAND bandwidth_record_tests)
+    set_tests_properties(bandwidth_record_tests PROPERTIES TIMEOUT 120)
 
     add_executable(ip_address_tests tests/ip_address_tests.cpp)
     target_link_libraries(ip_address_tests PRIVATE pmkext)
