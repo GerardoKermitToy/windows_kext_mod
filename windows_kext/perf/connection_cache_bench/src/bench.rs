@@ -4,7 +4,7 @@ use crate::connection_map::Key;
 use crate::workload::{
     snapshot, Family, PacketInfo, Query, Shape, Workload, CONNECTIONS, HITS, REQUESTS, SEED,
 };
-use smoltcp::wire::IpProtocol;
+use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Address, Ipv6Address};
 use std::{
     env,
     fs::{self, File},
@@ -292,6 +292,63 @@ fn pin_cpu() -> usize {
 #[cfg(not(windows))]
 fn pin_cpu() -> usize {
     0
+}
+
+fn cleanup_allocation_counts<T: Family>(local_address: IpAddress, remote_address: IpAddress) {
+    for (retained, expected_allocations) in [(0, 0), (1, 0), (2, 1), (512, 1), (2048, 0), (4096, 0)]
+    {
+        allocations::start();
+        let mut map = crate::connection_map::ConnectionMap::<T>::new();
+        let key = |index: u16| Key {
+            protocol: IpProtocol::Udp,
+            local_address,
+            local_port: 50_000,
+            remote_address,
+            remote_port: 10_000 + index,
+        };
+        for index in 0..4096u16 {
+            let mut connection = T::make(&key(index), usize::from(index));
+            if index >= retained {
+                connection.end(1);
+            }
+            assert!(map.insert_if_absent(connection).is_ok());
+        }
+
+        let before = allocations::snapshot();
+        map.clean_ended_connections();
+        let cleanup_allocations = allocations::snapshot().calls - before.calls;
+        assert_eq!(map.get_count(), usize::from(retained));
+        for index in 0..4096u16 {
+            assert_eq!(
+                map.read(&key(index), |connection| Some(connection.get_process_id())),
+                (index < retained).then_some(1000 + u64::from(index))
+            );
+        }
+        drop(map);
+        allocations::finish();
+        assert_eq!(
+            cleanup_allocations,
+            expected_allocations,
+            "{}: cleanup to {retained} endpoints",
+            T::NAME
+        );
+    }
+}
+
+#[test]
+fn cleanup_allocation_counts_v4() {
+    cleanup_allocation_counts::<ConnectionV4>(
+        IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 1)),
+        IpAddress::Ipv4(Ipv4Address::new(198, 51, 100, 1)),
+    );
+}
+
+#[test]
+fn cleanup_allocation_counts_v6() {
+    cleanup_allocation_counts::<ConnectionV6>(
+        IpAddress::Ipv6(Ipv6Address::new(0x2001, 0xdb8, 1, 0, 0, 0, 0, 1)),
+        IpAddress::Ipv6(Ipv6Address::new(0x2001, 0xdb8, 2, 0, 0, 0, 0, 1)),
+    );
 }
 
 #[test]

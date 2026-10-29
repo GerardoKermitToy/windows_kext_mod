@@ -59,7 +59,7 @@ fn main() {
             );
             replace_once(
                 &mut source,
-                "                if connections.capacity() > 64 && connections.len() < connections.capacity() / 4 {\n                    connections.shrink_to_fit();\n                }\n",
+                "                        if connections.capacity() > 64\n                            && connections.len() < connections.capacity() / 4\n                        {\n                            connections.shrink_to_fit();\n                        }\n",
                 "",
             );
         }

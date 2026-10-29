@@ -347,9 +347,6 @@ impl<T: Connection> RemoteConnections<T> {
             }
             Self::Many(mut connections) => {
                 connections.retain(|_, bucket| bucket.retain(&mut retain));
-                if connections.capacity() > 64 && connections.len() < connections.capacity() / 4 {
-                    connections.shrink_to_fit();
-                }
                 match connections.len() {
                     0 => Self::Empty,
                     1 => {
@@ -359,7 +356,14 @@ impl<T: Connection> RemoteConnections<T> {
                             .expect("one retained remote endpoint");
                         Self::One(bucket)
                     }
-                    _ => Self::Many(connections),
+                    _ => {
+                        if connections.capacity() > 64
+                            && connections.len() < connections.capacity() / 4
+                        {
+                            connections.shrink_to_fit();
+                        }
+                        Self::Many(connections)
+                    }
                 }
             }
         };
