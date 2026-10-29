@@ -67,18 +67,14 @@ fn merge_process_id(
     false
 }
 
-fn connection_instance_is_outbound_v4(
-    connection: &ConnectionV4,
-) -> Option<(u64, bool)> {
+fn connection_instance_is_outbound_v4(connection: &ConnectionV4) -> Option<(u64, bool)> {
     Some((
         connection.get_instance_id(),
         matches!(connection.get_direction(), Direction::Outbound),
     ))
 }
 
-fn connection_instance_is_outbound_v6(
-    connection: &ConnectionV6,
-) -> Option<(u64, bool)> {
+fn connection_instance_is_outbound_v6(connection: &ConnectionV6) -> Option<(u64, bool)> {
     Some((
         connection.get_instance_id(),
         matches!(connection.get_direction(), Direction::Outbound),
@@ -787,6 +783,117 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_growth_and_cleanup_preserve_packet_lookup_and_instances() {
+        const WRITERS: u32 = 4;
+        const PER_WRITER: u32 = 1024;
+        let cache = ConnectionCache::new();
+        let stable = connect_thread_keys().map(|tuple| {
+            let registration = cache
+                .register_connection(&tuple, 42, Direction::Outbound)
+                .unwrap();
+            cache.update_connection_instance(
+                tuple,
+                registration.instance_id,
+                Verdict::PermanentAccept,
+            );
+            (tuple, registration.instance_id)
+        });
+        let start = std::sync::Barrier::new(WRITERS as usize + 2);
+        std::thread::scope(|threads| {
+            for writer in 0..WRITERS {
+                let cache = &cache;
+                let start = &start;
+                threads.spawn(move || {
+                    start.wait();
+                    for index in 0..PER_WRITER {
+                        let id = writer * PER_WRITER + index + 1;
+                        for mut tuple in connect_thread_keys() {
+                            tuple.local_port = if index % 2 == 0 {
+                                50_000
+                            } else {
+                                1000 + id as u16
+                            };
+                            tuple.remote_address = if tuple.is_ipv6() {
+                                IpAddress::Ipv6(Ipv6Address::new(
+                                    0x2001, 0xdb8, 1, 0, 0, 0, 0, id as u16,
+                                ))
+                            } else {
+                                IpAddress::Ipv4(Ipv4Address::from_bytes(&id.to_be_bytes()))
+                            };
+                            let registration = cache
+                                .register_connection(&tuple, u64::from(id), Direction::Outbound)
+                                .unwrap();
+                            assert!(registration.inserted);
+                            if index % 5 == 0 {
+                                if tuple.is_ipv6() {
+                                    cache
+                                        .connections_v6
+                                        .write_lock()
+                                        .get_mut_instance(&tuple, registration.instance_id)
+                                        .unwrap()
+                                        .end(1);
+                                } else {
+                                    cache
+                                        .connections_v4
+                                        .write_lock()
+                                        .get_mut_instance(&tuple, registration.instance_id)
+                                        .unwrap()
+                                        .end(1);
+                                }
+                            } else {
+                                assert_eq!(
+                                    cache.get_connection_instance_id(&tuple),
+                                    Some(registration.instance_id)
+                                );
+                            }
+                        }
+                    }
+                });
+            }
+            let cache = &cache;
+            let start = &start;
+            threads.spawn(move || {
+                start.wait();
+                for _ in 0..2048 {
+                    for (tuple, instance_id) in stable {
+                        assert_eq!(cache.get_connection_instance_id(&tuple), Some(instance_id));
+                        let read_verdict =
+                            |conn: &crate::connection::ConnectionV4| Some(conn.get_verdict());
+                        let verdict = if tuple.is_ipv6() {
+                            cache.read_connection_v6_for_packet(
+                                &tuple,
+                                Direction::Inbound,
+                                |conn| Some(conn.get_verdict()),
+                            )
+                        } else {
+                            cache.read_connection_v4_for_packet(
+                                &tuple,
+                                Direction::Inbound,
+                                read_verdict,
+                            )
+                        };
+                        assert!(matches!(verdict, Some(Verdict::PermanentAccept)));
+                    }
+                }
+            });
+            threads.spawn(move || {
+                start.wait();
+                for _ in 0..1024 {
+                    cache.clean_ended_connections();
+                    std::thread::yield_now();
+                }
+            });
+        });
+        cache.clean_ended_connections();
+        let live_per_writer = (0..PER_WRITER).filter(|index| index % 5 != 0).count();
+        let per_family = 2 + WRITERS as usize * live_per_writer * 2;
+        assert_eq!(cache.get_entries_counts(), (per_family, per_family));
+        for (tuple, instance_id) in stable {
+            assert_eq!(cache.get_connection_instance_id(&tuple), Some(instance_id));
+        }
+    }
+
+    #[test]
     fn udp_pid_fallback_selects_family_and_does_not_create_missing_tuple() {
         for mut donor in connect_thread_keys() {
             let cache = ConnectionCache::new();
@@ -845,12 +952,25 @@ mod tests {
                 cache.get_untracked_connection_instance_id(&incoming),
                 Some(fallback.instance_id)
             );
-            assert!(matches!(saved_verdict(&cache, &incoming), Some(Verdict::Undecided)));
+            assert!(matches!(
+                saved_verdict(&cache, &incoming),
+                Some(Verdict::Undecided)
+            ));
             assert!(cache
-                .update_connection_instance(incoming, fallback.instance_id, Verdict::PermanentAccept)
+                .update_connection_instance(
+                    incoming,
+                    fallback.instance_id,
+                    Verdict::PermanentAccept
+                )
                 .is_some());
-            assert!(matches!(saved_verdict(&cache, &incoming), Some(Verdict::PermanentAccept)));
-            assert!(matches!(saved_verdict(&cache, &donor), Some(Verdict::PermanentBlock)));
+            assert!(matches!(
+                saved_verdict(&cache, &incoming),
+                Some(Verdict::PermanentAccept)
+            ));
+            assert!(matches!(
+                saved_verdict(&cache, &donor),
+                Some(Verdict::PermanentBlock)
+            ));
         }
     }
 
@@ -875,9 +995,15 @@ mod tests {
             assert!(!fallback.inserted);
             assert_eq!(fallback.instance_id, native.instance_id);
             assert_eq!(saved_identity(&cache, &tuple), Some((456, 7890)));
-            assert!(matches!(saved_verdict(&cache, &tuple), Some(Verdict::PermanentBlock)));
+            assert!(matches!(
+                saved_verdict(&cache, &tuple),
+                Some(Verdict::PermanentBlock)
+            ));
             assert_eq!(cache.get_untracked_connection_instance_id(&tuple), None);
-            assert_eq!(cache.is_outbound_connection_instance(&tuple, native.instance_id), Some(true));
+            assert_eq!(
+                cache.is_outbound_connection_instance(&tuple, native.instance_id),
+                Some(true)
+            );
         }
     }
 
@@ -899,9 +1025,13 @@ mod tests {
             assert_eq!(saved_identity(&cache, &tuple), Some((123, 0)));
 
             if tuple.is_ipv6() {
-                cache.end_connection_instance_v6(tuple, original.instance_id).unwrap();
+                cache
+                    .end_connection_instance_v6(tuple, original.instance_id)
+                    .unwrap();
             } else {
-                cache.end_connection_instance_v4(tuple, original.instance_id).unwrap();
+                cache
+                    .end_connection_instance_v4(tuple, original.instance_id)
+                    .unwrap();
             }
             let replacement = cache
                 .register_inbound_udp_fallback_connection(&tuple, 456)
@@ -911,7 +1041,10 @@ mod tests {
             assert!(cache
                 .update_connection_instance(tuple, original.instance_id, Verdict::PermanentAccept)
                 .is_none());
-            assert!(matches!(saved_verdict(&cache, &tuple), Some(Verdict::Undecided)));
+            assert!(matches!(
+                saved_verdict(&cache, &tuple),
+                Some(Verdict::Undecided)
+            ));
             assert_eq!(saved_identity(&cache, &tuple), Some((456, 0)));
         }
     }
@@ -948,7 +1081,10 @@ mod tests {
             }
             let (ended_v4, ended_v6) = cache.end_inactive_untracked_connections();
             assert!(ended_v4.is_empty() && ended_v6.is_empty());
-            assert_eq!(cache.get_connection_instance_id(&tuple), Some(tracked.instance_id));
+            assert_eq!(
+                cache.get_connection_instance_id(&tuple),
+                Some(tracked.instance_id)
+            );
         }
     }
 
@@ -956,16 +1092,19 @@ mod tests {
     fn ale_registration_keeps_pid_and_tid_together() {
         for tuple in connect_thread_keys() {
             let cache = ConnectionCache::new();
-            let original = cache.register_ale_connection(&tuple, 100, 1234, Direction::Outbound)
+            let original = cache
+                .register_ale_connection(&tuple, 100, 1234, Direction::Outbound)
                 .expect("ALE registration");
             assert_eq!(saved_identity(&cache, &tuple), Some((100, 1234)));
             for pid in [0, 4, 100] {
-                let repeated = cache.register_connection(&tuple, pid, Direction::Outbound)
+                let repeated = cache
+                    .register_connection(&tuple, pid, Direction::Outbound)
                     .expect("repeated registration");
                 assert_eq!(repeated.instance_id, original.instance_id);
                 assert_eq!(saved_identity(&cache, &tuple), Some((100, 1234)));
             }
-            let repeated = cache.register_ale_connection(&tuple, 200, 5678, Direction::Outbound)
+            let repeated = cache
+                .register_ale_connection(&tuple, 200, 5678, Direction::Outbound)
                 .expect("new process attribution");
             assert_eq!(repeated.instance_id, original.instance_id);
             assert_eq!(saved_identity(&cache, &tuple), Some((200, 5678)));
@@ -973,17 +1112,23 @@ mod tests {
             assert_eq!(saved_identity(&cache, &tuple), Some((200, 5678)));
             assert!(cache.update_process_id_instance(&tuple, original.instance_id, 300));
             assert_eq!(saved_identity(&cache, &tuple), Some((300, 0)));
-            cache.register_ale_connection(&tuple, 300, 9012, Direction::Outbound)
+            cache
+                .register_ale_connection(&tuple, 300, 9012, Direction::Outbound)
                 .expect("thread attribution");
             let ended_tid = if tuple.is_ipv6() {
-                cache.end_connection_instance_v6(tuple, original.instance_id)
-                    .expect("connection end").thread_id
+                cache
+                    .end_connection_instance_v6(tuple, original.instance_id)
+                    .expect("connection end")
+                    .thread_id
             } else {
-                cache.end_connection_instance_v4(tuple, original.instance_id)
-                    .expect("connection end").thread_id
+                cache
+                    .end_connection_instance_v4(tuple, original.instance_id)
+                    .expect("connection end")
+                    .thread_id
             };
             assert_eq!(ended_tid, 9012);
-            let replacement = cache.register_connection(&tuple, 400, Direction::Outbound)
+            let replacement = cache
+                .register_connection(&tuple, 400, Direction::Outbound)
                 .expect("tuple reuse");
             assert_ne!(replacement.instance_id, original.instance_id);
             assert_eq!(saved_identity(&cache, &tuple), Some((400, 0)));

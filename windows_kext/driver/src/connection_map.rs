@@ -1,14 +1,20 @@
-use core::{fmt::Display, time::Duration};
+use core::{
+    fmt::Display,
+    hash::{BuildHasherDefault, Hash},
+    time::Duration,
+};
 
-use crate::connection::{Connection, Direction};
-use alloc::{
-    collections::{
-        btree_map::{Entry, Values, ValuesMut},
-        BTreeMap,
-    },
-    vec::Vec,
+use crate::{
+    connection::{Connection, Direction},
+    port_table::PortTable,
+};
+use alloc::vec::Vec;
+use hashbrown::{
+    hash_map::{Entry, Values, ValuesMut},
+    HashMap,
 };
 use likely_stable::unlikely;
+use rustc_hash::FxHasher;
 use smoltcp::wire::{IpAddress, IpProtocol};
 
 #[derive(Clone, Copy, PartialEq, PartialOrd, Eq, Ord)]
@@ -80,8 +86,8 @@ impl Key {
 ///
 /// `ConnectionV4` uses a `u32` address and `ConnectionV6` uses two `u64` words.
 /// The separate family maps therefore avoid carrying an `IpAddress` discriminant
-/// through every B-tree comparison.
-#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+/// through every remote-endpoint hash.
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd, Hash)]
 struct RemoteEndpoint<A> {
     address: A,
     port: u16,
@@ -189,9 +195,16 @@ impl<T: Connection> ConnectionBucket<T> {
 /// A remote endpoint map is allocated only after one local endpoint has more
 /// than one distinct remote endpoint. Most ephemeral connections have one remote
 /// endpoint per `(protocol, local port)` group, so keeping that case inline avoids
-/// a B-tree allocation for every such group.
-type RemoteMap<T> =
-    BTreeMap<RemoteEndpoint<<T as Connection>::RemoteAddressKey>, ConnectionBucket<T>>;
+/// a hash-table allocation for every such group.
+///
+/// Fixed FxHash is an intentional throughput choice, not protection against
+/// adversarial keys. Maps and generation buckets grow without an entry limit.
+type FxBuildHasher = BuildHasherDefault<FxHasher>;
+type RemoteMap<T> = HashMap<
+    RemoteEndpoint<<T as Connection>::RemoteAddressKey>,
+    ConnectionBucket<T>,
+    FxBuildHasher,
+>;
 
 enum RemoteConnections<T: Connection> {
     Empty,
@@ -309,7 +322,7 @@ impl<T: Connection> RemoteConnections<T> {
                 *self = Self::One(ConnectionBucket::One(connection));
             }
             Self::One(stored_bucket) => {
-                let mut connections = BTreeMap::new();
+                let mut connections = RemoteMap::<T>::default();
                 connections.insert(stored_bucket.endpoint(), stored_bucket);
                 Self::insert_into_map(&mut connections, endpoint, connection);
                 *self = Self::Many(connections);
@@ -334,6 +347,9 @@ impl<T: Connection> RemoteConnections<T> {
             }
             Self::Many(mut connections) => {
                 connections.retain(|_, bucket| bucket.retain(&mut retain));
+                if connections.capacity() > 64 && connections.len() < connections.capacity() / 4 {
+                    connections.shrink_to_fit();
+                }
                 match connections.len() {
                     0 => Self::Empty,
                     1 => {
@@ -367,16 +383,16 @@ impl<T: Connection> RemoteConnections<T> {
 
 /// Connections grouped by `(protocol, local port)`, then by remote endpoint.
 ///
-/// The first remote endpoint in each local-port group is stored inline. A B-tree
-/// is allocated only when that group acquires a second distinct remote endpoint.
-/// Busy listeners still get ordered O(log n) endpoint lookup, while the common
-/// one-endpoint case avoids a fixed-size B-tree leaf allocation entirely.
+/// TCP/UDP ports use a direct heap-allocated directory with dense group storage.
+/// The first remote endpoint in each group is stored inline; a hash table is
+/// allocated only when the group acquires a second distinct remote endpoint.
+/// There is no connection-count limit or capacity-based eviction.
 ///
 /// Ended generations remain retained for late packets and are kept in insertion
 /// order inside their endpoint bucket. The remote endpoint is deliberately not
 /// the complete tuple: two local addresses can use the same port and remote
 /// endpoint, so exact operations still validate `Connection::remote_equals`.
-pub struct ConnectionMap<T: Connection>(BTreeMap<(IpProtocol, u16), RemoteConnections<T>>);
+pub struct ConnectionMap<T: Connection>(PortTable<RemoteConnections<T>>);
 
 /// Returns the first live match and remembers the first ended match as a
 /// possible late-packet fallback.
@@ -465,7 +481,7 @@ fn get_monotonic_timestamp_ms() -> u64 {
 
 impl<T: Connection + Clone> ConnectionMap<T> {
     pub fn new() -> Self {
-        Self(BTreeMap::new())
+        Self(PortTable::default())
     }
 
     #[cfg(test)]
@@ -602,9 +618,10 @@ impl<T: Connection + Clone> ConnectionMap<T> {
         Some(conn)
     }
 
-    /// Returns the PID of the first live UDP entry with these addresses and local
-    /// port, ignoring the remote port. Attribution alone must not refresh another
-    /// connection's activity or borrow its verdict/lifetime.
+    /// Returns the live UDP PID with these addresses and the lowest remote port.
+    /// Ties retain generation insertion order, matching the former ordered index.
+    /// Attribution alone must not refresh another connection's activity or borrow
+    /// its verdict/lifetime.
     pub(crate) fn find_active_udp_pid(
         &self,
         local_address: IpAddress,
@@ -615,11 +632,12 @@ impl<T: Connection + Clone> ConnectionMap<T> {
             .get(&(IpProtocol::Udp, local_port))?
             .values()
             .flat_map(ConnectionBucket::iter)
-            .find(|conn| {
+            .filter(|conn| {
                 !conn.has_ended()
                     && conn.get_local_address() == local_address
                     && conn.get_remote_address() == remote_address
             })
+            .min_by_key(|conn| conn.get_remote_port())
             .map(Connection::get_process_id)
     }
 
@@ -1612,6 +1630,149 @@ mod tests {
 
         assert!(!map.mark_native_lifecycle_instance(&tuple, old_instance_id));
         assert_eq!(map.end_inactive_untracked_connections().len(), 1);
+    }
+
+    fn verify_large_remote_index<T: Connection + Clone>(make: impl Fn(u32) -> T) {
+        const COUNT: u32 = 150_000;
+        let mut map = ConnectionMap::new();
+        for index in 0..COUNT {
+            let connection = make(index);
+            let instance_id = connection.get_instance_id();
+            assert_eq!(map.insert_if_absent(connection).ok(), Some(instance_id));
+        }
+        assert_eq!(map.get_count(), COUNT as usize);
+        for index in 0..COUNT {
+            let connection = make(index);
+            assert_eq!(
+                map.read(&connection.get_key(), |conn: &T| Some(
+                    conn.get_process_id()
+                )),
+                Some(connection.get_process_id()),
+            );
+        }
+
+        // Leave a sparse listener behind so cleanup also exercises hash-table
+        // compaction without evicting any live connection.
+        for index in 0..COUNT {
+            if index % 8 != 0 {
+                map.get_mut(&make(index).get_key()).unwrap().end(1);
+            }
+        }
+        map.clean_ended_connections();
+        assert_eq!(map.get_count(), COUNT as usize / 8);
+        for index in 0..COUNT {
+            let connection = make(index);
+            assert_eq!(
+                map.read(&connection.get_key(), |conn: &T| Some(
+                    conn.get_process_id()
+                )),
+                (index % 8 == 0).then_some(connection.get_process_id()),
+            );
+        }
+        map.clear();
+        assert_eq!(map.get_count(), 0);
+        assert!(map.insert_if_absent(make(COUNT - 1)).is_ok());
+        assert_eq!(map.get_count(), 1);
+    }
+
+    #[test]
+    fn one_port_can_hold_150000_connections_v4_without_eviction() {
+        verify_large_remote_index(|index| {
+            live(&key(index.to_be_bytes(), 443), u64::from(index) + 1)
+        });
+    }
+
+    #[test]
+    fn one_port_can_hold_150000_connections_v6_without_eviction() {
+        verify_large_remote_index(|index| {
+            let address = Ipv6Address::new(
+                0x2001,
+                0xdb8,
+                0,
+                0,
+                0,
+                0,
+                (index >> 16) as u16,
+                index as u16,
+            );
+            live_v6(&key_v6(address.0, 443), u64::from(index) + 1)
+        });
+    }
+
+    fn verify_retained_generation_growth<T: Connection + Clone>(make: impl Fn(u64) -> T) {
+        const GENERATIONS: u64 = 4096;
+        let mut map = ConnectionMap::new();
+        for pid in 0..GENERATIONS {
+            let mut connection = make(pid);
+            connection.end(1);
+            assert!(map.insert_if_absent(connection).is_ok());
+        }
+        let connection = make(GENERATIONS);
+        let tuple = connection.get_key();
+        let instance_id = connection.get_instance_id();
+        assert!(map.insert_if_absent(connection).is_ok());
+        assert_eq!(map.get_count(), GENERATIONS as usize + 1);
+        assert_eq!(
+            map.read_ended_exact(&tuple, |conn: &T| Some(conn.get_process_id())),
+            Some(GENERATIONS - 1),
+        );
+        assert!(map.has_live_instance(&tuple, instance_id));
+        map.clean_ended_connections();
+        assert_eq!(map.get_count(), 1);
+        assert!(map.has_live_instance(&tuple, instance_id));
+        assert_eq!(
+            map.read(&tuple, |conn: &T| Some(conn.get_process_id())),
+            Some(GENERATIONS),
+        );
+    }
+
+    #[test]
+    fn retained_generations_grow_without_a_count_limit_v4() {
+        let tuple = key([198, 51, 100, 20], 443);
+        verify_retained_generation_growth(|pid| live(&tuple, pid));
+    }
+
+    #[test]
+    fn retained_generations_grow_without_a_count_limit_v6() {
+        let tuple = key_v6(Ipv6Address::LOOPBACK.0, 443);
+        verify_retained_generation_growth(|pid| live_v6(&tuple, pid));
+    }
+
+    fn verify_udp_donor_order<T: Connection + Clone>(make: impl Fn(u16, u64) -> T) {
+        let mut map = ConnectionMap::new();
+        for port in [9000, 65000, 100, 443, 1, 50000] {
+            let mut connection = make(port, u64::from(port));
+            if port == 1 {
+                connection.end(1);
+            }
+            map.add(connection);
+        }
+        // Equal-port entries keep insertion precedence, not hash iteration order.
+        map.add(make(100, 999));
+        let tuple = make(200, 0).get_key();
+        for cleanup in [false, true] {
+            if cleanup {
+                map.clean_ended_connections();
+            }
+            assert_eq!(
+                map.find_active_udp_pid(
+                    tuple.local_address,
+                    tuple.local_port,
+                    tuple.remote_address
+                ),
+                Some(100),
+            );
+        }
+    }
+
+    #[test]
+    fn udp_donor_order_is_independent_of_hash_iteration_v4() {
+        verify_udp_donor_order(|port, pid| live(&key([198, 51, 100, 20], port), pid));
+    }
+
+    #[test]
+    fn udp_donor_order_is_independent_of_hash_iteration_v6() {
+        verify_udp_donor_order(|port, pid| live_v6(&key_v6(Ipv6Address::LOOPBACK.0, port), pid));
     }
 
     fn verify_exact_port_lookup<T: Connection + Clone>(connection: T, other_address: IpAddress) {

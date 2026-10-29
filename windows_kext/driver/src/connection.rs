@@ -120,7 +120,7 @@ pub trait Connection {
     /// Compact address representation used by the connection-cache index.
     /// IPv4 and IPv6 live in separate maps, so the index does not need the
     /// discriminant and storage overhead of `IpAddress`.
-    type RemoteAddressKey: Copy + Ord;
+    type RemoteAddressKey: Copy + Ord + core::hash::Hash;
 
     /// Returns the key of the connection.
     fn get_key(&self) -> Key {
