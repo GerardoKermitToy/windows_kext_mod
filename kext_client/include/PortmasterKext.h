@@ -24,6 +24,11 @@ enum class InfoType : uint8_t {
     ConnectionEndEventV6 = 4,
     BandwidthStatsV4     = 5,
     BandwidthStatsV6     = 6,
+    // Process batches are emitted only after StartProcessMonitoring is requested. Their payloads
+    // contain packed entries without a count field; the enclosing record size
+    // determines the batch length.
+    ProcessCreated       = 9,
+    ProcessTerminated    = 10,
 };
 
 // CommandType, from protocol/src/command.rs:9
@@ -37,6 +42,7 @@ enum class CommandType : uint8_t {
     GetBandwidthStats     = 6,
     PrintMemoryStats      = 7,
     CleanEndedConnections = 8,
+    StartProcessMonitoring = 9,
 };
 
 // Verdict, from driver/src/connection.rs:22
@@ -143,12 +149,29 @@ struct BandwidthStats {
     std::vector<BandwidthEntry> entries;
 };
 
+// ProcessCreated payload entries are packed as { pid: u64 LE, parent_pid: u64 LE }.
+// A ProcessCreated record can be an initial snapshot or an incremental update; both
+// use the same upsert-shaped message without a snapshot marker.
+struct ProcessCreated {
+    uint64_t pid = 0;
+    uint64_t parent_pid = 0;
+};
+
+// ProcessTerminated payload entries are packed as { pid: u64 LE }.
+struct ProcessTerminated {
+    uint64_t pid = 0;
+};
+
 // Callbacks invoked from Run(). All are optional.
 struct Handlers {
     std::function<void(const Connection&)>     on_connection;
     std::function<void(const ConnectionEnd&)>  on_connection_end;
     std::function<void(const LogLine&)>        on_log;
     std::function<void(const BandwidthStats&)> on_bandwidth;
+    // Process records are delivered in the batches carried by one wire frame.
+    // Empty batches are valid and are delivered as empty vectors.
+    std::function<void(const std::vector<ProcessCreated>&)> on_process_created;
+    std::function<void(const std::vector<ProcessTerminated>&)> on_process_terminated;
     // Reports a protocol desync or an unknown InfoType.
     std::function<void(const std::string&)>    on_warning;
     // Fires every poll_interval_ms from Run()'s own thread, independently of
@@ -215,6 +238,12 @@ public:
     bool GetVersion(uint8_t out[4], std::string& error);
     // IOCTL_SHUTDOWN_REQUEST: asks the driver to release pending packets.
     bool RequestShutdown(std::string& error);
+
+    // Explicitly starts process collection and sends a full inventory, then live
+    // events. Repeating restarts collection from scratch without discarding unread
+    // records. Open() alone never starts it. By default uses IOCTL 0x9c40e00c;
+    // via_write selects the equivalent one-byte WriteFile command (9).
+    bool StartProcessMonitoring(std::string& error, bool via_write = false);
 
     // Commands written to the device (protocol/src/command.rs).
     bool SendVerdict(uint64_t id, Verdict verdict, std::string& error);

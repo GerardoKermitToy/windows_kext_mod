@@ -34,6 +34,7 @@ namespace {
 
 pmkext::Driver* g_driver = nullptr;
 std::atomic<bool> g_shutdown_requested{false};
+std::atomic<bool> g_process_events_only{false};
 
 // Output comes from the reader, polling and delayed-verdict threads, so serialise
 // it to keep multi-line records from interleaving.
@@ -53,6 +54,11 @@ struct Options {
     bool show_ends = true;
     bool show_logs = true;
     bool show_bandwidth = true;
+    // Only this mode explicitly requests process collection. Normal runs do not
+    // register a process callback or request an inventory.
+    bool process_events_only = false;
+    bool process_events_write = false;
+    unsigned process_events_restart_ms = 0; // 0 = one initial request only
     bool timestamps = false;
     bool send_verdicts = true;
     bool show_payload = false;     // --payload: dump packet bytes as hex
@@ -193,6 +199,17 @@ void PrintUsage() {
         "  --out FILE       write records to FILE (flushed per record).\n"
         "  --poll N         request logs and bandwidth every N ms (default 1000).\n"
         "  --timestamps     prefix every record with local HH:MM:SS.mmm.\n"
+        "  --process-events-only\n"
+        "                   request process collection via IOCTL and show only\n"
+        "                   process create/exit events; connection verdicts still run.\n"
+        "                   Without this flag process collection is not started.\n"
+        "  --process-events-write\n"
+        "                   use WriteFile command 9 instead of IOCTL for requests.\n"
+        "                   Requires --process-events-only.\n"
+        "  --process-events-restart-ms N\n"
+        "                   request a fresh process snapshot every N ms (N > 0),\n"
+        "                   checked at --poll cadence; keep unread old records.\n"
+        "                   Requires --process-events-only. Default: no restarts.\n"
         "  --payload        dump each connection's packet bytes as one hex string.\n"
         "  --memory-stats   request driver memory statistics every poll interval.\n"
         "\n"
@@ -203,8 +220,8 @@ void PrintUsage() {
         "  --filter-ip IP[:PORT]\n"
         "                   show only connections, ends and bandwidth entries\n"
         "                   involving this IP. Use [IPv6]:PORT for IPv6.\n"
-        "  --filter-pid PID show only connection and end records for this PID.\n"
-        "                   Bandwidth records carry no PID and are suppressed.\n"
+        "  --filter-pid PID show only connection/end records and process events for\n"
+        "                   this PID. Bandwidth records carry no PID and are suppressed.\n"
         "  --filter-protocol N\n"
         "                   show only connection, end and bandwidth records with\n"
         "                   IP protocol number N (0..255; e.g. 1, 6, 17, 58).\n"
@@ -263,6 +280,7 @@ void PrintUsage() {
         "\n"
         "Examples:\n"
         "  kext_monitor.exe --duration 10 --only-logs\n"
+        "  kext_monitor.exe --duration 10 --process-events-only --filter-pid 1234\n"
         "  kext_monitor.exe --duration 30 --out run.log --timestamps\n"
         "  kext_monitor.exe --duration 30 --filter-pid 1234 --filter-protocol 6\n"
         "  kext_monitor.exe --duration 30 --filter-protocol 58\n"
@@ -302,6 +320,18 @@ bool ParseArgs(int argc, wchar_t** argv, Options& opt) {
             opt.out_path = argv[++i];
         } else if (a == L"--timestamps") {
             opt.timestamps = true;
+        } else if (a == L"--process-events-only") {
+            opt.process_events_only = true;
+        } else if (a == L"--process-events-write") {
+            opt.process_events_write = true;
+        } else if (a == L"--process-events-restart-ms") {
+            uint64_t interval = 0;
+            if (i + 1 >= argc ||
+                !ParseUnsignedDecimal(argv[++i], ~uint32_t{0}, interval) || interval == 0) {
+                std::printf("ERROR: --process-events-restart-ms needs a number from 1 to 4294967295\n");
+                return false;
+            }
+            opt.process_events_restart_ms = static_cast<unsigned>(interval);
         } else if (a == L"--payload") {
             opt.show_payload = true;
         } else if (a == L"--memory-stats") {
@@ -526,6 +556,22 @@ bool ParseArgs(int argc, wchar_t** argv, Options& opt) {
         return false;
     }
 
+    if (!opt.process_events_only &&
+        (opt.process_events_write || opt.process_events_restart_ms != 0)) {
+        std::printf("ERROR: process request options require --process-events-only\n");
+        return false;
+    }
+
+    // This mode is intentionally stronger than --only-logs regardless of the
+    // argument order. The connection callback still performs verdict work before
+    // considering these display settings.
+    if (opt.process_events_only) {
+        opt.show_connections = false;
+        opt.show_ends = false;
+        opt.show_logs = false;
+        opt.show_bandwidth = false;
+    }
+
     return true;
 }
 
@@ -533,7 +579,9 @@ BOOL WINAPI ConsoleHandler(DWORD signal) {
     if (signal == CTRL_C_EVENT || signal == CTRL_BREAK_EVENT ||
         signal == CTRL_CLOSE_EVENT) {
         g_shutdown_requested.store(true);
-        Emit("\nCtrl+C: stopping...\n");
+        if (!g_process_events_only.load()) {
+            Emit("\nCtrl+C: stopping...\n");
+        }
         // Stop() sets the stop flag and issues IOCTL_SHUTDOWN_REQUEST, which is
         // what actually releases the blocked read.
         if (g_driver != nullptr) {
@@ -570,6 +618,7 @@ int wmain(int argc, wchar_t** argv) {
     if (!ParseArgs(argc, argv, opt)) {
         return 2;
     }
+    g_process_events_only.store(opt.process_events_only);
     if (opt.help) {
         PrintUsage();
         return 0;
@@ -580,27 +629,40 @@ int wmain(int argc, wchar_t** argv) {
     SingleInstanceGuard single_instance;
     std::string instance_error;
     if (!single_instance.Acquire(instance_error)) {
-        std::printf("ERROR: %s. No service or device state was changed.\n",
-                    instance_error.c_str());
+        std::fprintf(opt.process_events_only ? stderr : stdout,
+                     "ERROR: %s. No service or device state was changed.\n",
+                     instance_error.c_str());
         return 1;
     }
 
     if (!opt.out_path.empty()) {
         g_out = _wfopen(opt.out_path.c_str(), L"w");
         if (g_out == nullptr) {
-            std::wprintf(L"ERROR: cannot open %s for writing\n", opt.out_path.c_str());
+            if (opt.process_events_only) {
+                std::fwprintf(stderr, L"ERROR: cannot open %s for writing\n", opt.out_path.c_str());
+            } else {
+                std::wprintf(L"ERROR: cannot open %s for writing\n", opt.out_path.c_str());
+            }
             return 1;
         }
         // Progress goes to the console; records go to the file.
-        std::wprintf(L"Writing records to %s\n", opt.out_path.c_str());
+        if (!opt.process_events_only) {
+            std::wprintf(L"Writing records to %s\n", opt.out_path.c_str());
+        }
     }
 
-    std::wprintf(L"Driver file : %s\n", sys_path.c_str());
-    std::printf("Service name: PortmasterKext\n");
+    if (!opt.process_events_only) {
+        std::wprintf(L"Driver file : %s\n", sys_path.c_str());
+        std::printf("Service name: PortmasterKext\n");
+    }
 
     if (GetFileAttributesW(sys_path.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        std::printf("\nERROR: driver file not found.\n");
-        PrintUsage();
+        if (opt.process_events_only) {
+            std::fprintf(stderr, "\nERROR: driver file not found.\n");
+        } else {
+            std::printf("\nERROR: driver file not found.\n");
+            PrintUsage();
+        }
         return 1;
     }
 
@@ -610,75 +672,89 @@ int wmain(int argc, wchar_t** argv) {
 
     std::string error;
     if (!driver.Install(sys_path, error, opt.inbound_udp_pid_fallback)) {
-        std::printf("\nERROR: install failed: %s\n", error.c_str());
+        std::fprintf(opt.process_events_only ? stderr : stdout,
+                     "\nERROR: install failed: %s\n", error.c_str());
         return 1;
     }
-    std::printf("Service is available and running.\n");
+    if (!opt.process_events_only) {
+        std::printf("Service is available and running.\n");
+    }
 
     if (!driver.Open(error)) {
-        std::printf("\nERROR: open device failed: %s\n", error.c_str());
+        std::fprintf(opt.process_events_only ? stderr : stdout,
+                     "\nERROR: open device failed: %s\n", error.c_str());
+        return 1;
+    }
+
+    if (opt.process_events_only &&
+        !driver.StartProcessMonitoring(error, opt.process_events_write)) {
+        std::fprintf(stderr, "ERROR: start process collection failed: %s\n", error.c_str());
         return 1;
     }
 
     uint8_t version[4] = {};
     if (driver.GetVersion(version, error)) {
-        std::printf("Driver version: %u.%u.%u.%u\n",
-                    version[0], version[1], version[2], version[3]);
-    } else {
+        if (!opt.process_events_only) {
+            std::printf("Driver version: %u.%u.%u.%u\n",
+                        version[0], version[1], version[2], version[3]);
+        }
+    } else if (!opt.process_events_only) {
         std::printf("WARN: could not read version: %s\n", error.c_str());
     }
 
-    if (!opt.send_verdicts) {
-        std::printf("NOT answering connections (--no-verdicts): traffic will stall.\n");
-    } else if (opt.has_alt && opt.has_match) {
-        if (opt.has_match_port) {
-            std::printf("Answering %s:%u with %s, everything else with PermanentAccept.\n",
-                        opt.alt_match_ip.c_str(), static_cast<unsigned>(opt.alt_match_port),
+    if (!opt.process_events_only) {
+        if (!opt.send_verdicts) {
+            std::printf("NOT answering connections (--no-verdicts): traffic will stall.\n");
+        } else if (opt.has_alt && opt.has_match) {
+            if (opt.has_match_port) {
+                std::printf("Answering %s:%u with %s, everything else with PermanentAccept.\n",
+                            opt.alt_match_ip.c_str(), static_cast<unsigned>(opt.alt_match_port),
+                            pmkext::ToString(opt.alt_verdict));
+            } else {
+                std::printf("Answering every connection to %s with %s, everything else with PermanentAccept.\n",
+                            opt.alt_match_ip.c_str(), pmkext::ToString(opt.alt_verdict));
+            }
+        } else if (opt.has_alt) {
+            // No --match: this hits everything. Say so plainly, because a block or
+            // drop applied to all traffic can take the machine off the network
+            // before the first record is written.
+            std::printf("Answering EVERY connection with %s (no --match given).\n",
                         pmkext::ToString(opt.alt_verdict));
-        } else {
-            std::printf("Answering every connection to %s with %s, everything else with PermanentAccept.\n",
-                        opt.alt_match_ip.c_str(), pmkext::ToString(opt.alt_verdict));
-        }
-    } else if (opt.has_alt) {
-        // No --match: this hits everything. Say so plainly, because a block or
-        // drop applied to all traffic can take the machine off the network
-        // before the first record is written.
-        std::printf("Answering EVERY connection with %s (no --match given).\n",
-                    pmkext::ToString(opt.alt_verdict));
-        if (opt.alt_verdict != pmkext::Verdict::Accept &&
-            opt.alt_verdict != pmkext::Verdict::PermanentAccept) {
-            std::printf("WARNING: this applies to all traffic on this machine and may\n"
-                        "         cut network access, including remote sessions.\n");
-            if (opt.duration_s == 0) {
-                std::printf("         No --duration given: the run only ends on Ctrl+C,\n"
-                            "         which needs a console that still works.\n");
+            if (opt.alt_verdict != pmkext::Verdict::Accept &&
+                opt.alt_verdict != pmkext::Verdict::PermanentAccept) {
+                std::printf("WARNING: this applies to all traffic on this machine and may\n"
+                            "         cut network access, including remote sessions.\n");
+                if (opt.duration_s == 0) {
+                    std::printf("         No --duration given: the run only ends on Ctrl+C,\n"
+                                "         which needs a console that still works.\n");
+                }
             }
+        } else {
+            std::printf("Answering every connection with PermanentAccept.\n");
         }
-    } else {
-        std::printf("Answering every connection with PermanentAccept.\n");
-    }
-    if (opt.send_verdicts && opt.verdict_delay_ms > 0) {
-        std::printf("Delaying %s by %u ms.\n",
-                    opt.has_match ? "only matching verdicts" : "each automatic verdict",
-                    opt.verdict_delay_ms);
-    }
-    if (opt.suspend_pid_on_verdict_delay) {
         if (opt.send_verdicts && opt.verdict_delay_ms > 0) {
-            std::printf("Suspending CONN PIDs while their delayed verdicts are pending.\n");
-            if (!opt.has_match) {
-                std::printf("WARNING: without --match this can pause unrelated processes.\n");
-            }
-        } else {
-            std::printf("PID suspension inactive: no delayed automatic verdicts.\n");
+            std::printf("Delaying %s by %u ms.\n",
+                        opt.has_match ? "only matching verdicts" : "each automatic verdict",
+                        opt.verdict_delay_ms);
         }
+        if (opt.suspend_pid_on_verdict_delay) {
+            if (opt.send_verdicts && opt.verdict_delay_ms > 0) {
+                std::printf("Suspending CONN PIDs while their delayed verdicts are pending.\n");
+                if (!opt.has_match) {
+                    std::printf("WARNING: without --match this can pause unrelated processes.\n");
+                }
+            } else {
+                std::printf("PID suspension inactive: no delayed automatic verdicts.\n");
+            }
+        }
+        if (opt.duration_s > 0) {
+            std::printf("Running for %u second(s), then stopping.\n", opt.duration_s);
+        } else {
+            std::printf("Press Ctrl+C to stop, remove the service and exit.\n");
+        }
+        std::printf("\n");
+        std::fflush(stdout);
     }
-    if (opt.duration_s > 0) {
-        std::printf("Running for %u second(s), then stopping.\n", opt.duration_s);
-    } else {
-        std::printf("Press Ctrl+C to stop, remove the service and exit.\n");
-    }
-    std::printf("\n");
-    std::fflush(stdout);
 
     unsigned long long connections = 0;
     std::atomic<unsigned long long> verdicts{0};
@@ -705,12 +781,14 @@ int wmain(int argc, wchar_t** argv) {
         } catch (const std::exception& error) {
             g_shutdown_requested.store(true);
             // Report inside the catch while the exception's message is valid.
-            Emit("[WARN] verdict processing failed; stopping: %s\n", error.what());
+            if (!opt.process_events_only) {
+                Emit("[WARN] verdict processing failed; stopping: %s\n", error.what());
+            }
         } catch (...) {
             g_shutdown_requested.store(true);
             failure = "unknown exception";
         }
-        if (failure != nullptr) {
+        if (failure != nullptr && !opt.process_events_only) {
             Emit("[WARN] verdict processing failed; stopping: %s\n", failure);
         }
         g_shutdown_requested.store(true);
@@ -766,12 +844,14 @@ int wmain(int argc, wchar_t** argv) {
                     std::string err;
                     if (suspended_processes->Acquire(c.process_id, suspension, err, observed_at)) {
                         suspended_pid = c.process_id;
-                        Emit("%s[SUSPEND] pid=%llu held for delayed verdict id=%llu generation=%llu\n",
-                             TimePrefix(opt.timestamps).c_str(),
-                             static_cast<unsigned long long>(suspended_pid),
-                             static_cast<unsigned long long>(c.id),
-                             static_cast<unsigned long long>(suspension.generation));
-                    } else {
+                        if (!opt.process_events_only) {
+                            Emit("%s[SUSPEND] pid=%llu held for delayed verdict id=%llu generation=%llu\n",
+                                 TimePrefix(opt.timestamps).c_str(),
+                                 static_cast<unsigned long long>(suspended_pid),
+                                 static_cast<unsigned long long>(c.id),
+                                 static_cast<unsigned long long>(suspension.generation));
+                        }
+                    } else if (!opt.process_events_only) {
                         Emit("%s[WARN] id=%llu pid=%llu not suspended: %s\n",
                              TimePrefix(opt.timestamps).c_str(),
                              static_cast<unsigned long long>(c.id),
@@ -787,14 +867,16 @@ int wmain(int argc, wchar_t** argv) {
                         }
                         std::string err;
                         if (!driver.SendVerdict(id, verdict, err)) {
-                            Emit("%s[WARN] id=%llu verdict %s FAILED: %s\n",
-                                 TimePrefix(opt.timestamps).c_str(),
-                                 static_cast<unsigned long long>(id),
-                                 pmkext::ToString(verdict), err.c_str());
+                            if (!opt.process_events_only) {
+                                Emit("%s[WARN] id=%llu verdict %s FAILED: %s\n",
+                                     TimePrefix(opt.timestamps).c_str(),
+                                     static_cast<unsigned long long>(id),
+                                     pmkext::ToString(verdict), err.c_str());
+                            }
                             return;
                         }
                         ++verdicts;
-                        if (show_connection || suspended_pid != 0) {
+                        if (!opt.process_events_only && (show_connection || suspended_pid != 0)) {
                             Emit("%s[VERDICT] id=%llu -> verdict %s sent%s\n",
                                  TimePrefix(opt.timestamps).c_str(),
                                  static_cast<unsigned long long>(id),
@@ -804,11 +886,13 @@ int wmain(int argc, wchar_t** argv) {
                         if (suspended_pid != 0) {
                             bool resumed = false;
                             if (!suspended_processes->Release(suspension, resumed, err)) {
-                                Emit("%s[WARN] pid=%llu resume after verdict id=%llu FAILED: %s\n",
-                                     TimePrefix(opt.timestamps).c_str(),
-                                     static_cast<unsigned long long>(suspended_pid),
-                                     static_cast<unsigned long long>(id), err.c_str());
-                            } else if (resumed) {
+                                if (!opt.process_events_only) {
+                                    Emit("%s[WARN] pid=%llu resume after verdict id=%llu FAILED: %s\n",
+                                         TimePrefix(opt.timestamps).c_str(),
+                                         static_cast<unsigned long long>(suspended_pid),
+                                         static_cast<unsigned long long>(id), err.c_str());
+                                }
+                            } else if (resumed && !opt.process_events_only) {
                                 Emit("%s[RESUME] pid=%llu after verdict id=%llu generation=%llu\n",
                                      TimePrefix(opt.timestamps).c_str(),
                                      static_cast<unsigned long long>(suspended_pid),
@@ -1006,8 +1090,42 @@ int wmain(int argc, wchar_t** argv) {
         }
     };
 
-    handlers.on_warning = [](const std::string& message) {
-        Emit("[WARN] %s\n", message.c_str());
+    handlers.on_process_created = [&](const std::vector<pmkext::ProcessCreated>& created) {
+        // Created batches represent either the initial snapshot or later upserts;
+        // the wire protocol deliberately has no snapshot marker. Process-only
+        // display filters solely by the event PID, never by network fields.
+        if (!opt.process_events_only) {
+            return;
+        }
+        for (const auto& event : created) {
+            if (opt.has_filter_pid && event.pid != opt.filter_pid) {
+                continue;
+            }
+            Emit("%s[PROCESS_CREATE] pid=%llu parent_pid=%llu\n",
+                 TimePrefix(opt.timestamps).c_str(),
+                 static_cast<unsigned long long>(event.pid),
+                 static_cast<unsigned long long>(event.parent_pid));
+        }
+    };
+
+    handlers.on_process_terminated = [&](const std::vector<pmkext::ProcessTerminated>& terminated) {
+        if (!opt.process_events_only) {
+            return;
+        }
+        for (const auto& event : terminated) {
+            if (opt.has_filter_pid && event.pid != opt.filter_pid) {
+                continue;
+            }
+            Emit("%s[PROCESS_EXIT] pid=%llu\n",
+                 TimePrefix(opt.timestamps).c_str(),
+                 static_cast<unsigned long long>(event.pid));
+        }
+    };
+
+    handlers.on_warning = [&](const std::string& message) {
+        if (!opt.process_events_only) {
+            Emit("[WARN] %s\n", message.c_str());
+        }
     };
 
     // Deadline for --duration, evaluated from the poll callback. Run() has no
@@ -1022,6 +1140,8 @@ int wmain(int argc, wchar_t** argv) {
     // so ConnectionCache entries remain allocated regardless of their age.
     constexpr ULONGLONG kCleanupIntervalMs = 30'000;
     ULONGLONG next_cleanup_at = GetTickCount64() + kCleanupIntervalMs;
+    ULONGLONG next_process_restart_at = GetTickCount64() + opt.process_events_restart_ms;
+    bool process_request_failed = false;
 
     // The driver only emits logs and bandwidth stats when asked. Run() invokes
     // this once per poll interval from its own thread, so no extra thread touches
@@ -1035,8 +1155,22 @@ int wmain(int argc, wchar_t** argv) {
 
         std::string err;
         const ULONGLONG now = GetTickCount64();
+        if (opt.process_events_restart_ms != 0 && now >= next_process_restart_at &&
+            (deadline == 0 || now < deadline)) {
+            if (!driver.StartProcessMonitoring(err, opt.process_events_write)) {
+                std::fprintf(stderr, "ERROR: restart process collection failed: %s\n", err.c_str());
+                process_request_failed = true;
+                g_shutdown_requested.store(true);
+                if (delayed_verdicts) {
+                    delayed_verdicts->Stop();
+                }
+                driver.Stop();
+                return;
+            }
+            next_process_restart_at = GetTickCount64() + opt.process_events_restart_ms;
+        }
         if (now >= next_cleanup_at) {
-            if (!driver.RequestCleanEndedConnections(err)) {
+            if (!driver.RequestCleanEndedConnections(err) && !opt.process_events_only) {
                 Emit("[WARN] CleanEndedConnections failed: %s\n", err.c_str());
             }
             next_cleanup_at = now + kCleanupIntervalMs;
@@ -1044,15 +1178,15 @@ int wmain(int argc, wchar_t** argv) {
 
         // Run cleanup first so memory statistics from the same poll show the
         // post-sweep cache sizes.
-        if (opt.memory_stats && !driver.RequestMemoryStats(err)) {
+        if (opt.memory_stats && !driver.RequestMemoryStats(err) && !opt.process_events_only) {
             Emit("[WARN] PrintMemoryStats failed: %s\n", err.c_str());
         }
         // Request logs after memory statistics so that the records produced by
         // PrintMemoryStats are included in this same poll.
-        if (!driver.RequestLogs(err)) {
+        if (!driver.RequestLogs(err) && !opt.process_events_only) {
             Emit("[WARN] GetLogs failed: %s\n", err.c_str());
         }
-        if (!driver.RequestBandwidthStats(err)) {
+        if (!driver.RequestBandwidthStats(err) && !opt.process_events_only) {
             Emit("[WARN] GetBandwidthStats failed: %s\n", err.c_str());
         }
 
@@ -1064,7 +1198,9 @@ int wmain(int argc, wchar_t** argv) {
             if (delayed_verdicts) {
                 delayed_verdicts->Stop();
             }
-            Emit("\nDuration elapsed, stopping...\n");
+            if (!opt.process_events_only) {
+                Emit("\nDuration elapsed, stopping...\n");
+            }
             driver.Stop();
         }
     };
@@ -1078,6 +1214,9 @@ int wmain(int argc, wchar_t** argv) {
         delayed_verdicts->Stop();
     }
     const auto resume_on_shutdown = [&](uint64_t pid, bool ok, const std::string& error) {
+        if (opt.process_events_only) {
+            return;
+        }
         if (ok) {
             Emit("%s[RESUME] pid=%llu at monitor shutdown (pending verdicts cancelled)\n",
                  TimePrefix(opt.timestamps).c_str(), static_cast<unsigned long long>(pid));
@@ -1091,10 +1230,12 @@ int wmain(int argc, wchar_t** argv) {
         suspended_processes->ResumeAll(resume_on_shutdown);
     }
 
-    std::printf("\nShutting down.\n");
-    std::printf("Connections: %llu (verdicts sent: %llu), ends: %llu, "
-                "log lines: %llu, bandwidth records: %llu\n",
-                connections, verdicts.load(), ends, logs, bandwidth_records);
+    if (!opt.process_events_only) {
+        std::printf("\nShutting down.\n");
+        std::printf("Connections: %llu (verdicts sent: %llu), ends: %llu, "
+                    "log lines: %llu, bandwidth records: %llu\n",
+                    connections, verdicts.load(), ends, logs, bandwidth_records);
+    }
 
     // Stop() already issued IOCTL_SHUTDOWN_REQUEST, which released the reader
     // and resolved pending packets. No second shutdown is needed here.
@@ -1104,7 +1245,9 @@ int wmain(int argc, wchar_t** argv) {
     // before the process exits.
     driver.Cleanup();
     g_driver = nullptr;
-    std::printf("Device closed; owned service state cleaned up.\n");
+    if (!opt.process_events_only) {
+        std::printf("Device closed; owned service state cleaned up.\n");
+    }
     if (suspended_processes) {
         suspended_processes->ResumeAll(resume_on_shutdown);
         suspended_processes.reset();
@@ -1113,5 +1256,5 @@ int wmain(int argc, wchar_t** argv) {
     if (g_out != nullptr && g_out != stdout) {
         std::fclose(g_out);
     }
-    return 0;
+    return process_request_failed ? 1 : 0;
 }

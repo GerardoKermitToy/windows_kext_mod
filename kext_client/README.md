@@ -32,6 +32,122 @@ repository root:
 ctest --test-dir kext_client/build -C Release --output-on-failure
 ```
 
+## Process lifecycle events
+
+Loading the driver or opening its device does **not** start process collection.
+After opening the device, explicitly request it with either:
+
+- `DeviceIoControl(handle, 0x9c40e00c, nullptr, 0, nullptr, 0, ...)`:
+  `StartProcessMonitoring`, `CTL_CODE(40000, 0x803, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)`.
+  There is no input or output payload; completion reports success or failure.
+  The removed GetThreadId IOCTL's `0x802` slot remains unused.
+- `WriteFile(handle, "\x09", 1, ...)`: `CommandType::StartProcessMonitoring = 9`,
+  with no payload. It also works in the existing concatenated-command format.
+
+`pmkext::Driver::StartProcessMonitoring(error, via_write = false)` exposes both
+paths. Every request, including a repeated IOCTL or write command, unregisters and
+drains the previous callback, clears the internal inventory, then starts from a
+fresh full snapshot. **Unread old records stay queued in order**, including any
+partially read frame. No restart marker is added to the wire protocol.
+
+On that explicit request, the driver registers a process callback and enumerates all live
+system processes, including idle/system and protected processes. It keeps only
+`pid -> parent_pid` entries, with no names, paths, or retained process objects.
+Creation/exit notifications racing that initial enumeration are journaled and
+replayed in order after the baseline, before publishing subsequent live events.
+In live mode each callback enqueues its event immediately; there is no batching
+wait, timer, or dependency on the monitor's `--poll` interval.
+
+On disconnect the callback is removed and drained and the inventory is freed;
+the next connection remains idle until its own explicit start request. Exiting a
+parent does not remove or reparent its live children, so a stored parent PID need
+not itself be alive. Process notifications include non-Win32 subsystem processes
+and use the Windows 10 1703+ / Windows 11 notification API.
+
+Once requested, the driver emits process batches on the same direct device stream as
+connection records. `InfoType::ProcessCreated` is `9` and its payload is a packed,
+count-free repetition of:
+
+```text
+pid: u64 little-endian
+parent_pid: u64 little-endian
+```
+
+Its payload size must be a multiple of 16. `InfoType::ProcessTerminated` is `10`
+and its payload is a packed, count-free repetition of:
+
+```text
+pid: u64 little-endian
+```
+
+Its payload size must be a multiple of 8. An empty payload is a valid empty batch
+for either event. There is no count field, process path/name, snapshot marker, or
+event subtype. Created records use the same upsert-shaped entry for the initial
+snapshot and subsequent live creates, so consumers cannot distinguish those sources
+from the wire data alone.
+
+The client invokes the corresponding `Handlers` callback immediately from its reader
+thread once a complete frame has arrived; it does not wait for `on_poll` or collect
+process events across records. By default the console monitor does not request
+process collection. `--process-events-only` explicitly issues the start IOCTL once
+after opening the device and prints process lifecycle records:
+
+```bash
+./kext_client/build/kext_monitor.exe --duration 10 --process-events-only ./windows_kext/portmaster-kext.sys
+```
+
+To use the equivalent `WriteFile` command instead of the IOCTL:
+
+```bash
+./kext_client/build/kext_monitor.exe --duration 10 --process-events-only --process-events-write ./windows_kext/portmaster-kext.sys
+```
+
+To request another fresh snapshot periodically, use `--process-events-restart-ms N`
+(`1..4294967295`). It requires `--process-events-only`, as does
+`--process-events-write`. Restarts use the chosen transport and are checked at the
+`--poll` cadence; live events still arrive immediately, independently of polling.
+By default no periodic restart is requested.
+
+```bash
+./kext_client/build/kext_monitor.exe --duration 10 --poll 100 --process-events-only --process-events-restart-ms 2000 ./windows_kext/portmaster-kext.sys
+```
+
+The record output uses the normal `--timestamps` and `--out` machinery:
+
+```text
+[PROCESS_CREATE] pid=<u64> parent_pid=<u64>
+[PROCESS_EXIT] pid=<u64>
+```
+
+`--process-events-only` opts into process collection, but connection parsing, verdicts,
+delayed verdict scheduling, and optional delayed-verdict PID suspension/resume keep
+running. It takes priority over `--only-logs` regardless of argument order and
+suppresses normal connection, end, bandwidth, log, warning, startup, and final
+statistics output where practical. Fatal startup errors remain visible on stderr.
+
+In this mode `--filter-pid PID` compares only the event's `pid` (never
+`parent_pid`). `--filter-ip`, `--filter-protocol`, and port portions of IP filters
+do not apply to process events.
+
+The bounded Administrator-only feature regression uses fresh output directories:
+
+```bash
+python -I windows_kext/test/process_events.py --output windows_kext/test/_out/process-events-run
+```
+
+It compares the initial inventory against stable `Win32_Process` entries, checks
+parent/child and short-lived lifetimes, verifies event delivery with a 5-second
+poll interval, and tests both display modes and TCP/UDP IPv4/IPv6 verdicts. It also
+checks repeated snapshots via IOCTL and WriteFile. An Administrator-only native
+probe checks that no process records arrive before the first request, pauses the
+reader across two restarts to verify unread snapshots are retained, and verifies
+that both command paths fail after shutdown. This probe is built with the client
+but is not part of the offline CTest suite. Extra
+IPv4/IPv6 UDP controls keep the same sockets exchanging 275-byte payloads across
+monitor exit and driver unload. These are feature checks, not the complete
+standard runtime suite: the legacy `IgnoreSpecialPorts=1` regression condition
+cannot be exercised by the current redirect-free driver, which has no such setting.
+
 ## Inbound UDP PID fallback
 
 By default, the monitor writes `EnableInboundUdpCacheMissPidFallback=1` as a
@@ -179,6 +295,8 @@ processes suspended, because closing a process handle does not resume its thread
 `--filter-protocol` accepts the numeric IP protocol value from 0 through 255
 (for example: ICMP 1, TCP 6, UDP 17, ICMPv6 58). Active filters combine with
 AND and affect output only; connection verdicts are still sent for records that
-are hidden. PID filtering applies to connection and connection-end records.
-Bandwidth records contain no PID and are therefore hidden while `--filter-pid`
-is active. Driver logs and warnings are never suppressed by these filters.
+are hidden. PID filtering applies to connection and connection-end records, and to
+the event PID of process records in `--process-events-only` mode (never its parent
+PID). Bandwidth records contain no PID and are therefore hidden while `--filter-pid`
+is active. Driver logs and warnings are never suppressed by these filters in normal
+output modes.

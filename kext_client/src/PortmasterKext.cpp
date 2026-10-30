@@ -26,6 +26,8 @@ constexpr uint32_t MakeCtlCode(uint32_t function) {
 
 constexpr uint32_t kIoctlVersion = MakeCtlCode(0x800);
 constexpr uint32_t kIoctlShutdown = MakeCtlCode(0x801);
+constexpr uint32_t kIoctlStartProcessMonitoring = MakeCtlCode(0x803);
+static_assert(kIoctlStartProcessMonitoring == 0x9c40e00c);
 
 // Every record is [InfoType: u8, size: u32 LE, payload: size bytes].
 constexpr size_t kRecordHeaderSize = 5;
@@ -95,6 +97,8 @@ const char* ToString(InfoType t) {
         case InfoType::ConnectionEndEventV6: return "ConnectionEndV6";
         case InfoType::BandwidthStatsV4:     return "BandwidthStatsV4";
         case InfoType::BandwidthStatsV6:     return "BandwidthStatsV6";
+        case InfoType::ProcessCreated:       return "ProcessCreated";
+        case InfoType::ProcessTerminated:    return "ProcessTerminated";
     }
     return "Unknown";
 }
@@ -394,6 +398,14 @@ bool Driver::RequestShutdown(std::string& error) {
     return DeviceControl(kIoctlShutdown, nullptr, 0, error);
 }
 
+bool Driver::StartProcessMonitoring(std::string& error, bool via_write) {
+    if (via_write) {
+        const uint8_t buf[] = {static_cast<uint8_t>(CommandType::StartProcessMonitoring)};
+        return SendCommand(buf, sizeof(buf), error);
+    }
+    return DeviceControl(kIoctlStartProcessMonitoring, nullptr, 0, error);
+}
+
 bool Driver::SendCommand(const uint8_t* data, size_t len, std::string& error) {
     if (device_ == nullptr) {
         error = "device not open";
@@ -615,6 +627,51 @@ size_t Driver::Dispatch(const Handlers& handlers) {
                     stats.entries.push_back(e);
                 }
                 if (handlers.on_bandwidth) handlers.on_bandwidth(stats);
+                break;
+            }
+
+            case InfoType::ProcessCreated: {
+                // A process-created frame is a consecutive packed sequence of
+                // { u64 pid, u64 parent_pid }, with no count or snapshot marker.
+                // Reject a malformed whole frame before decoding any entry, then
+                // consume it so a following valid frame remains aligned.
+                constexpr size_t kEntrySize = 16;
+                if (n % kEntrySize != 0) {
+                    if (handlers.on_warning) {
+                        handlers.on_warning("ProcessCreated record size is not a multiple of 16");
+                    }
+                    break;
+                }
+                std::vector<ProcessCreated> created;
+                created.reserve(n / kEntrySize);
+                for (size_t o = 0; o < n; o += kEntrySize) {
+                    ProcessCreated entry;
+                    entry.pid = ReadU64(p + o);
+                    entry.parent_pid = ReadU64(p + o + 8);
+                    created.push_back(entry);
+                }
+                if (handlers.on_process_created) handlers.on_process_created(created);
+                break;
+            }
+
+            case InfoType::ProcessTerminated: {
+                // A process-terminated frame is a consecutive packed sequence
+                // of u64 PIDs, again with no count field.
+                constexpr size_t kEntrySize = 8;
+                if (n % kEntrySize != 0) {
+                    if (handlers.on_warning) {
+                        handlers.on_warning("ProcessTerminated record size is not a multiple of 8");
+                    }
+                    break;
+                }
+                std::vector<ProcessTerminated> terminated;
+                terminated.reserve(n / kEntrySize);
+                for (size_t o = 0; o < n; o += kEntrySize) {
+                    ProcessTerminated entry;
+                    entry.pid = ReadU64(p + o);
+                    terminated.push_back(entry);
+                }
+                if (handlers.on_process_terminated) handlers.on_process_terminated(terminated);
                 break;
             }
 

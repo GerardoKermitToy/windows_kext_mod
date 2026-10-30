@@ -27,6 +27,7 @@ mod cpu_features;
 mod device;
 #[cfg(not(test))]
 mod entry;
+mod event_queue;
 #[cfg(not(test))]
 mod icmp_echo_cache;
 mod id_cache;
@@ -39,6 +40,9 @@ mod packet_metadata;
 #[cfg(not(test))]
 mod packet_util;
 mod port_table;
+#[cfg(not(test))]
+mod process_monitor;
+mod process_snapshot;
 mod registry_settings;
 #[cfg(not(test))]
 mod stream_callouts;

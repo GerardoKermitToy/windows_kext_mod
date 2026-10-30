@@ -40,10 +40,8 @@ pub(crate) type FwpsCalloutNotifyFn = unsafe extern "system" fn(
 pub type FwpsCalloutFlowDeleteNotifyFn =
     unsafe extern "system" fn(layerId: u16, calloutId: u32, flowContext: u64);
 
-pub type WdfIrpPreprocessCallback = unsafe extern "system" fn(
-    wdf_device: HANDLE,
-    irp: *mut IRP,
-) -> NTSTATUS;
+pub type WdfIrpPreprocessCallback =
+    unsafe extern "system" fn(wdf_device: HANDLE, irp: *mut IRP) -> NTSTATUS;
 
 /// The FWPS_ACTION0 structure specifies the run-time action that the filter engine takes if all of the filter's filtering conditions are true.
 #[allow(non_camel_case_types, non_snake_case)]
@@ -346,7 +344,6 @@ const _: () = {
     assert!(offset_of!(NET_BUFFER_LIST_POOL_PARAMETERS, ContextSize) == 6);
     assert!(offset_of!(NET_BUFFER_LIST_POOL_PARAMETERS, PoolTag) == 8);
     assert!(offset_of!(NET_BUFFER_LIST_POOL_PARAMETERS, DataSize) == 12);
-
 };
 
 // #[link(name = "Fwpkclnt", kind = "static")]
@@ -648,6 +645,15 @@ extern "system" {
         FreeMdl: BOOLEAN,
         FreeMdlHandler: *mut c_void,
     );
+
+    /// Kernel import: the pinned windows-sys SystemInformation binding instead
+    /// targets ntdll.dll and must not be used by a driver.
+    pub fn ZwQuerySystemInformation(
+        SystemInformationClass: i32,
+        SystemInformation: *mut c_void,
+        SystemInformationLength: u32,
+        ReturnLength: *mut u32,
+    ) -> NTSTATUS;
 
     /// Returns the process identifier of the current process.
     /// This is safe to call from IRP_MJ_CREATE handlers, which always execute in the context of the initiating user-space process.

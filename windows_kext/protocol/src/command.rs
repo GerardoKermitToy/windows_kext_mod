@@ -17,6 +17,7 @@ pub enum CommandType {
     GetBandwidthStats     = 6,
     PrintMemoryStats      = 7,
     CleanEndedConnections = 8,
+    StartProcessMonitoring = 9,
 }
 
 // These are private wire-layout markers. They must not be exposed as borrowed
@@ -96,7 +97,8 @@ impl CommandType {
             | Self::GetLogs
             | Self::GetBandwidthStats
             | Self::PrintMemoryStats
-            | Self::CleanEndedConnections => 0,
+            | Self::CleanEndedConnections
+            | Self::StartProcessMonitoring => 0,
             Self::Verdict => VERDICT_PAYLOAD_SIZE,
             Self::UpdateV4 => UPDATE_V4_PAYLOAD_SIZE,
             Self::UpdateV6 => UPDATE_V6_PAYLOAD_SIZE,
@@ -261,9 +263,7 @@ fn test_go_command_file() {
                         parse_update_v6(&buf),
                         Some(UpdateV6 {
                             protocol: 1,
-                            local_address: [
-                                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16
-                            ],
+                            local_address: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
                             local_port: 2,
                             remote_address: [
                                 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17
@@ -278,6 +278,7 @@ fn test_go_command_file() {
                 CommandType::GetBandwidthStats => {}
                 CommandType::PrintMemoryStats => {}
                 CommandType::CleanEndedConnections => {}
+                CommandType::StartProcessMonitoring => {}
             }
         } else {
             panic!("Unknown command: {}", command[0]);
@@ -294,6 +295,31 @@ fn rejects_empty_and_wrong_sized_payloads() {
     assert!(parse_update_v6(&[0; UPDATE_V6_PAYLOAD_SIZE - 1]).is_none());
     assert!(!has_valid_payload_length(CommandType::Shutdown, &[0]));
     assert!(has_valid_payload_length(CommandType::Shutdown, &[]));
+}
+
+#[test]
+fn process_monitor_command_is_payload_free_and_repeatable_in_a_write_batch() {
+    assert_eq!(CommandType::StartProcessMonitoring as u8, 9);
+    assert!(has_valid_payload_length(
+        CommandType::StartProcessMonitoring,
+        &[]
+    ));
+    assert!(!has_valid_payload_length(
+        CommandType::StartProcessMonitoring,
+        &[0]
+    ));
+    let mut remaining: &[u8] = &[9, 9, 5];
+    for expected in [
+        CommandType::StartProcessMonitoring,
+        CommandType::StartProcessMonitoring,
+        CommandType::GetLogs,
+    ] {
+        let (command, payload, next) = split_first_command(remaining).unwrap();
+        assert_eq!(command, expected);
+        assert!(payload.is_empty());
+        remaining = next;
+    }
+    assert!(remaining.is_empty());
 }
 
 #[test]
@@ -342,9 +368,7 @@ fn rejects_invalid_command_boundaries() {
 #[test]
 fn decodes_unaligned_little_endian_payload() {
     let mut storage = [0_u8; VERDICT_PAYLOAD_SIZE + 1];
-    storage[1..].copy_from_slice(&[
-        0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x0a,
-    ]);
+    storage[1..].copy_from_slice(&[0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x0a]);
 
     assert_eq!(
         parse_verdict(&storage[1..]),

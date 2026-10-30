@@ -46,6 +46,13 @@ pub enum ControlCode {
         METHOD_BUFFERED,
         FILE_READ_DATA | FILE_WRITE_DATA
     ),
+    // 0x802 belonged to the removed GetThreadId IOCTL; do not reuse it.
+    StartProcessMonitoring = ctl_code!(
+        SIOCTL_TYPE,
+        0x803,
+        METHOD_BUFFERED,
+        FILE_READ_DATA | FILE_WRITE_DATA
+    ),
 }
 
 impl Display for ControlCode {
@@ -53,6 +60,7 @@ impl Display for ControlCode {
         match self {
             ControlCode::Version => _ = write!(f, "Version"),
             ControlCode::ShutdownRequest => _ = write!(f, "Shutdown"),
+            ControlCode::StartProcessMonitoring => _ = write!(f, "StartProcessMonitoring"),
         };
         return Ok(());
     }

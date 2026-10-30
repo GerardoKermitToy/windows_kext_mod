@@ -18,7 +18,7 @@ use wdk::{
         packet::{InjectInfo, InjectionPath, Injector},
         FilterEngine, UnregisterCalloutsResult,
     },
-    ioqueue::{self, IOQueue},
+    ioqueue,
     irp_helpers::{ReadRequest, WriteRequest},
     passive_mutex::PassiveMutex,
     rw_spin_lock::RwSpinLock,
@@ -35,9 +35,11 @@ use crate::{
     connection_cache::ConnectionCache,
     connection_map::Key,
     dbg, err,
+    event_queue::EventQueue,
     icmp_echo_cache::IcmpEchoCache,
     id_cache::{ConnectionMetadata, IdCache, PendingPacket},
     logger,
+    process_monitor::ProcessMonitor,
     tcp_closure_cache::{PendingTcpClosure, TcpClosureCache},
     tcp_endpoint_cache::{TcpEndpointCache, TcpEndpointConnection},
     udp_endpoint_cache::UdpEndpointCache,
@@ -116,7 +118,8 @@ pub struct Device {
     /// fragment, waiting for/dequeuing records, and publishing the next fragment.
     /// A spin lock cannot protect this state because an empty stream may wait.
     read_stream: PassiveMutex<ArrayHolder>,
-    pub(crate) event_queue: IOQueue<Info>, // Queue for events to user-space
+    pub(crate) event_queue: EventQueue, // Queue for events to user-space
+    pub(crate) process_monitor: ProcessMonitor,
     pub(crate) packet_cache: RwSpinLock<IdCache>, // Cache of pending packets waiting for verdict
     pub(crate) connection_cache: ConnectionCache, // Cache of connections and their verdicts
     /// Exact TCP connection generations keyed by WFP transport endpoint handle.
@@ -182,6 +185,7 @@ impl Device {
             NetworkAllocator::new().map_err(|err| format!("network allocator error: {}", err))?;
         let read_stream = PassiveMutex::new(ArrayHolder::default())
             .map_err(|err| format!("read stream lock error: {}", err))?;
+        let process_monitor = ProcessMonitor::new()?;
 
         let filter_engine = FilterEngine::new(driver, 0x7dab1057_8e2b_40c4_9b85_693e381d7896)
             .map_err(|err| alloc::format!("filter engine error: {}", err))?;
@@ -194,7 +198,8 @@ impl Device {
         Ok(Self {
             filter_engine,
             read_stream,
-            event_queue: IOQueue::new(), // Queue for events to user-space
+            event_queue: EventQueue::new(), // Queue for events to user-space
+            process_monitor,
             packet_cache: RwSpinLock::new(IdCache::new()), // Cache of pending packets waiting for verdict
             connection_cache: ConnectionCache::new(),
             tcp_endpoint_cache: RwSpinLock::new(TcpEndpointCache::new()),
@@ -225,6 +230,18 @@ impl Device {
     pub fn is_owner_pid(&self, pid: u32) -> bool {
         let p = self.owner_pid.load(Ordering::Acquire);
         p != 0 && p == pid
+    }
+
+    /// Removal waits for all process callbacks before their Device state can be
+    /// cleared or reclaimed. Never continue teardown with a registered callback.
+    pub(crate) fn stop_process_monitor(&self, shutdown: bool) {
+        while let Err(status) = self.process_monitor.stop(&self.event_queue, shutdown) {
+            err!(
+                "failed to stop process monitor: NTSTATUS({:#010x})",
+                status as u32
+            );
+            wdk::utils::sleep_ms(1);
+        }
     }
 
     /// Marks reads waiting for an event so the owning handle's cleanup can
@@ -419,6 +436,9 @@ impl Device {
             CommandType::Shutdown => {
                 wdk::dbg!("Shutdown command");
                 self.shutdown();
+            }
+            CommandType::StartProcessMonitoring => {
+                crate::entry::restart_process_monitor(self)?;
             }
             CommandType::Verdict => {
                 let Some(verdict) = protocol::command::parse_verdict(payload) else {
@@ -910,6 +930,7 @@ impl Device {
     /// pending user-space decisions. This runs from PASSIVE_LEVEL dispatch or
     /// DriverUnload and is idempotent.
     pub fn shutdown(&self) {
+        crate::entry::stop_process_session_for_shutdown(self);
         // A user-mode shutdown command can arrive before service-driven unload.
         // Close callback admission here as well as in DriverUnload so no classify
         // can enqueue a new packet after the cache and event queue are drained.
@@ -1277,6 +1298,7 @@ impl Device {
 
 impl Drop for Device {
     fn drop(&mut self) {
+        self.stop_process_monitor(true);
         // Normal unload closes this barrier before reaching Drop.  Keep the
         // guard here as a last line of defense for an initialization/error path
         // that destroys Device through a different route.

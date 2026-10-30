@@ -58,6 +58,7 @@ struct DispatchGate {
     reads_closed: AtomicBool,
     reads: core::sync::atomic::AtomicU32,
     session_busy: AtomicBool,
+    session_shutdown: AtomicBool,
 }
 
 // The rundown object is accessed only through the interlocked kernel APIs, and
@@ -83,6 +84,7 @@ impl DispatchGate {
             reads_closed: AtomicBool::new(false),
             reads: core::sync::atomic::AtomicU32::new(0),
             session_busy: AtomicBool::new(false),
+            session_shutdown: AtomicBool::new(false),
         }
     }
 
@@ -124,6 +126,7 @@ impl DispatchGate {
         {
             let _admission_guard = self.acquire_admission();
             self.reads_closed.store(false, Ordering::Release);
+            self.session_shutdown.store(false, Ordering::Release);
             self.unloading.store(false, Ordering::Release);
             // Publish the usable rundown only after all admission flags describe
             // the new instance. enter() observes this flag with Acquire.
@@ -318,14 +321,38 @@ pub(crate) fn close_and_wait_for_reads(device: &device::Device) {
     DISPATCH_GATE.wait_for_reads();
 }
 
+/// Both command transports use the same session gate as CREATE/CLEANUP/shutdown.
+/// No read admission or queue reset is needed: old records remain in wire order.
+pub(crate) fn restart_process_monitor(device: &device::Device) -> Result<(), NTSTATUS> {
+    let _session_guard = DISPATCH_GATE.acquire_session();
+    if DISPATCH_GATE.is_unloading()
+        || DISPATCH_GATE.session_shutdown.load(Ordering::Acquire)
+        || device.owner_file_object.load(Ordering::Acquire).is_null()
+    {
+        return Err(STATUS_DEVICE_NOT_READY);
+    }
+    device.process_monitor.restart(&device.event_queue)
+}
+
+/// Serializes permanent shutdown with CREATE and explicit process requests, so
+/// neither can reopen the process monitor after shutdown stops it.
+pub(crate) fn stop_process_session_for_shutdown(device: &device::Device) {
+    let _session_guard = DISPATCH_GATE.acquire_session();
+    DISPATCH_GATE
+        .session_shutdown
+        .store(true, Ordering::Release);
+    device.stop_process_monitor(true);
+}
+
 /// Loads the published Device pointer.
 ///
 /// This is only a publication/load operation; it does not keep the allocation
 /// alive. WFP classify callers must hold the callback barrier guard acquired by
 /// the common trampoline, and user-mode dispatch callers must hold a
-/// DispatchGate guard, for the entire duration of their Device access. Unload
-/// closes both admission paths and waits for their guards before swapping and
-/// dropping the pointer.
+/// DispatchGate guard, for the entire duration of their Device access. Process
+/// callbacks are protected separately: their registration is removed and drained
+/// by ProcessMonitor before shutdown/drop can reclaim this allocation. Unload
+/// closes all admission paths and waits before swapping and dropping the pointer.
 pub fn get_device() -> Option<&'static device::Device> {
     // Acquire pairs with the Release store in driver_entry and the AcqRel swap in driver_unload.
     unsafe { DEVICE.load(Ordering::Acquire).as_ref() }
@@ -572,7 +599,7 @@ unsafe extern "system" fn driver_create(
     };
     let _session_guard = DISPATCH_GATE.acquire_session();
 
-    if DISPATCH_GATE.is_unloading() {
+    if DISPATCH_GATE.is_unloading() || DISPATCH_GATE.session_shutdown.load(Ordering::Acquire) {
         return create_request.fail(STATUS_DEVICE_NOT_READY);
     }
 
@@ -594,8 +621,10 @@ unsafe extern "system" fn driver_create(
     }
 
     device.owner_pid.store(pid, Ordering::Release);
+    DISPATCH_GATE.close_reads();
     // A previous owner may have canceled the shared read wait. Reset it only
-    // after the new file object owns the session, then reopen read admission.
+    // after the new file object owns the session. Opening the device does not
+    // register process callbacks or collect/send a process inventory.
     device.reset_read_cancellation();
     DISPATCH_GATE.open_reads();
     info!("Device opened by PID {}", pid);
@@ -631,6 +660,7 @@ unsafe extern "system" fn driver_cleanup(
         let file_object = cleanup_request.get_file_object();
         if !file_object.is_null() && device.owner_file_object.load(Ordering::Acquire) == file_object
         {
+            device.stop_process_monitor(false);
             // Stop new reads before signaling the wait. Reads that passed the
             // admission check are counted by DispatchGate and are drained below.
             close_and_wait_for_reads(device);
@@ -792,6 +822,12 @@ unsafe extern "system" fn device_control(
         ControlCode::ShutdownRequest => {
             wdk::info!("IOCTL: {}", control_code);
             device.shutdown();
+        }
+        ControlCode::StartProcessMonitoring => {
+            wdk::info!("IOCTL: {}", control_code);
+            if let Err(status) = restart_process_monitor(device) {
+                return control_request.fail(status);
+            }
         }
     };
 

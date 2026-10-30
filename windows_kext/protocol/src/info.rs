@@ -11,6 +11,8 @@ enum InfoType {
     ConnectionEndEventV6 = 4,
     BandwidthStatsV4 = 5,
     BandwidthStatsV6 = 6,
+    ProcessCreated = 9,
+    ProcessTerminated = 10,
 }
 
 // Fallow this pattern when adding new packets: [InfoType: u8, data_size_in_bytes: u32, data: ...]
@@ -305,6 +307,36 @@ pub fn connection_end_event_v6_info(
     push_bytes!(vec, remote_ip);
     push_bytes!(vec, local_port);
     push_bytes!(vec, remote_port);
+    info
+}
+
+/// Initial snapshot entries and subsequent process creations share this format.
+/// The payload size determines the number of (PID, parent PID) pairs.
+pub fn process_created_info<I>(processes: I) -> Info
+where
+    I: IntoIterator<Item = (u64, u64)>,
+    I::IntoIter: ExactSizeIterator,
+{
+    let processes = processes.into_iter();
+    let mut info = Info::new(InfoType::ProcessCreated, processes.len() * 16);
+    for (pid, parent_pid) in processes {
+        push_bytes!(&mut info.0, pid);
+        push_bytes!(&mut info.0, parent_pid);
+    }
+    info
+}
+
+/// The payload is a packed array of terminated PIDs, without a count field.
+pub fn process_terminated_info<I>(processes: I) -> Info
+where
+    I: IntoIterator<Item = u64>,
+    I::IntoIter: ExactSizeIterator,
+{
+    let processes = processes.into_iter();
+    let mut info = Info::new(InfoType::ProcessTerminated, processes.len() * 8);
+    for pid in processes {
+        push_bytes!(&mut info.0, pid);
+    }
     info
 }
 
@@ -604,6 +636,38 @@ mod tests {
     }
 
     #[test]
+    fn process_batches_have_no_count_and_preserve_full_width_pids() {
+        let created =
+            super::process_created_info([(0, 0), (0x0102_0304_0506_0708, 0x1112_1314_1516_1718)]);
+        let mut expected = vec![9, 32, 0, 0, 0];
+        expected.extend_from_slice(&[0; 16]);
+        expected.extend_from_slice(&[8, 7, 6, 5, 4, 3, 2, 1]);
+        expected.extend_from_slice(&[0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11]);
+        assert_eq!(created.as_bytes(), expected);
+        created.assert_size();
+
+        let terminated = super::process_terminated_info([0, 0x0102_0304_0506_0708]);
+        assert_eq!(
+            terminated.as_bytes(),
+            &[10, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 7, 6, 5, 4, 3, 2, 1]
+        );
+        terminated.assert_size();
+    }
+
+    #[test]
+    fn empty_process_batches_and_large_payload_headers_are_exact() {
+        assert_eq!(super::process_created_info([]).as_bytes(), &[9, 0, 0, 0, 0]);
+        assert_eq!(
+            super::process_terminated_info([]).as_bytes(),
+            &[10, 0, 0, 0, 0]
+        );
+        let created = super::process_created_info((0..300usize).map(|pid| (pid as u64, 4)));
+        assert_eq!(&created.as_bytes()[..5], &[9, 0xc0, 0x12, 0, 0]);
+        assert_eq!(created.as_bytes().len(), 5 + 300 * 16);
+        created.assert_size();
+    }
+
+    #[test]
     fn bandwidth_v6_iterator_serializes_full_u32_count() {
         let count = 300;
         let values = (0..count).map(|_| BandwidthValueV6 {
@@ -641,6 +705,8 @@ fn generate_test_info_file() -> Result<(), std::io::Error> {
         InfoType::ConnectionEndEventV6,
         InfoType::BandwidthStatsV4,
         InfoType::BandwidthStatsV6,
+        InfoType::ProcessCreated,
+        InfoType::ProcessTerminated,
     ];
 
     let mut selected: Vec<InfoType> = Vec::with_capacity(1000);
@@ -778,6 +844,16 @@ fn generate_test_info_file() -> Result<(), std::io::Error> {
                     received_bytes: 8,
                 });
                 let info = bandiwth_stats_array_v6(1, vec);
+                info.assert_size();
+                info.0
+            }
+            InfoType::ProcessCreated => {
+                let info = process_created_info([(1, 0), (2, 1)]);
+                info.assert_size();
+                info.0
+            }
+            InfoType::ProcessTerminated => {
+                let info = process_terminated_info([1, 2]);
                 info.assert_size();
                 info.0
             }

@@ -78,6 +78,21 @@ if(BUILD_TESTING)
     add_test(NAME connection_record_tests COMMAND connection_record_tests)
     set_tests_properties(connection_record_tests PROPERTIES TIMEOUT 10)
 
+    add_executable(process_event_tests tests/process_event_tests.cpp)
+    target_link_libraries(process_event_tests PRIVATE pmkext)
+    add_test(NAME process_event_tests COMMAND process_event_tests)
+    set_tests_properties(process_event_tests PROPERTIES TIMEOUT 10)
+
+    # Explicit Administrator-only runtime probe, launched by process_events.py.
+    # Keep service installation and driver loading out of the offline CTest suite.
+    add_executable(process_control_runtime tests/process_control_runtime.cpp)
+    target_link_libraries(process_control_runtime PRIVATE pmkext)
+    if(MSVC)
+        target_link_options(process_control_runtime PRIVATE /ENTRY:wmainCRTStartup)
+    else()
+        target_link_options(process_control_runtime PRIVATE -municode)
+    endif()
+
     add_executable(bandwidth_record_tests tests/bandwidth_record_tests.cpp)
     target_link_libraries(bandwidth_record_tests PRIVATE pmkext)
     add_test(NAME bandwidth_record_tests COMMAND bandwidth_record_tests)
@@ -106,4 +121,9 @@ if(BUILD_TESTING)
         COMMAND "${CMAKE_COMMAND}" "-DMONITOR=$<TARGET_FILE:kext_monitor>"
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/verdict_delay_cli_tests.cmake")
     set_tests_properties(verdict_delay_cli_tests PROPERTIES TIMEOUT 30)
+
+    add_test(NAME process_events_cli_tests
+        COMMAND "${CMAKE_COMMAND}" "-DMONITOR=$<TARGET_FILE:kext_monitor>"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/process_events_cli_tests.cmake")
+    set_tests_properties(process_events_cli_tests PROPERTIES TIMEOUT 30)
 endif()
