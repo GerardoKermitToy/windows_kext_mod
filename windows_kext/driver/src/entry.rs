@@ -310,7 +310,7 @@ impl Drop for SessionGuard<'_> {
 static DISPATCH_GATE: DispatchGate = DispatchGate::new();
 
 /// Closes read admission, wakes blocked readers, and waits until every admitted
-/// read has returned. Queue rundown must not race an active `KeRemoveQueue`.
+/// read has returned. Queue storage must outlive every blocked event wait.
 ///
 /// This is also used by the user-issued shutdown command, which can run while a
 /// separate ReadFile is blocked; DriverUnload performs the same steps before it

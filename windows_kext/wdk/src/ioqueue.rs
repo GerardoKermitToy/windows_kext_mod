@@ -1,35 +1,15 @@
-use core::{
-    cell::UnsafeCell,
-    ffi::c_void,
-    fmt::Display,
-    marker::PhantomData,
-    mem::MaybeUninit,
-    pin::Pin,
-    sync::atomic::{AtomicBool, Ordering},
-};
+use core::{fmt::Display, ptr};
 
-use crate::{dbg, rw_spin_lock::RwSpinLock};
 use alloc::boxed::Box;
-use likely_stable::likely;
-use windows_sys::{
-    Wdk::Foundation::KQUEUE,
-    Win32::{
-        Foundation::{STATUS_ABANDONED, STATUS_TIMEOUT, STATUS_USER_APC},
-        System::Kernel::LIST_ENTRY,
-    },
-};
 
-// IOQueue owns the resident KQUEUE storage that KeInitializeQueue writes.
-#[cfg(target_pointer_width = "64")]
-const _: () = {
-    assert!(core::mem::size_of::<LIST_ENTRY>() == 16);
-    assert!(core::mem::align_of::<LIST_ENTRY>() == 8);
-    assert!(core::mem::size_of::<KQUEUE>() == 64);
-    assert!(core::mem::align_of::<KQUEUE>() == 8);
-    assert!(core::mem::offset_of!(Entry<()>, list) == 0);
-};
+#[cfg(not(test))]
+use crate::rw_spin_lock::RwSpinLock;
+#[cfg(not(test))]
+use kernel::WaitEvents;
+#[cfg(test)]
+use tests::{RwSpinLock, WaitEvents};
 
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 pub enum Status {
     Uninitialized,
     Timeout,
@@ -52,287 +32,320 @@ impl Display for Status {
     }
 }
 
-// KPROCESSOR_MODE is a CCHAR typedef in the WDK, not a native C enum.
-#[repr(i8)]
-pub enum KprocessorMode {
-    KernelMode = 0,
-    UserMode = 1,
-}
-
-// #[link(name = "NtosKrnl", kind = "static")]
-extern "system" {
-    /*
-    KeInitializeQueue
-        [out] Queue
-        Pointer to a KQUEUE structure for which the caller must provide resident storage in nonpaged pool. This structure is defined as follows:
-
-        [in] Count
-        The maximum number of threads for which the waits on the queue object can be satisfied concurrently. If this parameter is not supplied, the number of processors in the machine is used.
-    */
-    fn KeInitializeQueue(queue: *mut KQUEUE, count: u32);
-    /*
-    KeInsertQueue returns the previous signal state of the given Queue. If it was set to zero (that is, not signaled) before KeInsertQueue was called, KeInsertQueue returns zero, meaning that no entries were queued. If it was nonzero (signaled), KeInsertQueue returns the number of entries that were queued before KeInsertQueue was called.
-    */
-    fn KeInsertQueue(queue: *mut KQUEUE, list_entry: *mut c_void) -> i32;
-    /*
-    KeRemoveQueue returns one of the following:
-        A pointer to a dequeued entry from the given queue object, if one is available
-        STATUS_TIMEOUT, if the given Timeout interval expired before an entry became available
-        STATUS_USER_APC, if a user-mode APC was delivered in the context of the calling thread
-        STATUS_ABANDONED, if the queue has been run down
-    */
-    fn KeRemoveQueue(
-        queue: *mut KQUEUE,
-        waitmode: KprocessorMode,
-        timeout: *const i64,
-    ) -> *mut LIST_ENTRY;
-
-    // If the queue is empty, KeRundownQueue returns NULL; otherwise, it returns the address of the first entry in the queue.
-    fn KeRundownQueue(queue: *mut KQUEUE) -> *mut LIST_ENTRY;
-}
-
-#[repr(C)]
 struct Entry<T> {
-    list: LIST_ENTRY, // Internal use
-    entry: T,
+    next: *mut Entry<T>,
+    value: T,
 }
+
+struct State<T> {
+    head: *mut Entry<T>,
+    tail: *mut Entry<T>,
+    initialized: bool,
+    cancelled: bool,
+}
+
+// The pointers own Box allocations and are accessed only under the queue lock.
+unsafe impl<T: Send> Send for State<T> {}
 
 pub struct IOQueue<T> {
-    // The address of the value should not change.
-    kernel_queue: Pin<Box<UnsafeCell<KQUEUE>>>,
-    // Set while a handle cleanup or driver unload is releasing blocked reads.
-    // Reads poll the KQUEUE with a short timeout and observe this flag.
-    cancelled: AtomicBool,
-    // Serializes insert and rundown. `initialized` alone cannot prevent an
-    // insertion that passed its load from racing KeRundownQueue.
-    lifecycle_lock: RwSpinLock<()>,
-    initialized: AtomicBool,
-    _type: PhantomData<T>, // 0 size variable. Required for the generic to work properly. Compiler limitation.
+    state: RwSpinLock<State<T>>,
+    events: WaitEvents,
 }
-
-unsafe impl<T: Send> Sync for IOQueue<T> {}
-unsafe impl<T: Send> Send for IOQueue<T> {}
 
 impl<T> IOQueue<T> {
     /// Make sure `rundown` is called on exit, if `drop()` is not called for queue.
     pub fn new() -> Self {
-        unsafe {
-            let kernel_queue = Box::pin(UnsafeCell::new(MaybeUninit::zeroed().assume_init()));
-            KeInitializeQueue(kernel_queue.get(), 1);
-
-            Self {
-                kernel_queue,
-                cancelled: AtomicBool::new(false),
-                lifecycle_lock: RwSpinLock::new(()),
-                initialized: AtomicBool::new(true),
-                _type: PhantomData,
-            }
+        Self {
+            state: RwSpinLock::new(State {
+                head: ptr::null_mut(),
+                tail: ptr::null_mut(),
+                initialized: true,
+                cancelled: false,
+            }),
+            events: WaitEvents::new(),
         }
     }
 
     /// Pushes new entry of any type.
-    pub fn push(&self, entry: T) -> Result<(), Status> {
-        let kqueue = self.kernel_queue.get();
-        // Allocate entry.
-        let list_entry = Box::new(Entry {
-            list: LIST_ENTRY {
-                Flink: core::ptr::null_mut(),
-                Blink: core::ptr::null_mut(),
-            },
-            entry,
+    pub fn push(&self, value: T) -> Result<(), Status> {
+        // Allocate before taking the spin lock; reclaim rejected values outside it.
+        let entry = Box::new(Entry {
+            next: ptr::null_mut(),
+            value,
         });
-        let raw_ptr = Box::into_raw(list_entry);
-
-        // Serialize this initialized check with rundown. Without the lock, a
-        // producer can observe true, lose the CPU while KeRundownQueue drains,
-        // then insert into a queue that will never be consumed or freed.
-        let result = {
-            let _lifecycle_guard = self.lifecycle_lock.write_lock();
-            if likely(self.initialized.load(Ordering::Acquire)) {
-                unsafe { KeInsertQueue(kqueue, raw_ptr as *mut c_void) }
-            } else {
-                -1
-            }
-        };
-        // A push after rundown takes the synthetic negative-result path above;
-        // KeInsertQueue itself returns the queue's previous signal state.
-        if result >= 0 {
-            return Ok(());
+        let mut state = self.state.write_lock();
+        if !state.initialized {
+            drop(state);
+            return Err(Status::Uninitialized);
         }
 
-        // Reclaim outside the spin lock so an arbitrary T destructor never runs
-        // at the lock-raised DISPATCH_LEVEL.
-        _ = unsafe { Box::from_raw(raw_ptr) };
-        return Err(Status::Uninitialized);
+        let entry = Box::into_raw(entry);
+        if state.head.is_null() {
+            state.head = entry;
+            state.tail = entry;
+            // Signal only on the empty -> nonempty transition. Consumers reset
+            // the notification under this same lock, so no wakeup can be lost.
+            self.events.set_ready();
+        } else {
+            // SAFETY: The nonempty FIFO owns tail and the lock excludes consumers.
+            unsafe { (*state.tail).next = entry };
+            state.tail = entry;
+        }
+        Ok(())
     }
 
-    /// Marks current and future `wait_and_pop_cancellable` calls as canceled.
-    /// Other pop methods do not observe this flag. It remains set until a new
-    /// owner calls `reset_cancellation`.
+    /// Cancels current/future cancellable waits and wakes blocked readers immediately.
+    /// Other pop methods ignore cancellation. Queued records remain available to
+    /// the next owner after `reset_cancellation`.
     pub fn cancel_waiters(&self) {
-        self.cancelled.store(true, Ordering::Release);
-    }
-
-    /// Clears the cancellation state for a new owner session.
-    ///
-    /// The caller must first close read admission and wait until all readers
-    /// have returned. This method must run at PASSIVE_LEVEL.
-    pub fn reset_cancellation(&self) {
-        self.cancelled.store(false, Ordering::Release);
-    }
-
-    /// Returns an Element or a status.
-    fn pop_internal(&self, timeout: Option<&i64>) -> Result<T, Status> {
-        unsafe {
-            let kqueue = self.kernel_queue.get();
-            let timeout = timeout.map_or(core::ptr::null(), core::ptr::from_ref);
-            // Check if initialized.
-            if likely(self.initialized.load(Ordering::Acquire)) {
-                // Pop and check the return value.
-                let list_entry =
-                    KeRemoveQueue(kqueue, KprocessorMode::KernelMode, timeout) as *mut Entry<T>;
-                let result = list_entry as usize;
-                match result {
-                    status
-                        if status == STATUS_TIMEOUT as u32 as usize
-                            || status == STATUS_TIMEOUT as isize as usize =>
-                    {
-                        return Err(Status::Timeout)
-                    }
-                    status
-                        if status == STATUS_USER_APC as u32 as usize
-                            || status == STATUS_USER_APC as isize as usize =>
-                    {
-                        return Err(Status::UserAPC)
-                    }
-                    status
-                        if status == STATUS_ABANDONED as u32 as usize
-                            || status == STATUS_ABANDONED as isize as usize =>
-                    {
-                        return Err(Status::Abandoned)
-                    }
-                    0 => return Err(Status::InvalidResult),
-                    // A status cast to a pointer can be either zero-extended or
-                    // sign-extended by the native implementation; the guards above
-                    // accept both complete representations. Reject every remaining
-                    // low value without truncating a valid x64 kernel address to its
-                    // low 32 bits.
-                    status if status <= u32::MAX as usize => {
-                        return Err(Status::InvalidResult)
-                    }
-                    _ => {
-                        let list_entry = Box::from_raw(list_entry);
-                        return Ok(list_entry.entry);
-                    }
-                }
-            }
+        let mut state = self.state.write_lock();
+        if !state.cancelled {
+            state.cancelled = true;
+            self.events.set_cancelled();
         }
-
-        Err(Status::Uninitialized)
     }
 
-    /// Returns element or a status. Waits until element is pushed or the queue is interrupted.
-    pub fn wait_and_pop(&self) -> Result<T, Status> {
-        // No timeout.
-        self.pop_internal(None)
+    /// Clears cancellation after the caller has closed read admission and drained
+    /// every previous reader. This method must run at PASSIVE_LEVEL.
+    pub fn reset_cancellation(&self) {
+        let mut state = self.state.write_lock();
+        state.cancelled = false;
+        self.events.clear_cancelled();
     }
 
-    /// Waits for an entry while remaining responsive to the owning handle's
-    /// cleanup. `KeRemoveQueue` has no cancellation object, so use a bounded
-    /// relative wait and check the cancellation flag between waits. This queue
-    /// remains synchronous; handle cleanup, rather than `CancelIoEx`, owns the
-    /// cancellation transition.
-    pub fn wait_and_pop_cancellable(&self) -> Result<T, Status> {
-        // Ten milliseconds bounds the time spent in the dispatch routine after
-        // IRP_MJ_CLEANUP signals cancellation without creating a permanent
-        // polling event or a cancel-routine race for this active IRP.
-        const WAIT_SLICE_MS: i64 = 10;
+    fn pop_internal(&self, timeout_ms: Option<i64>, cancellable: bool) -> Result<T, Status> {
+        // Only explicitly timed callers read the clock. Idle stream reads pass
+        // None and wait indefinitely, without periodic timer wakeups.
+        let deadline = timeout_ms
+            .filter(|timeout| *timeout > 0)
+            .map(|timeout| timestamp_ms().saturating_add(timeout as u64));
 
         loop {
-            if self.cancelled.load(Ordering::Acquire) {
-                return Err(Status::Cancelled);
-            }
-            if !self.initialized.load(Ordering::Acquire) {
-                return Err(Status::Uninitialized);
+            let entry = {
+                let mut state = self.state.write_lock();
+                if cancellable && state.cancelled {
+                    return Err(Status::Cancelled);
+                }
+                if !state.initialized {
+                    return Err(Status::Uninitialized);
+                }
+
+                let entry = state.head;
+                if !entry.is_null() {
+                    // SAFETY: The lock exclusively owns this linked-list head.
+                    state.head = unsafe { (*entry).next };
+                    if state.head.is_null() {
+                        state.tail = ptr::null_mut();
+                        self.events.clear_ready();
+                    }
+                }
+                entry
+            };
+            if !entry.is_null() {
+                // SAFETY: Unlinking transfers the Box to this consumer. Free it
+                // only after the spin lock has restored the caller's IRQL.
+                return Ok(unsafe { Box::from_raw(entry) }.value);
             }
 
-            match self.pop_timeout(WAIT_SLICE_MS) {
-                Ok(entry) => {
-                    // Cleanup may race the dequeue. Do not deliver an entry to
-                    // a handle after its cancellation has been observed.
-                    if self.cancelled.load(Ordering::Acquire) {
-                        return Err(Status::Cancelled);
+            let remaining = match timeout_ms {
+                Some(timeout) if timeout <= 0 => return Err(Status::Timeout),
+                Some(_) => {
+                    let remaining = deadline.unwrap().saturating_sub(timestamp_ms());
+                    if remaining == 0 {
+                        return Err(Status::Timeout);
                     }
-                    return Ok(entry);
+                    Some(remaining)
                 }
-                Err(Status::Timeout) => continue,
-                Err(status) => return Err(status),
-            }
+                None => None,
+            };
+            // No spin lock is held across this wait. Notification events retain
+            // a signal delivered between the empty check and the kernel wait.
+            self.events.wait(cancellable, remaining)?;
         }
     }
 
-    /// Returns element or a status. Does not wait.
+    /// Waits until an entry is pushed or the queue is run down.
+    pub fn wait_and_pop(&self) -> Result<T, Status> {
+        self.pop_internal(None, false)
+    }
+
+    /// Waits indefinitely for data or cancellation of the owning handle. Cleanup,
+    /// rather than `CancelIoEx`, owns the cancellation transition for this
+    /// synchronous queue. There is no timeout or periodic cancellation polling.
+    pub fn wait_and_pop_cancellable(&self) -> Result<T, Status> {
+        self.pop_internal(None, true)
+    }
+
+    /// Returns an element immediately, or Timeout if the queue is empty.
     pub fn pop(&self) -> Result<T, Status> {
-        let timeout: i64 = 0;
-        self.pop_internal(Some(&timeout))
+        self.pop_internal(Some(0), false)
     }
 
-    /// Returns element or a status. Waits the specified timeout.
+    /// Waits up to the specified number of milliseconds for an entry.
     pub fn pop_timeout(&self, timeout: i64) -> Result<T, Status> {
-        let timeout_ptr = timeout.saturating_mul(-10_000);
-        self.pop_internal(Some(&timeout_ptr))
+        self.pop_internal(Some(timeout), false)
     }
 
-    /// Drains and frees queued entries and permanently shuts down the queue.
-    /// The KQUEUE backing allocation remains owned by this object until Drop.
+    /// Permanently shuts down the queue and frees detached records outside the
+    /// spin lock. Callers must drain all readers before dropping the queue itself.
     pub fn rundown(&self) {
-        self.cancel_waiters();
-        unsafe {
-            let kqueue = self.kernel_queue.get();
-            if kqueue.is_null() {
-                return;
-            }
-
-            // Exclude insertions from the initialized transition through the
-            // native list detach. Producers that arrive later observe false and
-            // reclaim their own allocation instead of touching the dead queue.
-            let list_entries = {
-                let _lifecycle_guard = self.lifecycle_lock.write_lock();
-                if self.initialized.swap(false, Ordering::AcqRel) {
-                    KeRundownQueue(kqueue)
-                } else {
-                    core::ptr::null_mut()
-                }
-            };
-
-            // KeRundownQueue returns a detached circular list. Destructors are
-            // arbitrary T code, so traverse and free it only after restoring the
-            // caller's original IRQL on release of lifecycle_lock.
-            if !list_entries.is_null() {
-                let mut entry = list_entries;
-                loop {
-                    let next = (*entry).Flink;
-                    dbg!("discarding entry");
-                    let _ = Box::from_raw(entry as *mut Entry<T>);
-                    if core::ptr::eq(next, list_entries) {
-                        break;
-                    }
-                    entry = next;
-                }
-            }
+        let mut entry = {
+            let mut state = self.state.write_lock();
+            state.initialized = false;
+            state.cancelled = true;
+            let head = state.head;
+            state.head = ptr::null_mut();
+            state.tail = ptr::null_mut();
+            // Wake both kinds of waiter, even when the FIFO was already empty.
+            self.events.set_cancelled();
+            self.events.set_ready();
+            head
+        };
+        while !entry.is_null() {
+            // SAFETY: Detachment transfers this entire list to rundown. No
+            // producer can append after initialized was cleared under the lock.
+            let owned = unsafe { Box::from_raw(entry) };
+            entry = owned.next;
+            drop(owned);
         }
     }
 }
 
 impl<T> Drop for IOQueue<T> {
     fn drop(&mut self) {
-        // Drain queued entries before clearing the KQUEUE storage.
         self.rundown();
-        unsafe {
-            let ptr = self.kernel_queue.get();
-            if !ptr.is_null() {
-                *ptr = MaybeUninit::zeroed().assume_init();
+    }
+}
+
+#[cfg(not(test))]
+fn timestamp_ms() -> u64 {
+    crate::utils::get_monotonic_timestamp_ms()
+}
+
+#[cfg(test)]
+fn timestamp_ms() -> u64 {
+    tests::timestamp_ms()
+}
+
+#[cfg(not(test))]
+mod kernel {
+    use super::Status;
+    use alloc::boxed::Box;
+    use core::{cell::UnsafeCell, mem::MaybeUninit, ptr};
+    use windows_sys::{
+        Wdk::{
+            Foundation::KEVENT,
+            System::SystemServices::{
+                Executive, KeClearEvent, KeInitializeEvent, KeSetEvent, KeWaitForMultipleObjects,
+                KeWaitForSingleObject,
+            },
+        },
+        Win32::{
+            Foundation::{STATUS_ABANDONED, STATUS_SUCCESS, STATUS_TIMEOUT, STATUS_USER_APC},
+            System::Kernel::{NotificationEvent, WaitAny},
+        },
+    };
+
+    #[cfg(target_pointer_width = "64")]
+    const _: () = {
+        assert!(core::mem::size_of::<KEVENT>() == 24);
+        assert!(core::mem::align_of::<KEVENT>() == 8);
+    };
+
+    pub(super) struct WaitEvents {
+        // The global kernel allocator provides resident nonpaged storage. Box
+        // keeps both dispatcher objects at stable addresses for their lifetimes.
+        events: Box<UnsafeCell<[KEVENT; 2]>>,
+    }
+
+    // Only the interlocked kernel event APIs access the resident objects.
+    unsafe impl Send for WaitEvents {}
+    unsafe impl Sync for WaitEvents {}
+
+    impl WaitEvents {
+        pub(super) fn new() -> Self {
+            // SAFETY: KEVENT backing bytes are initialized by KeInitializeEvent
+            // at their final addresses before any signal or wait can access them.
+            let events = Box::new(UnsafeCell::new(unsafe {
+                MaybeUninit::<[KEVENT; 2]>::zeroed().assume_init()
+            }));
+            unsafe {
+                KeInitializeEvent(events.get().cast::<KEVENT>(), NotificationEvent, 0);
+                KeInitializeEvent(events.get().cast::<KEVENT>().add(1), NotificationEvent, 0);
+            }
+            Self { events }
+        }
+
+        fn ready(&self) -> *mut KEVENT {
+            self.events.get().cast::<KEVENT>()
+        }
+
+        fn cancelled(&self) -> *mut KEVENT {
+            // SAFETY: The resident allocation contains exactly two KEVENTs.
+            unsafe { self.ready().add(1) }
+        }
+
+        pub(super) fn set_ready(&self) {
+            // Wait=FALSE is required while the queue's spin lock is held.
+            unsafe { KeSetEvent(self.ready(), 0, 0) };
+        }
+
+        pub(super) fn clear_ready(&self) {
+            unsafe { KeClearEvent(self.ready()) };
+        }
+
+        pub(super) fn set_cancelled(&self) {
+            unsafe { KeSetEvent(self.cancelled(), 0, 0) };
+        }
+
+        pub(super) fn clear_cancelled(&self) {
+            unsafe { KeClearEvent(self.cancelled()) };
+        }
+
+        pub(super) fn wait(
+            &self,
+            cancellable: bool,
+            timeout_ms: Option<u64>,
+        ) -> Result<(), Status> {
+            let timeout =
+                timeout_ms.map(|ms| (ms.min(i64::MAX as u64) as i64).saturating_mul(-10_000));
+            let timeout = timeout.as_ref().map_or(ptr::null(), ptr::from_ref);
+            // SAFETY: Both objects remain resident through the wait. There are
+            // only two objects (<= THREAD_WAIT_OBJECTS), so the thread's builtin
+            // wait blocks suffice. Wait in KernelMode, non-alertably, with no
+            // timeout for normal stream reads and no queue spin lock held.
+            let status = unsafe {
+                if cancellable {
+                    let objects = [
+                        self.ready().cast_const().cast(),
+                        self.cancelled().cast_const().cast(),
+                    ];
+                    KeWaitForMultipleObjects(
+                        objects.len() as u32,
+                        objects.as_ptr(),
+                        WaitAny,
+                        Executive,
+                        0,
+                        0,
+                        timeout,
+                        ptr::null_mut(),
+                    )
+                } else {
+                    KeWaitForSingleObject(self.ready().cast(), Executive, 0, 0, timeout)
+                }
+            };
+            match status {
+                // Recheck queue/cancellation under the queue lock after either signal.
+                STATUS_SUCCESS | 1 => Ok(()),
+                STATUS_TIMEOUT => Err(Status::Timeout),
+                STATUS_USER_APC => Err(Status::UserAPC),
+                STATUS_ABANDONED => Err(Status::Abandoned),
+                _ => Err(Status::InvalidResult),
             }
         }
     }
 }
+
+#[cfg(test)]
+#[path = "ioqueue_tests.rs"]
+mod tests;

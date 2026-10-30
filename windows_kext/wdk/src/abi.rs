@@ -49,12 +49,3 @@ const _: () = {
     assert!(size_of::<IP_ADDRESS_PREFIX>() == 32);
     assert!(align_of::<IP_ADDRESS_PREFIX>() == 4);
 };
-
-#[cfg(target_pointer_width = "64")]
-const _: () = {
-    use core::mem::{align_of, size_of};
-    use windows_sys::Wdk::Foundation::KQUEUE;
-
-    assert!(size_of::<KQUEUE>() == 64);
-    assert!(align_of::<KQUEUE>() == 8);
-};

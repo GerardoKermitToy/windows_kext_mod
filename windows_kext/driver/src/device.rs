@@ -245,7 +245,7 @@ impl Device {
     }
 
     /// Marks reads waiting for an event so the owning handle's cleanup can
-    /// finish. The queue observes this state at its next bounded wait check.
+    /// finish. Signaling the cancellation event wakes blocked reads immediately.
     pub fn cancel_read_waiters(&self) {
         self.event_queue.cancel_waiters();
     }
@@ -937,8 +937,7 @@ impl Device {
         wdk::callback_barrier::CALLBACK_BARRIER.close_classify_and_wait();
         self.begin_unload();
 
-        // KeRundownQueue cannot race a thread blocked in KeRemoveQueue. Close
-        // read admission, wake the bounded waits, and drain their dispatch guards
+        // Close read admission, signal cancellation, and drain dispatch guards
         // before reclaiming queued entries. The queue itself is reclaimed by
         // Device::drop after DriverUnload has closed all dispatch admission. Do
         // not run it down here: a user-issued shutdown can race CLEANUP followed

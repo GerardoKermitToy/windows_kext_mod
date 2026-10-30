@@ -101,7 +101,7 @@ mod tests {
         Cancelled,
     }
 
-    // The KQUEUE itself is tested by runtime suites. This FIFO double exercises
+    // Kernel waits are tested by runtime suites. This FIFO double exercises
     // the real session filtering, including both dequeue entry points, offline.
     pub(crate) struct IOQueue<T> {
         entries: Mutex<VecDeque<T>>,
