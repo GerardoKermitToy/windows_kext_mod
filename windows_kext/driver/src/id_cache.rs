@@ -159,10 +159,22 @@ pub struct IdCache {
     next_id: u64,
 }
 
+const INITIAL_CAPACITY: usize = 1000;
+
+/// Releases a high-water queue allocation without reallocating for every verdict.
+/// Once the live queue is below one quarter of its allocation, retain the normal
+/// initial reserve rather than shrinking a cache that is expected to be reused.
+fn release_excess_capacity<T>(values: &mut VecDeque<T>) {
+    let capacity = values.capacity();
+    if capacity > INITIAL_CAPACITY && values.len() < capacity / 4 {
+        values.shrink_to(INITIAL_CAPACITY);
+    }
+}
+
 impl IdCache {
     pub fn new() -> Self {
         Self {
-            values: VecDeque::with_capacity(1000),
+            values: VecDeque::with_capacity(INITIAL_CAPACITY),
             pending_by_instance: BTreeMap::new(),
             active: BTreeMap::new(),
             lock: RwSpinLock::default(),
@@ -235,6 +247,7 @@ impl IdCache {
                 entry.value.connection_instance_id,
                 id,
             );
+            release_excess_capacity(&mut self.values);
             self.active.insert(
                 id,
                 PendingIdentity {
@@ -460,6 +473,7 @@ fn retire_pending_id(
         values[index].value.connection_instance_id = None;
     } else if let Some(entry) = values.remove(index) {
         removed.push_back(entry);
+        release_excess_capacity(values);
     }
 }
 
@@ -578,7 +592,9 @@ fn build_info(
 
 #[cfg(test)]
 mod tests {
-    use super::{add_pending_request, Entry, IdCache, Packet, PendingPacket};
+    use super::{
+        add_pending_request, Entry, IdCache, Packet, PendingPacket, INITIAL_CAPACITY,
+    };
     use crate::connection_map::Key;
     use alloc::vec;
     use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Address};
@@ -776,10 +792,48 @@ mod tests {
     }
 
     #[test]
-    fn draining_pending_requests_clears_reverse_index() {
+    fn removing_pending_requests_releases_excess_queue_capacity() {
+        let mut cache = IdCache::new();
+        const COUNT: u64 = 4096;
+        for id in 1..=COUNT {
+            queue(&mut cache, id, Some(10), false);
+        }
+        let peak_capacity = cache.values.capacity();
+
+        let removed = cache.retire_connection_instances(&[10]);
+
+        assert_eq!(removed.len(), COUNT as usize);
+        assert!(cache.values.is_empty());
+        assert!(cache.values.capacity() >= INITIAL_CAPACITY);
+        assert!(cache.values.capacity() < peak_capacity);
+    }
+
+    #[test]
+    fn claiming_pending_requests_releases_excess_queue_capacity() {
+        let mut cache = IdCache::new();
+        const COUNT: u64 = 4096;
+        for id in 1..=COUNT {
+            queue(&mut cache, id, None, false);
+        }
+        let peak_capacity = cache.values.capacity();
+
+        for id in 1..=COUNT {
+            assert!(cache.pop_id(id).is_some());
+            cache.finish_id(id);
+        }
+
+        assert!(cache.values.is_empty());
+        assert!(cache.values.capacity() >= INITIAL_CAPACITY);
+        assert!(cache.values.capacity() < peak_capacity);
+    }
+
+    #[test]
+    fn draining_pending_requests_releases_queue_allocation() {
         let mut cache = IdCache::new();
         queue(&mut cache, 1, Some(10), false);
         queue(&mut cache, 2, Some(20), false);
+        cache.values.reserve(4096);
+        assert!(cache.values.capacity() > INITIAL_CAPACITY);
 
         let drained = cache.pop_all();
 
@@ -792,5 +846,6 @@ mod tests {
         );
         assert!(cache.values.is_empty());
         assert!(cache.pending_by_instance.is_empty());
+        assert_eq!(cache.values.capacity(), 1);
     }
 }

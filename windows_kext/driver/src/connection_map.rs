@@ -123,6 +123,17 @@ enum ConnectionBucket<T> {
     Multiple(Vec<T>),
 }
 
+const EXCESS_CAPACITY_THRESHOLD: usize = 64;
+
+/// Releases a high-water generation buffer without reallocating on every cleanup.
+fn release_excess_capacity<T>(connections: &mut Vec<T>) {
+    if connections.capacity() > EXCESS_CAPACITY_THRESHOLD
+        && connections.len() < connections.capacity() / 4
+    {
+        connections.shrink_to_fit();
+    }
+}
+
 impl<T> ConnectionBucket<T> {
     #[inline]
     fn iter(&self) -> core::slice::Iter<'_, T> {
@@ -162,6 +173,8 @@ impl<T> ConnectionBucket<T> {
                 if remaining == 1 {
                     let connection = connections.pop().expect("one retained connection");
                     *self = Self::One(connection);
+                } else {
+                    release_excess_capacity(connections);
                 }
                 remaining != 0
             }
@@ -993,6 +1006,30 @@ mod tests {
 
     fn read_process_id_v6(conn: &ConnectionV6) -> Option<u64> {
         Some(conn.process_id)
+    }
+
+    #[test]
+    fn connection_bucket_releases_excess_generation_capacity() {
+        let mut bucket = ConnectionBucket::One(0u64);
+        const COUNT: u64 = 4096;
+        for generation in 1..COUNT {
+            bucket.push(generation);
+        }
+        let peak_capacity = match &bucket {
+            ConnectionBucket::Multiple(connections) => connections.capacity(),
+            ConnectionBucket::One(_) => panic!("expected multiple generations"),
+        };
+
+        assert!(bucket.retain(|generation| *generation < 2));
+
+        match bucket {
+            ConnectionBucket::Multiple(connections) => {
+                assert_eq!(connections.len(), 2);
+                assert!(connections.capacity() < peak_capacity);
+                assert!(connections.capacity() <= connections.len() * 4);
+            }
+            ConnectionBucket::One(_) => panic!("two generations should remain multiple"),
+        }
     }
 
     #[test]

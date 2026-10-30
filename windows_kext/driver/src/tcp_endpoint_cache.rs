@@ -41,6 +41,15 @@ enum TcpEndpointHandles {
     Multiple(Vec<u64>),
 }
 
+const EXCESS_CAPACITY_THRESHOLD: usize = 64;
+
+/// Releases a high-water handle buffer without reallocating on every flow close.
+fn release_excess_capacity(handles: &mut Vec<u64>) {
+    if handles.capacity() > EXCESS_CAPACITY_THRESHOLD && handles.len() < handles.capacity() / 4 {
+        handles.shrink_to_fit();
+    }
+}
+
 impl TcpEndpointHandles {
     fn iter(&self) -> core::slice::Iter<'_, u64> {
         match self {
@@ -83,7 +92,10 @@ impl TcpEndpointHandles {
                         *self = Self::One(remaining);
                         false
                     }
-                    _ => false,
+                    _ => {
+                        release_excess_capacity(handles);
+                        false
+                    }
                 }
             }
         }
@@ -95,10 +107,13 @@ impl TcpEndpointHandles {
             Self::One(handle) => keep(handle).then_some(Self::One(handle)),
             Self::Multiple(mut handles) => {
                 handles.retain(|handle| keep(*handle));
-                match handles.as_slice() {
-                    [] => None,
-                    [handle] => Some(Self::One(*handle)),
-                    _ => Some(Self::Multiple(handles)),
+                match handles.len() {
+                    0 => None,
+                    1 => Some(Self::One(handles[0])),
+                    _ => {
+                        release_excess_capacity(&mut handles);
+                        Some(Self::Multiple(handles))
+                    }
                 }
             }
         }
@@ -424,7 +439,9 @@ impl TcpEndpointCache {
 
 #[cfg(test)]
 mod tests {
-    use super::TcpEndpointCache;
+    use super::{
+        TcpEndpointCache, TcpEndpointHandles, EXCESS_CAPACITY_THRESHOLD,
+    };
     use crate::{
         connection::{Connection, ConnectionV4, Direction},
         connection_map::{ConnectionMap, Key},
@@ -443,6 +460,58 @@ mod tests {
 
     fn connection(key: &Key, process_id: u64) -> ConnectionV4 {
         ConnectionV4::from_key(key, process_id, Direction::Outbound).expect("IPv4 key")
+    }
+
+    #[test]
+    fn endpoint_handles_release_excess_capacity() {
+        let mut handles = TcpEndpointHandles::One(0);
+        const COUNT: u64 = 4096;
+        for handle in 1..COUNT {
+            handles.insert(handle);
+        }
+        let peak_capacity = match &handles {
+            TcpEndpointHandles::Multiple(handles) => handles.capacity(),
+            TcpEndpointHandles::One(_) => panic!("expected multiple endpoint handles"),
+        };
+
+        for handle in 2..COUNT {
+            assert!(!handles.remove(handle));
+        }
+
+        match handles {
+            TcpEndpointHandles::Multiple(handles) => {
+                assert_eq!(handles.as_slice(), &[0, 1]);
+                assert!(handles.capacity() < peak_capacity);
+                assert!(handles.capacity() <= EXCESS_CAPACITY_THRESHOLD);
+            }
+            TcpEndpointHandles::One(_) => panic!("two handles should remain multiple"),
+        }
+    }
+
+    #[test]
+    fn endpoint_handles_retain_releases_excess_capacity() {
+        let mut handles = TcpEndpointHandles::One(0);
+        const COUNT: u64 = 4096;
+        for handle in 1..COUNT {
+            handles.insert(handle);
+        }
+        let peak_capacity = match &handles {
+            TcpEndpointHandles::Multiple(handles) => handles.capacity(),
+            TcpEndpointHandles::One(_) => panic!("expected multiple endpoint handles"),
+        };
+
+        let retained = handles
+            .retain(|handle| handle < 2)
+            .expect("retained handles");
+
+        match retained {
+            TcpEndpointHandles::Multiple(handles) => {
+                assert_eq!(handles.as_slice(), &[0, 1]);
+                assert!(handles.capacity() < peak_capacity);
+                assert!(handles.capacity() <= EXCESS_CAPACITY_THRESHOLD);
+            }
+            TcpEndpointHandles::One(_) => panic!("two handles should remain multiple"),
+        }
     }
 
     #[test]
