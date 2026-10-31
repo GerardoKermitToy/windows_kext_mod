@@ -281,10 +281,8 @@ impl<R: PacketData> PacketInspector<R> {
                 let key_end =
                     if likely(matches!(header.protocol, IpProtocol::Tcp | IpProtocol::Udp)) {
                         usize::from(header.transport_offset) + 4
-                    } else if unlikely(self.ipv6) {
-                        IPV6_HEADER_LEN
                     } else {
-                        IPV4_HEADER_LEN + 4
+                        base_length
                     };
                 if likely(!extension && packet.len() >= key_end) {
                     // The common path parses the key from the first read itself,
@@ -311,11 +309,13 @@ impl<R: PacketData> PacketInspector<R> {
         if let Some(error) = header.error {
             return Err(error);
         }
-        // Preserve the IPv4 key contract even for protocols without ports.
+        // Only TCP/UDP keys require readable ports beyond the IPv4 base header.
         let length = if unlikely(self.ipv6) {
             IPV6_HEADER_LEN
-        } else {
+        } else if likely(matches!(header.protocol, IpProtocol::Tcp | IpProtocol::Udp)) {
             IPV4_HEADER_LEN + 4
+        } else {
+            IPV4_HEADER_LEN
         };
         let packet = self
             .reader
@@ -931,6 +931,21 @@ mod tests {
                         });
                         assert!(actual.icmp_error == expected_error, "ICMP quote mismatch: {packet:02x?}");
                     }
+                    (Ok(actual), Err(original::PacketMetadataError::UnreadablePacket))
+                        if !ipv6
+                            && (IPV4_HEADER_LEN..IPV4_HEADER_LEN + 4).contains(&packet.len())
+                            && !matches!(IpProtocol::from(packet[9]), IpProtocol::Tcp | IpProtocol::Udp) =>
+                    {
+                        // The reference unnecessarily required four unused port bytes.
+                        let protocol = IpProtocol::from(packet[9]);
+                        let source = IpAddress::Ipv4(Ipv4Address::from_bytes(&packet[12..16]));
+                        let destination = IpAddress::Ipv4(Ipv4Address::from_bytes(&packet[16..20]));
+                        assert!(actual.key == build_key(direction, protocol, source, 0, destination, 0));
+                        assert!(!actual.is_tcp_reset);
+                        assert!(!actual.is_local_icmp_error);
+                        assert!(actual.icmp_echo.is_none());
+                        assert!(actual.icmp_error.is_none());
+                    }
                     (Err(actual), Err(expected)) => {
                         let expected = match expected {
                             original::PacketMetadataError::UnreadablePacket => PacketMetadataError::UnreadablePacket,
@@ -1193,6 +1208,65 @@ mod tests {
                 assert_eq!(reader.byte_reads, 1);
                 assert_eq!(reader.reader.requests, [length]);
                 assert_eq!(reader.reader.reads, [length]);
+            }
+        }
+    }
+
+    #[test]
+    fn short_ipv4_raw_keys_use_one_available_prefix() {
+        for protocol in 0..=u8::MAX {
+            let protocol = IpProtocol::from(protocol);
+            if matches!(protocol, IpProtocol::Tcp | IpProtocol::Udp) {
+                continue;
+            }
+            let mut packet = basic_packet(false, protocol);
+            for length in IPV4_HEADER_LEN..=IPV4_HEADER_LEN + 4 {
+                packet[2..4].copy_from_slice(&(length as u16).to_be_bytes());
+                for direction in [Direction::Outbound, Direction::Inbound] {
+                    for permit_fragments in [false, true] {
+                        let mut inspector = PacketInspector::new(
+                            CountingReader::new(&packet[..length]),
+                            false,
+                            direction,
+                            permit_fragments,
+                        );
+                        let key = inspector.key().unwrap();
+                        let source = IpAddress::Ipv4(Ipv4Address::from_bytes(&packet[12..16]));
+                        let destination = IpAddress::Ipv4(Ipv4Address::from_bytes(&packet[16..20]));
+                        assert!(key == build_key(direction, protocol, source, 0, destination, 0));
+                        assert!(!inspector.is_tcp_reset());
+                        assert_eq!(inspector.reader.requests, [length]);
+                        assert_eq!(inspector.reader.reads, [length]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ipv4_raw_key_recovers_when_only_base_header_is_readable() {
+        for protocol in [
+            IpProtocol::Icmp,
+            IpProtocol::Igmp,
+            IpProtocol::Unknown(253),
+            IpProtocol::Unknown(254),
+        ] {
+            let packet = basic_packet(false, protocol);
+            for direction in [Direction::Outbound, Direction::Inbound] {
+                for inspect_header_first in [false, true] {
+                    let mut reader = CountingReader::new(&packet);
+                    reader.readable_length = IPV4_HEADER_LEN;
+                    let mut inspector = PacketInspector::new(reader, false, direction, true);
+                    if inspect_header_first {
+                        assert!(!inspector.is_fragment());
+                    }
+                    let key = inspector.key().unwrap();
+                    assert_eq!(key.protocol, protocol);
+                    assert_eq!((key.local_port, key.remote_port), (0, 0));
+                    assert!(!inspector.is_tcp_reset());
+                    assert_eq!(inspector.reader.requests, [24, 20, 20]);
+                    assert_eq!(inspector.reader.reads, [24, 20]);
+                }
             }
         }
     }
@@ -1659,6 +1733,7 @@ mod tests {
         let mut packet = [0u8; IPV4_HEADER_LEN];
         packet[0] = 0x45;
         packet[6..8].copy_from_slice(&0x2000u16.to_be_bytes());
+        packet[9] = u8::from(IpProtocol::Tcp);
 
         let inspected = inspect_packet(&packet, false, Direction::Outbound);
         assert!(inspected.is_fragment);
