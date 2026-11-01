@@ -918,7 +918,7 @@ int wmain(int argc, wchar_t** argv) {
         pmkext::RecordOutput record(g_out, g_print_mutex);
         record.Write("%s[CONN %s] id=%llu pid=%llu tid=%llu %s proto=%u(%s) layer=%u(%s)\n"
              "          %s:%u -> %s:%u  payload=%u bytes\n"
-             "          compartment_id=%u interface_index=%u sub_interface_index=%u\n",
+             "          compartment_id=%u condition_flags=0x%08x interface_index=%u sub_interface_index=%u\n",
              TimePrefix(opt.timestamps).c_str(),
              c.ipv6 ? "v6" : "v4",
              static_cast<unsigned long long>(c.id),
@@ -932,6 +932,7 @@ int wmain(int argc, wchar_t** argv) {
              c.RemoteIpString().c_str(), static_cast<unsigned>(c.remote_port),
              static_cast<unsigned>(c.payload_size),
              static_cast<unsigned>(c.compartment_id),
+             static_cast<unsigned>(c.condition_flags),
              static_cast<unsigned>(c.interface_index),
              static_cast<unsigned>(c.sub_interface_index));
 

@@ -90,6 +90,7 @@ struct Connection {
     uint64_t process_id = 0;
     uint64_t tid = 0;
     uint32_t compartment_id = 0;
+    uint32_t condition_flags = 0; // Raw FWP_CONDITION_FLAG_* mask for this indication.
     uint32_t interface_index = 0;
     uint32_t sub_interface_index = 0;
     uint8_t  direction = 0;

@@ -32,6 +32,7 @@ struct AleLayerData {
     is_ipv6: bool,
     reauthorize: bool,
     loopback: bool,
+    condition_flags: u32,
     process_id: u64,
     protocol: IpProtocol,
     /// Direction assigned to the ALE flow, derived from its authorization layer.
@@ -72,6 +73,7 @@ impl AleLayerData {
             // Publication copies the TID from the exact live cache generation.
             thread_id: 0,
             compartment_id: data.get_compartment_id().unwrap_or(0),
+            condition_flags: self.condition_flags,
             interface_index: self.interface_index,
             sub_interface_index: self.sub_interface_index,
         }
@@ -116,10 +118,11 @@ fn get_u32_or_zero(data: &CalloutData, index: usize) -> u32 {
     data.get_value_u32(index)
 }
 
-/// Reads the shared ALE flags field once for both classifications.
-fn get_ale_flags(data: &CalloutData, index: usize) -> (bool, bool) {
+/// Reads ALE flags once, preserving all bits alongside the derived classifications.
+fn get_ale_flags(data: &CalloutData, index: usize) -> (u32, bool, bool) {
     let flags = get_u32_or_zero(data, index);
     (
+        flags,
         flags & FWP_CONDITION_FLAG_IS_REAUTHORIZE != 0,
         flags & FWP_CONDITION_FLAG_IS_LOOPBACK != 0,
     )
@@ -161,11 +164,12 @@ fn get_ipv6_address_if_present(data: &CalloutData, index: usize) -> Option<IpAdd
 
 pub fn ale_layer_connect_v4(data: CalloutData) {
     type Fields = FieldsAleAuthConnectV4;
-    let (reauthorize, loopback) = get_ale_flags(&data, Fields::Flags as usize);
+    let (condition_flags, reauthorize, loopback) = get_ale_flags(&data, Fields::Flags as usize);
     let ale_data = AleLayerData {
         is_ipv6: false,
         reauthorize,
         loopback,
+        condition_flags,
         process_id: data.get_process_id().unwrap_or(0),
         protocol: get_protocol(&data, Fields::IpProtocol as usize),
         connection_direction: Direction::Outbound,
@@ -183,12 +187,13 @@ pub fn ale_layer_connect_v4(data: CalloutData) {
 
 pub fn ale_layer_connect_v6(data: CalloutData) {
     type Fields = FieldsAleAuthConnectV6;
-    let (reauthorize, loopback) = get_ale_flags(&data, Fields::Flags as usize);
+    let (condition_flags, reauthorize, loopback) = get_ale_flags(&data, Fields::Flags as usize);
 
     let ale_data = AleLayerData {
         is_ipv6: true,
         reauthorize,
         loopback,
+        condition_flags,
         process_id: data.get_process_id().unwrap_or(0),
         protocol: get_protocol(&data, Fields::IpProtocol as usize),
         connection_direction: Direction::Outbound,
@@ -208,12 +213,13 @@ pub fn ale_layer_connect_v6(data: CalloutData) {
 
 pub fn ale_layer_recv_accept_v4(data: CalloutData) {
     type Fields = FieldsAleAuthRecvAcceptV4;
-    let (reauthorize, loopback) = get_ale_flags(&data, Fields::Flags as usize);
+    let (condition_flags, reauthorize, loopback) = get_ale_flags(&data, Fields::Flags as usize);
 
     let ale_data = AleLayerData {
         is_ipv6: false,
         reauthorize,
         loopback,
+        condition_flags,
         process_id: data.get_process_id().unwrap_or(0),
         protocol: get_protocol(&data, Fields::IpProtocol as usize),
         connection_direction: Direction::Inbound,
@@ -231,12 +237,13 @@ pub fn ale_layer_recv_accept_v4(data: CalloutData) {
 
 pub fn ale_layer_recv_accept_v6(data: CalloutData) {
     type Fields = FieldsAleAuthRecvAcceptV6;
-    let (reauthorize, loopback) = get_ale_flags(&data, Fields::Flags as usize);
+    let (condition_flags, reauthorize, loopback) = get_ale_flags(&data, Fields::Flags as usize);
 
     let ale_data = AleLayerData {
         is_ipv6: true,
         reauthorize,
         loopback,
+        condition_flags,
         process_id: data.get_process_id().unwrap_or(0),
         protocol: get_protocol(&data, Fields::IpProtocol as usize),
         connection_direction: Direction::Inbound,

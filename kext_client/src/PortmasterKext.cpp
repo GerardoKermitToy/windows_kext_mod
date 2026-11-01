@@ -528,9 +528,9 @@ size_t Driver::Dispatch(const Handlers& handlers) {
             case InfoType::ConnectionIpv6: {
                 const bool v6 = (type == InfoType::ConnectionIpv6);
                 const size_t addr_len = v6 ? 16 : 4;
-                // id(8) pid(8) tid(8) compartment(4) interface(4) subinterface(4)
+                // id(8) pid(8) tid(8) compartment(4) condition_flags(4) interface(4) subinterface(4)
                 // dir(1) proto(1) local_ip remote_ip lport(2) rport(2) layer(1) payload_len(4)
-                const size_t fixed = 8 + 8 + 8 + 4 + 4 + 4 + 1 + 1 + addr_len * 2 + 2 + 2 + 1 + 4;
+                const size_t fixed = 8 + 8 + 8 + 4 + 4 + 4 + 4 + 1 + 1 + addr_len * 2 + 2 + 2 + 1 + 4;
                 if (n < fixed) {
                     if (handlers.on_warning) handlers.on_warning("Connection record too short");
                     break;
@@ -542,6 +542,7 @@ size_t Driver::Dispatch(const Handlers& handlers) {
                 c.process_id = ReadU64(p + o);  o += 8;
                 c.tid = ReadU64(p + o);         o += 8;
                 c.compartment_id = ReadU32(p + o);      o += 4;
+                c.condition_flags = ReadU32(p + o);     o += 4;
                 c.interface_index = ReadU32(p + o);     o += 4;
                 c.sub_interface_index = ReadU32(p + o); o += 4;
                 c.direction = p[o];             o += 1;

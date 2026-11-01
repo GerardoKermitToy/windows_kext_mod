@@ -61,6 +61,7 @@ struct PendingIdentity {
 pub(crate) struct ConnectionMetadata {
     pub thread_id: u64,
     pub compartment_id: u32,
+    pub condition_flags: u32,
     pub interface_index: u32,
     pub sub_interface_index: u32,
 }
@@ -556,6 +557,7 @@ fn build_info(
                 process_id,
                 metadata.thread_id,
                 metadata.compartment_id,
+                metadata.condition_flags,
                 metadata.interface_index,
                 metadata.sub_interface_index,
                 direction as u8,
@@ -574,6 +576,7 @@ fn build_info(
                 process_id,
                 metadata.thread_id,
                 metadata.compartment_id,
+                metadata.condition_flags,
                 metadata.interface_index,
                 metadata.sub_interface_index,
                 direction as u8,

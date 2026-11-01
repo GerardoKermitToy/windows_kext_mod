@@ -21,7 +21,8 @@ CONN = re.compile(
     r'\[CONN v[46]\] id=(?P<id>\d+) pid=(?P<pid>\d+) tid=(?P<tid>\d+) '
     r'(?P<direction>\w+) proto=(?P<proto>\d+)\([^)]*\) layer=\d+\([^)]*\)\r?\n'
     r'\s+(?P<local>\S+):(?P<lp>\d+) -> (?P<remote>\S+):(?P<rp>\d+)\s+payload=\d+ bytes\r?\n'
-    r'\s+compartment_id=(?P<compartment_id>\d+) interface_index=(?P<interface_index>\d+) '
+    r'\s+compartment_id=(?P<compartment_id>\d+) condition_flags=(?P<condition_flags>0x[0-9a-fA-F]+) '
+    r'interface_index=(?P<interface_index>\d+) '
     r'sub_interface_index=(?P<sub_interface_index>\d+)')
 END = re.compile(r'\[END\s+v[46]\] pid=(?P<pid>\d+) (?P<direction>\w+) '
                  r'proto=(?P<proto>\d+)\([^)]*\) (?P<local>\S+):(?P<lp>\d+) -> (?P<remote>\S+):(?P<rp>\d+)')
@@ -110,6 +111,8 @@ def events(text, pattern):
         for key in ('pid', 'tid', 'proto', 'lp', 'rp', 'id', 'compartment_id', 'interface_index', 'sub_interface_index'):
             if key in e:
                 e[key] = int(e[key])
+        if 'condition_flags' in e:
+            e['condition_flags'] = int(e['condition_flags'], 16)
         for key in ('local', 'remote'):
             e[key] = canonical(e[key])
         result.append(e)
@@ -265,6 +268,7 @@ def run(args):
         assert all(e['tid'] == child.meta['tid'] for e in conn), ('Wrong outbound TID', child.meta, conn)
         assert all(e['compartment_id'] == child.meta['compartment_id'] for e in conn), \
             ('Wrong compartment ID', child.meta, conn)
+        assert all(e['condition_flags'] & 1 for e in conn), ('Missing WFP loopback flag', conn)
         if proto == 17:
             assert all(e['interface_index'] > 0 for e in conn), ('Missing packet interface', conn)
         return conn

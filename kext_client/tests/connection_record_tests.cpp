@@ -25,13 +25,14 @@ void Check(bool condition, const char* message) {
 }
 
 std::vector<uint8_t> Record(bool ipv6, bool empty = false) {
-    const uint8_t size = static_cast<uint8_t>((ipv6 ? 79 : 55) + (empty ? 0 : 3));
+    const uint8_t size = static_cast<uint8_t>((ipv6 ? 83 : 59) + (empty ? 0 : 3));
     std::vector<uint8_t> bytes = {
         static_cast<uint8_t>(ipv6 ? 8 : 7), size, 0, 0, 0,
         8, 7, 6, 5, 4, 3, 2, 1,
         0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11,
         0x28, 0x27, 0x26, 0x25, 0x24, 0x23, 0x22, 0x21,
         0x34, 0x33, 0x32, 0x31,
+        0x84, 0x83, 0x82, 0x81,
         0x44, 0x43, 0x42, 0x41,
         0x54, 0x53, 0x52, 0x51,
         1, 17,
@@ -54,6 +55,7 @@ void CheckConnection(const pmkext::Connection& c, bool ipv6, bool empty) {
     Check(c.process_id == 0x1112131415161718ULL, "process ID");
     Check(c.tid == 0x2122232425262728ULL, "thread ID");
     Check(c.compartment_id == 0x31323334, "compartment ID");
+    Check(c.condition_flags == 0x81828384, "WFP condition flags");
     Check(c.interface_index == 0x41424344, "interface index");
     Check(c.sub_interface_index == 0x51525354, "subinterface index");
     Check(c.direction == 1 && c.protocol == 17, "direction and protocol");
@@ -97,6 +99,28 @@ void TestRecords() {
     }
 }
 
+void TestConditionFlagMasks() {
+    for (const bool ipv6 : {false, true}) {
+        for (const uint32_t flags : {0u, 5u, 0x80000000u, 0xffffffffu}) {
+            pmkext::Driver driver;
+            pmkext::Handlers handlers;
+            unsigned connections = 0;
+            handlers.on_connection = [&](const pmkext::Connection& c) {
+                ++connections;
+                Check(c.condition_flags == flags, "full WFP condition flag mask");
+                Check(c.compartment_id == 0x31323334 && c.interface_index == 0x41424344,
+                      "fields adjacent to condition flags");
+            };
+            auto bytes = Record(ipv6, true);
+            for (size_t i = 0; i < 4; ++i) {
+                bytes[5 + 28 + i] = static_cast<uint8_t>(flags >> (i * 8));
+            }
+            pmkext::DriverTestAccess::Feed(driver, handlers, bytes);
+            Check(connections == 1, "condition flag mask dispatch");
+        }
+    }
+}
+
 void TestShortAndLegacyRecords() {
     for (const bool ipv6 : {false, true}) {
         pmkext::Driver driver;
@@ -106,7 +130,7 @@ void TestShortAndLegacyRecords() {
         handlers.on_connection = [&](const pmkext::Connection&) { ++connections; };
         handlers.on_warning = [&](const std::string&) { ++warnings; };
         const auto valid = Record(ipv6);
-        const size_t fixed = ipv6 ? 79 : 55;
+        const size_t fixed = ipv6 ? 83 : 59;
         for (size_t length = 0; length < fixed; ++length) {
             auto short_record = valid;
             short_record.resize(5 + length);
@@ -155,6 +179,7 @@ int main() {
     static_assert(static_cast<uint8_t>(pmkext::InfoType::ConnectionEndEventV6) == 4);
     try {
         TestRecords();
+        TestConditionFlagMasks();
         TestShortAndLegacyRecords();
         TestBatchAndTruncatedPayload();
     } catch (const std::exception& error) {

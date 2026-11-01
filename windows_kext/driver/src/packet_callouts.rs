@@ -567,6 +567,7 @@ fn ip_packet_layer(
             ConnectionMetadata {
                 thread_id,
                 compartment_id: inject_info.compartment_id.unwrap_or(0),
+                condition_flags: data.get_value_u32(fields.flags),
                 interface_index: inject_info.interface_index,
                 sub_interface_index: inject_info.sub_interface_index,
             },

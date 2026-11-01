@@ -2,6 +2,8 @@
 import unittest
 
 from test_udp_burst_closure import CONN
+from test_tcp_rst_closure import CONN as TCP_CONN
+from test_tcp_rst_reauthorization import CONN as TCP_REAUTH_CONN
 
 
 class UdpBurstParserTests(unittest.TestCase):
@@ -50,6 +52,19 @@ class UdpBurstParserTests(unittest.TestCase):
                                                             newline=newline, metadata=metadata))
                             self.assertIsNotNone(match)
                             self.assertEqual(match.group(8), 'PermanentAccept')
+
+    def test_condition_flags_line_preserves_all_parsers(self):
+        for version in (4, 6):
+            for newline in ('\n', '\r\n'):
+                for flags in ('', ' condition_flags=0x00000000', ' condition_flags=0x81828384',
+                              ' condition_flags=0xffffffff'):
+                    metadata = f'compartment_id=1{flags} interface_index=9 sub_interface_index=0'
+                    record = self.record(version, 'tid=904 ', newline=newline, metadata=metadata)
+                    with self.subTest(version=version, newline=newline, flags=flags):
+                        self.assertIsNotNone(CONN.search(record))
+                        tcp_record = record.replace('proto=17(UDP)', 'proto=6(TCP)')
+                        self.assertIsNotNone(TCP_CONN.search(tcp_record))
+                        self.assertIsNotNone(TCP_REAUTH_CONN.search(tcp_record))
 
     def test_invalid_tid_is_not_silently_accepted(self):
         for tid in ('tid= ', 'tid=abc ', 'tid=-1 ', 'tid=904 tid=905 '):

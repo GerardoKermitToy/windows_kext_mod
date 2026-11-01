@@ -11,11 +11,13 @@ The current API version is **3.0.0.0**, stored as `[3, 0, 0, 0]` in [windows_kex
 This is a **breaking API change**, not a drop-in replacement for the original driver or clients using the legacy connection-event layout:
 
 - `ConnectionIpv4` now uses `info_type = 7`, and `ConnectionIpv6` uses `info_type = 8`. Values `1` and `2` remain reserved for the legacy format; the version 3 driver does not emit that format.
-- Both connection events include `tid: u64`, `compartment_id: u32`, `interface_index: u32`, and `sub_interface_index: u32` immediately after `process_id`. Their fixed payload sizes are now 55 bytes for IPv4 and 79 bytes for IPv6.
+- Both connection events include `tid: u64`, `compartment_id: u32`, `condition_flags: u32`, `interface_index: u32`, and `sub_interface_index: u32` immediately after `process_id`. Their fixed payload sizes are now 59 bytes for IPv4 and 83 bytes for IPv6.
 - The former `IOCTL_GET_THREAD_ID` (`0x9C40E008`) and C++ `Driver::GetThreadId` method have been removed. Read `Connection::tid` directly from the decoded event; no per-request IOCTL lookup is needed.
 - The device paths, five-byte event framing, command IDs and layouts, verdict values, and log, connection-end, and bandwidth event formats are unchanged. These unchanged parts do **not** make the complete API compatible with the original implementation.
 
 Update the driver and client together. Clients must check `IOCTL_VERSION` and support the corresponding event IDs and layouts before processing traffic. A legacy client may reject or ignore the new decision requests and leave retained packets without verdicts. Unless stated otherwise, references to "the driver" below mean this modified version 3 implementation.
+
+The connection layout includes `condition_flags` immediately after `compartment_id`; it is not compatible with earlier version 3 builds that omitted this field. Event IDs remain `7`/`8`, so driver and client must use the same layout; `IOCTL_VERSION` alone does not distinguish those earlier builds.
 
 The driver and its user-mode controller operate as one system:
 
@@ -152,7 +154,7 @@ When no event is available, the read waits. During shutdown, an already waiting 
 
 ### `ConnectionIpv4` (`info_type = 7`)
 
-The fixed payload is 55 bytes, followed by the captured packet bytes. Offsets are relative to the payload, excluding the five-byte record header:
+The fixed payload is 59 bytes, followed by the captured packet bytes. Offsets are relative to the payload, excluding the five-byte record header:
 
 | Offset | Size | Field | Description |
 |---:|---:|---|---|
@@ -160,23 +162,24 @@ The fixed payload is 55 bytes, followed by the captured packet bytes. Offsets ar
 | `8` | 8 | `process_id` | Attributed PID, or `0` when it cannot be determined |
 | `16` | 8 | `tid` | Captured Windows thread ID (`u64`), or `0` when unavailable |
 | `24` | 4 | `compartment_id` | WFP network compartment ID (`u32`), or `0` when unavailable |
-| `28` | 4 | `interface_index` | Interface index for the WFP indication (`u32`) |
-| `32` | 4 | `sub_interface_index` | Subinterface index for the WFP indication (`u32`) |
-| `36` | 1 | `direction` | Direction of the packet being decided |
-| `37` | 1 | `protocol` | IP protocol number |
-| `38` | 4 | `local_ip` | Local IPv4 address |
-| `42` | 4 | `remote_ip` | Remote IPv4 address |
-| `46` | 2 | `local_port` | Local port, or `0` for a protocol without ports |
-| `48` | 2 | `remote_port` | Remote port, or `0` for a protocol without ports |
-| `50` | 1 | `payload_layer` | Layer represented by the captured bytes |
-| `51` | 4 | `captured_length` | Number of bytes that follow |
-| `55` | N | `captured_bytes` | Captured packet bytes |
+| `28` | 4 | `condition_flags` | Raw `FWP_CONDITION_FLAG_*` bitmask (`u32`) from this WFP indication |
+| `32` | 4 | `interface_index` | Interface index for the WFP indication (`u32`) |
+| `36` | 4 | `sub_interface_index` | Subinterface index for the WFP indication (`u32`) |
+| `40` | 1 | `direction` | Direction of the packet being decided |
+| `41` | 1 | `protocol` | IP protocol number |
+| `42` | 4 | `local_ip` | Local IPv4 address |
+| `46` | 4 | `remote_ip` | Remote IPv4 address |
+| `50` | 2 | `local_port` | Local port, or `0` for a protocol without ports |
+| `52` | 2 | `remote_port` | Remote port, or `0` for a protocol without ports |
+| `54` | 1 | `payload_layer` | Layer represented by the captured bytes |
+| `55` | 4 | `captured_length` | Number of bytes that follow |
+| `59` | N | `captured_bytes` | Captured packet bytes |
 
-A valid payload length is `55 + captured_length`. A complete framed record is `5 + 55 + captured_length` bytes.
+A valid payload length is `59 + captured_length`. A complete framed record is `5 + 59 + captured_length` bytes.
 
 ### `ConnectionIpv6` (`info_type = 8`)
 
-The fixed payload is 79 bytes. The metadata prefix and its offsets are identical to IPv4; the larger addresses shift the following fields:
+The fixed payload is 83 bytes. The metadata prefix and its offsets are identical to IPv4; the larger addresses shift the following fields:
 
 | Offset | Size | Field | Description |
 |---:|---:|---|---|
@@ -184,19 +187,20 @@ The fixed payload is 79 bytes. The metadata prefix and its offsets are identical
 | `8` | 8 | `process_id` | Attributed PID, or `0` when unknown |
 | `16` | 8 | `tid` | Captured Windows thread ID (`u64`), or `0` when unavailable |
 | `24` | 4 | `compartment_id` | WFP network compartment ID (`u32`), or `0` when unavailable |
-| `28` | 4 | `interface_index` | Interface index for the WFP indication (`u32`) |
-| `32` | 4 | `sub_interface_index` | Subinterface index for the WFP indication (`u32`) |
-| `36` | 1 | `direction` | Direction of the packet being decided |
-| `37` | 1 | `protocol` | IP protocol number |
-| `38` | 16 | `local_ip` | Local IPv6 address |
-| `54` | 16 | `remote_ip` | Remote IPv6 address |
-| `70` | 2 | `local_port` | Local port, or `0` |
-| `72` | 2 | `remote_port` | Remote port, or `0` |
-| `74` | 1 | `payload_layer` | Layer represented by the captured bytes |
-| `75` | 4 | `captured_length` | Number of bytes that follow |
-| `79` | N | `captured_bytes` | Captured packet bytes |
+| `28` | 4 | `condition_flags` | Raw `FWP_CONDITION_FLAG_*` bitmask (`u32`) from this WFP indication |
+| `32` | 4 | `interface_index` | Interface index for the WFP indication (`u32`) |
+| `36` | 4 | `sub_interface_index` | Subinterface index for the WFP indication (`u32`) |
+| `40` | 1 | `direction` | Direction of the packet being decided |
+| `41` | 1 | `protocol` | IP protocol number |
+| `42` | 16 | `local_ip` | Local IPv6 address |
+| `58` | 16 | `remote_ip` | Remote IPv6 address |
+| `74` | 2 | `local_port` | Local port, or `0` |
+| `76` | 2 | `remote_port` | Remote port, or `0` |
+| `78` | 1 | `payload_layer` | Layer represented by the captured bytes |
+| `79` | 4 | `captured_length` | Number of bytes that follow |
+| `83` | N | `captured_bytes` | Captured packet bytes |
 
-A valid payload length is `79 + captured_length`. A complete framed record is `5 + 79 + captured_length` bytes.
+A valid payload length is `83 + captured_length`. A complete framed record is `5 + 83 + captured_length` bytes.
 
 #### Connection-event field semantics
 
@@ -220,9 +224,11 @@ A connection event is a decision request, not a guarantee of one event per logic
 
 `tid` is included directly in every version 3 connection event. For connection-associated requests, publication snapshots the TID from the exact live cache generation. For outbound TCP/UDP ALE attribution, a TID is captured only when the PID is neither unknown/System (`0` or `4`) nor the controller owning the driver handle; existing outbound execution-context and ICMP echo attribution also apply. An unavailable TID is `0`. The value is attributed to the observed request or connection and is not necessarily the thread that sent each subsequent packet. It is not the monitor's reader thread. No IOCTL query is required, and consuming or retiring the request does not invalidate metadata already carried by its event.
 
+`condition_flags` is the complete, unmodified 32-bit `FWP_CONDITION_FLAG_*` mask from the current classification layer's `Flags` field (ALE authorization or inbound/outbound IP packet). Bits are not synthesized from addresses or copied from an earlier connection event. For example, `FWP_CONDITION_FLAG_IS_LOOPBACK` is `0x00000001` and `FWP_CONDITION_FLAG_IS_REAUTHORIZE` is `0x00000004`; applicable bits depend on the layer. Unknown bits are preserved. A missing or non-`FWP_UINT32` field is encoded as `0`, which is indistinguishable from a native zero mask.
+
 `compartment_id`, `interface_index`, and `sub_interface_index` describe the current WFP indication, not an immutable route for the connection. They are copied from ALE classification data or the packet-layer routing snapshot. Unavailable values are encoded as `0`; interface and subinterface indices may legitimately be zero at ALE layers. The format has no presence mask, so a native zero and unavailable metadata cannot be distinguished.
 
-The C++ client exposes these fields as `Connection::tid`, `Connection::compartment_id`, `Connection::interface_index`, and `Connection::sub_interface_index`. `kext_monitor` prints `tid` in the `CONN` header and the three routing fields on a separate line. Metadata is carried by the event regardless of display filters, delayed verdicts, or `--no-verdicts`. Connection-end records do not include these four fields and retain their existing format.
+The C++ client exposes these fields as `Connection::tid`, `Connection::compartment_id`, `Connection::condition_flags`, `Connection::interface_index`, and `Connection::sub_interface_index`. `kext_monitor` prints `tid` in the `CONN` header and routing metadata with `condition_flags=0x%08x` on a separate line. Metadata is carried by the event regardless of display filters, delayed verdicts, or `--no-verdicts`. Connection-end records do not include these five fields and retain their existing format.
 
 A successful `WriteFile` for a verdict means that the driver accepted the command; it does not confirm delivery of the reinjected packet. WFP injection completes asynchronously, and a final injection failure is written to the driver's log ring. Independent UDP reinjections do not form a FIFO contract, so this API does not guarantee the delivery order of accepted UDP datagrams.
 

@@ -146,6 +146,7 @@ pub fn connection_info_v4(
     process_id: u64,
     tid: u64,
     compartment_id: u32,
+    condition_flags: u32,
     interface_index: u32,
     sub_interface_index: u32,
     direction: u8,
@@ -162,6 +163,7 @@ pub fn connection_info_v4(
         process_id,
         tid,
         compartment_id,
+        condition_flags,
         interface_index,
         sub_interface_index,
         direction,
@@ -181,6 +183,7 @@ pub fn connection_info_v4(
     push_bytes!(vec, process_id);
     push_bytes!(vec, tid);
     push_bytes!(vec, compartment_id);
+    push_bytes!(vec, condition_flags);
     push_bytes!(vec, interface_index);
     push_bytes!(vec, sub_interface_index);
     push_bytes!(vec, direction);
@@ -200,6 +203,7 @@ pub fn connection_info_v6(
     process_id: u64,
     tid: u64,
     compartment_id: u32,
+    condition_flags: u32,
     interface_index: u32,
     sub_interface_index: u32,
     direction: u8,
@@ -216,6 +220,7 @@ pub fn connection_info_v6(
         process_id,
         tid,
         compartment_id,
+        condition_flags,
         interface_index,
         sub_interface_index,
         direction,
@@ -234,6 +239,7 @@ pub fn connection_info_v6(
     push_bytes!(vec, process_id);
     push_bytes!(vec, tid);
     push_bytes!(vec, compartment_id);
+    push_bytes!(vec, condition_flags);
     push_bytes!(vec, interface_index);
     push_bytes!(vec, sub_interface_index);
     push_bytes!(vec, direction);
@@ -480,6 +486,7 @@ mod tests {
             0x1112_1314_1516_1718,
             0x2122_2324_2526_2728,
             0x3132_3334,
+            0x8182_8384,
             0x4142_4344,
             0x5152_5354,
             1,
@@ -494,10 +501,10 @@ mod tests {
         assert_eq!(
             info.as_bytes(),
             &[
-                7, 58, 0, 0, 0, 8, 7, 6, 5, 4, 3, 2, 1, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12,
-                0x11, 0x28, 0x27, 0x26, 0x25, 0x24, 0x23, 0x22, 0x21, 0x34, 0x33, 0x32, 0x31, 0x44,
-                0x43, 0x42, 0x41, 0x54, 0x53, 0x52, 0x51, 1, 17, 1, 2, 3, 4, 5, 6, 7, 8, 0x62,
-                0x61, 0x72, 0x71, 3, 3, 0, 0, 0, 0xaa, 0xbb, 0xcc,
+                7, 62, 0, 0, 0, 8, 7, 6, 5, 4, 3, 2, 1, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12,
+                0x11, 0x28, 0x27, 0x26, 0x25, 0x24, 0x23, 0x22, 0x21, 0x34, 0x33, 0x32, 0x31, 0x84,
+                0x83, 0x82, 0x81, 0x44, 0x43, 0x42, 0x41, 0x54, 0x53, 0x52, 0x51, 1, 17, 1, 2, 3,
+                4, 5, 6, 7, 8, 0x62, 0x61, 0x72, 0x71, 3, 3, 0, 0, 0, 0xaa, 0xbb, 0xcc,
             ]
         );
         info.assert_size();
@@ -510,6 +517,7 @@ mod tests {
             0x1112_1314_1516_1718,
             0x2122_2324_2526_2728,
             0x3132_3334,
+            0x8182_8384,
             0x4142_4344,
             0x5152_5354,
             1,
@@ -522,9 +530,9 @@ mod tests {
             &[0xaa, 0xbb, 0xcc],
         );
         let mut expected = vec![
-            8, 82, 0, 0, 0, 8, 7, 6, 5, 4, 3, 2, 1, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11,
-            0x28, 0x27, 0x26, 0x25, 0x24, 0x23, 0x22, 0x21, 0x34, 0x33, 0x32, 0x31, 0x44, 0x43,
-            0x42, 0x41, 0x54, 0x53, 0x52, 0x51, 1, 17,
+            8, 86, 0, 0, 0, 8, 7, 6, 5, 4, 3, 2, 1, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11,
+            0x28, 0x27, 0x26, 0x25, 0x24, 0x23, 0x22, 0x21, 0x34, 0x33, 0x32, 0x31, 0x84, 0x83,
+            0x82, 0x81, 0x44, 0x43, 0x42, 0x41, 0x54, 0x53, 0x52, 0x51, 1, 17,
         ];
         expected.extend(1..=16);
         expected.extend(17..=32);
@@ -535,14 +543,14 @@ mod tests {
 
     #[test]
     fn connection_without_metadata_or_payload_keeps_fixed_fields() {
-        let v4 = connection_info_v4(1, 2, 0, 0, 0, 0, 0, 6, [1; 4], [2; 4], 3, 4, 4, &[]);
-        let v6 = connection_info_v6(1, 2, 0, 0, 0, 0, 0, 6, [1; 16], [2; 16], 3, 4, 4, &[]);
-        for (info, info_type, size) in [(v4, 7, 55), (v6, 8, 79)] {
+        let v4 = connection_info_v4(1, 2, 0, 0, 0, 0, 0, 0, 6, [1; 4], [2; 4], 3, 4, 4, &[]);
+        let v6 = connection_info_v6(1, 2, 0, 0, 0, 0, 0, 0, 6, [1; 16], [2; 16], 3, 4, 4, &[]);
+        for (info, info_type, size) in [(v4, 7, 59), (v6, 8, 83)] {
             let bytes = info.as_bytes();
             assert_eq!(&bytes[..5], &[info_type, size, 0, 0, 0]);
             assert_eq!(bytes.len(), size as usize + 5);
-            assert_eq!(&bytes[21..41], &[0; 20]);
-            assert_eq!(&bytes[41..43], &[0, 6]);
+            assert_eq!(&bytes[21..45], &[0; 24]);
+            assert_eq!(&bytes[45..47], &[0, 6]);
             assert_eq!(&bytes[bytes.len() - 4..], &[0; 4]);
             info.assert_size();
         }
@@ -720,6 +728,7 @@ fn generate_test_info_file() -> Result<(), std::io::Error> {
         2,
         9,
         10,
+        13,
         11,
         12,
         3,
@@ -750,6 +759,7 @@ fn generate_test_info_file() -> Result<(), std::io::Error> {
                     2,
                     9,
                     10,
+                    13,
                     11,
                     12,
                     3,
@@ -771,6 +781,7 @@ fn generate_test_info_file() -> Result<(), std::io::Error> {
                     2,
                     9,
                     10,
+                    13,
                     11,
                     12,
                     3,

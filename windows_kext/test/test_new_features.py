@@ -68,16 +68,27 @@ class ConnectionMetadataTests(unittest.TestCase):
     def record(self):
         return ('[CONN v4] id=17 pid=4568 tid=904 outbound proto=17(UDP) layer=3(network)\n'
                 '          127.0.0.1:54829 -> 127.0.0.1:54828  payload=12 bytes\n'
-                '          compartment_id=1 interface_index=4294967295 sub_interface_index=0\n')
+                '          compartment_id=1 condition_flags=0x81828384 interface_index=4294967295 sub_interface_index=0\n')
 
     def test_metadata_fields_are_parsed_as_integers(self):
         for newline in ('\n', '\r\n'):
             with self.subTest(newline=newline):
                 events = new_features.events(self.record().replace('\n', newline), new_features.CONN)
                 self.assertEqual(len(events), 1)
-                for key, value in (('tid', 904), ('compartment_id', 1),
+                for key, value in (('tid', 904), ('compartment_id', 1), ('condition_flags', 0x81828384),
                                    ('interface_index', 4294967295), ('sub_interface_index', 0)):
                     self.assertEqual(events[0][key], value)
+
+    def test_zero_and_full_width_condition_flags(self):
+        for flags in (0, 1, 5, 0x80000000, 0xffffffff):
+            with self.subTest(flags=flags):
+                record = self.record().replace('0x81828384', f'0x{flags:08x}')
+                events = new_features.events(record, new_features.CONN)
+                self.assertEqual(events[0]['condition_flags'], flags)
+
+    def test_missing_condition_flags_is_not_a_new_format_record(self):
+        record = self.record().replace(' condition_flags=0x81828384', '')
+        self.assertEqual(new_features.events(record, new_features.CONN), [])
 
     def test_missing_metadata_is_not_a_new_format_record(self):
         record = self.record().rsplit('          compartment_id=', 1)[0]

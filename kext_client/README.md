@@ -186,6 +186,7 @@ id: u64
 process_id: u64
 tid: u64
 compartment_id: u32
+condition_flags: u32
 interface_index: u32
 sub_interface_index: u32
 direction: u8
@@ -199,20 +200,28 @@ payload_size: u32
 payload: [u8; payload_size]
 ```
 
-The fixed payload prefix is 55 bytes for IPv4 and 79 bytes for IPv6, excluding
+The fixed payload prefix is 59 bytes for IPv4 and 83 bytes for IPv6, excluding
 the five-byte record header and captured packet bytes.
 
-`CONN` output includes `tid=...` in its header and the three routing fields on a
-separate line. The driver snapshots the exact live connection generation's TID
+`CONN` output includes `tid=...` in its header and the routing fields with
+`condition_flags=0x%08x` on a separate line. The driver snapshots the exact live connection generation's TID
 when publishing the event. Existing outbound execution-context and ICMP echo
 attribution still apply; an unavailable TID is `0`.
+
+`Connection::condition_flags` contains the complete raw `FWP_CONDITION_FLAG_*`
+mask from the current ALE or IP-packet classification, not flags cached from
+an earlier event. Unknown bits are preserved; unavailable flags are `0`.
+For example, bit `0x00000001` denotes loopback and bit `0x00000004` denotes
+reauthorization where that flag applies to the layer. This extra `u32` shifts
+all following fields by four bytes; earlier v3 clients without it are not
+compatible even though the event IDs and `IOCTL_VERSION` are unchanged.
 
 Routing values describe the current WFP indication, not an immutable route for
 the connection. Unavailable metadata is `0`; interface and subinterface fields
 can legitimately be zero at ALE layers. A zero value does not distinguish
 unavailable metadata from a native zero.
 
-TID and routing metadata are part of the event even when the monitor hides it,
+TID, condition flags and routing metadata are part of the event even when the monitor hides it,
 delays its verdict, or uses `--no-verdicts`. No extra IOCTL query is needed and
 metadata does not depend on the pending request still existing. The former
 GetThreadId IOCTL (`0x9c40e008`) and client method have been removed.
