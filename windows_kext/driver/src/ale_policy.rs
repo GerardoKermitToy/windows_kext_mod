@@ -2,6 +2,14 @@ use smoltcp::wire::IpProtocol;
 
 use crate::connection::Direction;
 
+/// Raw receive indications describe delivery of a packet copy, not ownership of
+/// its TCP/UDP tuple. Keep the observer out of native connection lifecycle state.
+/// Raw sends still need normal authorization and packet-layer policy.
+#[inline]
+pub(crate) fn should_skip_raw_receive(raw_endpoint: bool, inbound: bool) -> bool {
+    raw_endpoint && inbound
+}
+
 /// Policy result after combining the network and transport injection handles.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AleInjectionAction {
@@ -209,11 +217,23 @@ mod tests {
         inbound_udp_fallback_pid, self_injected_endpoint_identifies_socket,
         self_injected_packet_needs_accept_authorization, should_capture_ale_packet,
         should_permit_ale_tcp_reset, should_skip_cross_direction_ale_clone,
-        should_skip_injected_outbound_flow, AleInjectionAction, InjectionStatus,
-        PacketInjectionAction,
+        should_skip_injected_outbound_flow, should_skip_raw_receive, AleInjectionAction,
+        InjectionStatus, PacketInjectionAction,
     };
     use crate::connection::Direction;
     use smoltcp::wire::IpProtocol;
+
+    #[test]
+    fn raw_receive_copies_never_enter_native_connection_lifecycle() {
+        assert!(should_skip_raw_receive(true, true));
+    }
+
+    #[test]
+    fn native_receives_and_raw_sends_keep_normal_authorization() {
+        assert!(!should_skip_raw_receive(false, true));
+        assert!(!should_skip_raw_receive(false, false));
+        assert!(!should_skip_raw_receive(true, false));
+    }
 
     #[test]
     fn inbound_udp_fallback_does_not_lookup_when_disabled_or_not_udp() {

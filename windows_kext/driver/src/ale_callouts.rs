@@ -1,7 +1,8 @@
 use crate::ale_policy::{
     can_reuse_ended_tcp_policy, classify_ale_injection, self_injected_endpoint_identifies_socket,
     should_capture_ale_packet, should_permit_ale_tcp_reset, should_skip_cross_direction_ale_clone,
-    should_skip_injected_outbound_flow, AleInjectionAction, InjectionStatus,
+    should_skip_injected_outbound_flow, should_skip_raw_receive, AleInjectionAction,
+    InjectionStatus,
 };
 use crate::connection::{Connection, ConnectionV4, ConnectionV6, Direction, Verdict};
 use crate::connection_map::Key;
@@ -14,7 +15,10 @@ use likely_stable::{likely, unlikely};
 use smoltcp::wire::{
     IpAddress, IpProtocol, Ipv4Address, Ipv6Address, IPV4_HEADER_LEN, IPV6_HEADER_LEN,
 };
-use wdk::consts::{FWP_CONDITION_FLAG_IS_LOOPBACK, FWP_CONDITION_FLAG_IS_REAUTHORIZE};
+use wdk::consts::{
+    FWP_CONDITION_FLAG_IS_LOOPBACK, FWP_CONDITION_FLAG_IS_RAW_ENDPOINT,
+    FWP_CONDITION_FLAG_IS_REAUTHORIZE,
+};
 use wdk::filter_engine::layer::{
     self, FieldsAleAuthConnectV4, FieldsAleAuthConnectV6, FieldsAleAuthRecvAcceptV4,
     FieldsAleAuthRecvAcceptV6, ValueType,
@@ -22,7 +26,9 @@ use wdk::filter_engine::layer::{
 use wdk::filter_engine::net_buffer::NetBufferList;
 use wdk::filter_engine::packet::{PacketInjectionOrigin, TransportPacketList, TransportProtocol};
 use wdk::filter_engine::{callout_data::CalloutData, PacketDirection as WfpPacketDirection};
-use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_DIRECTION_OUTBOUND;
+use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
+    FWP_DIRECTION_INBOUND, FWP_DIRECTION_OUTBOUND,
+};
 
 // ALE Layers
 
@@ -388,6 +394,19 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
     )) {
         // Outbound: will be handled by packet layer next.
         // Inbound: was already handled by packet layer.
+        data.action_permit();
+        return;
+    }
+
+    // Raw sockets (including SIO_RCVALL observers) receive copies of TCP/UDP
+    // packets, not ownership of their tuples. A shared raw endpoint must never
+    // acquire the real socket's PID, verdict, or closure identity. The original
+    // traffic still takes its normal ALE/IP policy path. Check before querying
+    // injection state, looking up caches, or cloning a packet.
+    if unlikely(should_skip_raw_receive(
+        ale_data.condition_flags & FWP_CONDITION_FLAG_IS_RAW_ENDPOINT != 0,
+        matches!(ale_data.connection_direction, Direction::Inbound),
+    )) {
         data.action_permit();
         return;
     }
@@ -1726,6 +1745,14 @@ pub fn ale_flow_established_monitor(data: CalloutData) {
         layer::Layer::AleFlowEstablishedV4 => {
             type Fields = layer::FieldsAleFlowEstablishedV4;
 
+            if unlikely(should_skip_raw_receive(
+                data.get_value_u32(Fields::Flags as usize) & FWP_CONDITION_FLAG_IS_RAW_ENDPOINT
+                    != 0,
+                data.get_value_u32(Fields::Direction as usize) == FWP_DIRECTION_INBOUND as u32,
+            )) {
+                return;
+            }
+
             let Some(protocol) = get_protocol_if_present(&data, Fields::IpProtocol as usize) else {
                 return;
             };
@@ -1756,6 +1783,14 @@ pub fn ale_flow_established_monitor(data: CalloutData) {
         }
         layer::Layer::AleFlowEstablishedV6 => {
             type Fields = layer::FieldsAleFlowEstablishedV6;
+
+            if unlikely(should_skip_raw_receive(
+                data.get_value_u32(Fields::Flags as usize) & FWP_CONDITION_FLAG_IS_RAW_ENDPOINT
+                    != 0,
+                data.get_value_u32(Fields::Direction as usize) == FWP_DIRECTION_INBOUND as u32,
+            )) {
+                return;
+            }
 
             let Some(protocol) = get_protocol_if_present(&data, Fields::IpProtocol as usize) else {
                 return;
@@ -1793,8 +1828,8 @@ pub fn ale_flow_established_monitor(data: CalloutData) {
     // endpoint. It is not the application's native connection. Skip both our own
     // reinjection and another driver's synthetic flow before endpoint or tuple
     // resolution so neither can produce false correlation errors, overwrite
-    // attribution, or own application lifecycle state. Injection state is the
-    // discriminator; a raw-socket flag alone would also match legitimate traffic.
+    // attribution, or own application lifecycle state. Raw receive copies were
+    // excluded above; outbound raw sends still need the injection discriminator.
     if is_injected_outbound_transport_flow(device, &data, direction_index, is_ipv6) {
         return;
     }
