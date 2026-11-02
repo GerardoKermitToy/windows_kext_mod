@@ -9,12 +9,13 @@ use windows_sys::{
     Win32::{
         Foundation::{HANDLE, NTSTATUS, STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_HANDLE},
         NetworkManagement::WindowsFilteringPlatform::{
-            FWPM_CONDITION_ALE_APP_ID, FWPM_FILTER_CONDITION0,
+            FWPM_CONDITION_ALE_APP_ID, FWPM_CONDITION_IP_REMOTE_ADDRESS, FWPM_FILTER_CONDITION0,
             FWPM_NETWORK_CONNECTION_POLICY_CONTEXT, FWPM_NETWORK_CONNECTION_POLICY_SETTING0,
             FWPM_NETWORK_CONNECTION_POLICY_SETTINGS0, FWPM_PROVIDER_CONTEXT3, FWPM_SESSION0,
-            FWPM_SESSION_FLAG_DYNAMIC, FWP_BYTE_BLOB, FWP_BYTE_BLOB_TYPE, FWP_IP_VERSION,
-            FWP_IP_VERSION_V4, FWP_IP_VERSION_V6, FWP_MATCH_EQUAL,
-            FWP_NETWORK_CONNECTION_POLICY_NEXT_HOP_INTERFACE, FWP_UINT64,
+            FWPM_SESSION_FLAG_DYNAMIC, FWP_BYTE_ARRAY16, FWP_BYTE_ARRAY16_TYPE, FWP_BYTE_BLOB,
+            FWP_BYTE_BLOB_TYPE, FWP_IP_VERSION, FWP_IP_VERSION_V4, FWP_IP_VERSION_V6,
+            FWP_MATCH_EQUAL, FWP_MATCH_NOT_EQUAL, FWP_NETWORK_CONNECTION_POLICY_NEXT_HOP_INTERFACE,
+            FWP_UINT64, FWP_V4_ADDR_AND_MASK, FWP_V4_ADDR_MASK,
         },
         System::Rpc::RPC_C_AUTHN_WINNT,
     },
@@ -198,8 +199,68 @@ fn downcase_app_id(app_id: &[u8]) -> Result<Vec<u8>, NTSTATUS> {
 
 #[cfg(test)]
 mod tests {
-    use super::downcase_app_id;
+    use super::{downcase_app_id, policy_conditions, LoopbackAddresses};
     use alloc::{string::String, vec, vec::Vec};
+    use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
+        FWPM_CONDITION_ALE_APP_ID, FWPM_CONDITION_IP_REMOTE_ADDRESS, FWP_BYTE_ARRAY16_TYPE,
+        FWP_BYTE_BLOB, FWP_BYTE_BLOB_TYPE, FWP_IP_VERSION_V4, FWP_IP_VERSION_V6, FWP_MATCH_EQUAL,
+        FWP_MATCH_NOT_EQUAL, FWP_V4_ADDR_MASK,
+    };
+
+    #[test]
+    fn policy_matches_the_app_and_excludes_each_familys_loopback_destinations() {
+        let mut app_id = encoded(concat!(r"\device\volume\app.exe", "\0"));
+        let mut blob = FWP_BYTE_BLOB {
+            size: app_id.len() as u32,
+            data: app_id.as_mut_ptr(),
+        };
+        let mut loopback = LoopbackAddresses::new();
+        let key = |guid: &windows_sys::core::GUID| (guid.data1, guid.data2, guid.data3, guid.data4);
+        for version in [FWP_IP_VERSION_V4, FWP_IP_VERSION_V6] {
+            let conditions = policy_conditions(&mut blob, version, &mut loopback);
+            assert_eq!(conditions.len(), 2);
+            assert_eq!(
+                key(&conditions[0].fieldKey),
+                key(&FWPM_CONDITION_ALE_APP_ID)
+            );
+            assert_eq!(conditions[0].matchType, FWP_MATCH_EQUAL);
+            assert_eq!(conditions[0].conditionValue.r#type, FWP_BYTE_BLOB_TYPE);
+            assert_eq!(
+                unsafe { conditions[0].conditionValue.Anonymous.byteBlob },
+                core::ptr::addr_of_mut!(blob)
+            );
+            assert_eq!(
+                key(&conditions[1].fieldKey),
+                key(&FWPM_CONDITION_IP_REMOTE_ADDRESS)
+            );
+            assert_eq!(conditions[1].matchType, FWP_MATCH_NOT_EQUAL);
+            if version == FWP_IP_VERSION_V4 {
+                assert_eq!(conditions[1].conditionValue.r#type, FWP_V4_ADDR_MASK);
+                let mask = unsafe { &*conditions[1].conditionValue.Anonymous.v4AddrMask };
+                assert_eq!(mask.addr, 0x7f00_0000);
+                assert_eq!(mask.mask, 0xff00_0000);
+                for address in [0x7f00_0000, 0x7f00_0001, 0x7f00_0002, 0x7fff_ffff] {
+                    assert_eq!(address & mask.mask, mask.addr);
+                }
+                for address in [
+                    0x0101_0101,
+                    0x0a00_0001,
+                    0x7eff_ffff,
+                    0x8000_0000,
+                    0xc0a8_0001,
+                ] {
+                    assert_ne!(address & mask.mask, mask.addr);
+                }
+            } else {
+                assert_eq!(conditions[1].conditionValue.r#type, FWP_BYTE_ARRAY16_TYPE);
+                let address = unsafe { &*conditions[1].conditionValue.Anonymous.byteArray16 };
+                assert_eq!(
+                    address.byteArray16,
+                    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+                );
+            }
+        }
+    }
 
     fn encoded(path: &str) -> Vec<u8> {
         path.encode_utf16().flat_map(u16::to_le_bytes).collect()
@@ -272,6 +333,50 @@ impl Drop for PolicyTransaction {
     }
 }
 
+struct LoopbackAddresses {
+    ipv4: FWP_V4_ADDR_AND_MASK,
+    ipv6: FWP_BYTE_ARRAY16,
+}
+
+impl LoopbackAddresses {
+    fn new() -> Self {
+        Self {
+            // FWP's IPv4 address/mask values use host byte order.
+            ipv4: FWP_V4_ADDR_AND_MASK {
+                addr: 0x7f00_0000,
+                mask: 0xff00_0000,
+            },
+            ipv6: FWP_BYTE_ARRAY16 {
+                byteArray16: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            },
+        }
+    }
+}
+
+fn policy_conditions(
+    blob: &mut FWP_BYTE_BLOB,
+    version: FWP_IP_VERSION,
+    loopback: &mut LoopbackAddresses,
+) -> [FWPM_FILTER_CONDITION0; 2] {
+    let mut conditions: [FWPM_FILTER_CONDITION0; 2] = unsafe { mem::zeroed() };
+    conditions[0].fieldKey = FWPM_CONDITION_ALE_APP_ID;
+    conditions[0].matchType = FWP_MATCH_EQUAL;
+    conditions[0].conditionValue.r#type = FWP_BYTE_BLOB_TYPE;
+    conditions[0].conditionValue.Anonymous.byteBlob = blob;
+    // IS_LOOPBACK is not sufficient at connection-policy route lookup on the test
+    // OS. Exclude destinations explicitly before forcing an external interface.
+    conditions[1].fieldKey = FWPM_CONDITION_IP_REMOTE_ADDRESS;
+    conditions[1].matchType = FWP_MATCH_NOT_EQUAL;
+    if version == FWP_IP_VERSION_V4 {
+        conditions[1].conditionValue.r#type = FWP_V4_ADDR_MASK;
+        conditions[1].conditionValue.Anonymous.v4AddrMask = &mut loopback.ipv4;
+    } else {
+        conditions[1].conditionValue.r#type = FWP_BYTE_ARRAY16_TYPE;
+        conditions[1].conditionValue.Anonymous.byteArray16 = &mut loopback.ipv6;
+    }
+    conditions
+}
+
 fn add_policy(
     handle: HANDLE,
     key: &GUID,
@@ -283,11 +388,8 @@ fn add_policy(
         size: app_id.len() as u32,
         data: app_id.as_ptr().cast_mut(),
     };
-    let mut condition: FWPM_FILTER_CONDITION0 = unsafe { mem::zeroed() };
-    condition.fieldKey = FWPM_CONDITION_ALE_APP_ID;
-    condition.matchType = FWP_MATCH_EQUAL;
-    condition.conditionValue.r#type = FWP_BYTE_BLOB_TYPE;
-    condition.conditionValue.Anonymous.byteBlob = &mut blob;
+    let mut loopback = LoopbackAddresses::new();
+    let conditions = policy_conditions(&mut blob, version, &mut loopback);
 
     let mut setting: FWPM_NETWORK_CONNECTION_POLICY_SETTING0 = unsafe { mem::zeroed() };
     setting.r#type = FWP_NETWORK_CONNECTION_POLICY_NEXT_HOP_INTERFACE;
@@ -315,8 +417,8 @@ fn add_policy(
             &context,
             version,
             100,
-            1,
-            &condition,
+            conditions.len() as u32,
+            conditions.as_ptr(),
             ptr::null_mut(),
         )
     })

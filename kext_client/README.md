@@ -100,9 +100,15 @@ app_id:      app_id_size bytes of canonical UTF-16LE native path
 The driver rejects oversized paths (more than 65,534 bytes), odd byte counts,
 missing or embedded NUL terminators, malformed UTF-16, and truncated payloads.
 It calls the kernel `FwpmConnectionPolicyAdd0` with `FWPM_CONDITION_ALE_APP_ID`
-and `FWP_NETWORK_CONNECTION_POLICY_NEXT_HOP_INTERFACE` (`FWP_UINT64`). IPv4 and
-IPv6 policies are added, replaced, or removed in one WFP transaction. Failed
-updates preserve the previous pair. Setting an unchanged assignment is a no-op.
+and `FWP_NETWORK_CONNECTION_POLICY_NEXT_HOP_INTERFACE` (`FWP_UINT64`). A second
+`FWPM_CONDITION_IP_REMOTE_ADDRESS` condition uses `FWP_MATCH_NOT_EQUAL` to exclude
+all of `127.0.0.0/8` for IPv4 and `::1` for IPv6. Those destinations retain normal
+local routing instead of being forced onto the selected external/VPN adapter.
+An `IS_LOOPBACK` flag condition alone did not prevent `WSAEADDRNOTAVAIL` at
+connection-policy route lookup on the test OS; the address exclusions are
+intentional. IPv4 and IPv6 policies are added, replaced, or removed in one WFP
+transaction. Failed updates preserve the previous pair. Setting an unchanged
+assignment is a no-op.
 WFP management failures are returned to the caller, rather than logged as success.
 
 Policies belong to a separate dynamic WFP session. Device-handle cleanup or
@@ -176,7 +182,12 @@ TCP interface selection. It is deliberately **not** registered with offline CTes
 
 The optional interface address selects a second adapter with a usable route.
 The live probe makes short TCP connections to `1.1.1.1:443`, sends no application
-data, and fails if the policy is stored but does not change the observed route.
+data to that endpoint, and fails if the policy is stored but does not change the
+observed source and interface. It also verifies TCP/UDP echo round trips to
+`127.0.0.1`, `127.0.0.2`, and `::1` from the selected Unicode EXE path, both without
+a policy and with policies installed through IOCTL and WriteFile. WFP inspection
+checks the loopback-address exclusion on both policy filters. Only the bounded
+`--loopback-child` mode is registered in CTest; it never opens or loads the driver.
 Successful IOCTL completion proves policy installation, not successful egress:
 OS support and a usable route on the selected interface remain necessary.
 

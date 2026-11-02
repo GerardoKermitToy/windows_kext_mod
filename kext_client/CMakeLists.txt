@@ -128,6 +128,9 @@ if(BUILD_TESTING)
     else()
         target_link_options(app_interface_runtime PRIVATE -municode)
     endif()
+    # Only the bounded loopback child runs in CTest; it never opens the driver.
+    add_test(NAME app_interface_loopback_tests COMMAND app_interface_runtime --loopback-child)
+    set_tests_properties(app_interface_loopback_tests PROPERTIES TIMEOUT 10)
 
     add_executable(verdict_tests tests/verdict_tests.cpp)
     target_link_libraries(verdict_tests PRIVATE pmkext)

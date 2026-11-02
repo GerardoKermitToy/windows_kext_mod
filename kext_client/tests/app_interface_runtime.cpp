@@ -121,6 +121,7 @@ struct PolicyInspector {
                 for (UINT32 i = 0; i < count; ++i) {
                     const auto* filter = filters[i];
                     bool same_app = false;
+                    bool excludes_loopback = false;
                     for (UINT32 c = 0; c < filter->numFilterConditions; ++c) {
                         const auto& condition = filter->filterCondition[c];
                         if (IsEqualGUID(condition.fieldKey, FWPM_CONDITION_ALE_APP_ID) &&
@@ -129,9 +130,24 @@ struct PolicyInspector {
                             same_app = blob && blob->size == app_id.size() &&
                                 std::memcmp(blob->data, app_id.data(), app_id.size()) == 0;
                         }
+                        if (IsEqualGUID(condition.fieldKey, FWPM_CONDITION_IP_REMOTE_ADDRESS) &&
+                            condition.matchType == FWP_MATCH_NOT_EQUAL) {
+                            if (IsEqualGUID(*layer, FWPM_LAYER_OUTBOUND_NETWORK_CONNECTION_POLICY_V4) &&
+                                condition.conditionValue.type == FWP_V4_ADDR_MASK) {
+                                const auto* mask = condition.conditionValue.v4AddrMask;
+                                excludes_loopback = mask && mask->addr == 0x7f000000 && mask->mask == 0xff000000;
+                            } else if (IsEqualGUID(*layer, FWPM_LAYER_OUTBOUND_NETWORK_CONNECTION_POLICY_V6) &&
+                                       condition.conditionValue.type == FWP_BYTE_ARRAY16_TYPE) {
+                                const auto* address = condition.conditionValue.byteArray16;
+                                const IN6_ADDR expected = IN6ADDR_LOOPBACK_INIT;
+                                excludes_loopback = address &&
+                                    std::memcmp(address->byteArray16, &expected, sizeof(expected)) == 0;
+                            }
+                        }
                     }
                     if (!same_app) continue;
                     ++matches;
+                    settings_ok = settings_ok && filter->numFilterConditions == 2 && excludes_loopback;
                     FWPM_PROVIDER_CONTEXT3* context = nullptr;
                     if (FwpmProviderContextGetByKey3(engine, &filter->providerContextKey, &context) != ERROR_SUCCESS) {
                         settings_ok = false;
@@ -156,37 +172,45 @@ struct PolicyInspector {
     }
 };
 
+struct ChildResult { DWORD pid; DWORD exit_code; };
+
+ChildResult RunChild(const std::wstring& path, const wchar_t* mode, DWORD timeout_ms) {
+    std::wstring args = L"\"" + path + L"\" " + mode;
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process{};
+    Check(CreateProcessW(path.c_str(), args.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr,
+                         &startup, &process) != 0, "start Unicode test child");
+    CloseHandle(process.hThread);
+    const DWORD wait = WaitForSingleObject(process.hProcess, timeout_ms);
+    if (wait != WAIT_OBJECT_0) {
+        TerminateProcess(process.hProcess, 0xfffffffe);
+        WaitForSingleObject(process.hProcess, 1000);
+        CloseHandle(process.hProcess);
+        throw std::runtime_error("test child exceeded its time bound");
+    }
+    DWORD result = 0;
+    const BOOL have_result = GetExitCodeProcess(process.hProcess, &result);
+    CloseHandle(process.hProcess);
+    Check(have_result != FALSE, "test child exit code");
+    return {process.dwProcessId, result};
+}
+
 DWORD ChildSource(const std::wstring& path, ULONG* interface_index = nullptr) {
     size_t first_observation;
     {
         std::lock_guard<std::mutex> guard(observations_mutex);
         first_observation = observations.size();
     }
-    std::wstring args = L"\"" + path + L"\" --route-child";
-    STARTUPINFOW startup{};
-    startup.cb = sizeof(startup);
-    PROCESS_INFORMATION process{};
-    Check(CreateProcessW(path.c_str(), args.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr,
-                         &startup, &process) != 0, "start Unicode route child");
-    CloseHandle(process.hThread);
-    const DWORD wait = WaitForSingleObject(process.hProcess, 2500);
-    if (wait != WAIT_OBJECT_0) {
-        TerminateProcess(process.hProcess, 0xfffffffe);
-        WaitForSingleObject(process.hProcess, 1000);
-        CloseHandle(process.hProcess);
-        throw std::runtime_error("route child exceeded its 2.5-second bound");
-    }
-    DWORD result = 0;
-    GetExitCodeProcess(process.hProcess, &result);
-    CloseHandle(process.hProcess);
-    Check(result == 0, "route child socket operation");
+    const auto child = RunChild(path, L"--route-child", 2500);
+    Check(child.exit_code == 0, "route child socket operation");
     const ULONGLONG deadline = GetTickCount64() + 1000;
     do {
         {
             std::lock_guard<std::mutex> guard(observations_mutex);
             for (size_t i = first_observation; i < observations.size(); ++i) {
                 const auto& route = observations[i];
-                if (route.pid == process.dwProcessId) {
+                if (route.pid == child.pid) {
                     if (interface_index) *interface_index = route.interface_index;
                     return route.source;
                 }
@@ -195,6 +219,137 @@ DWORD ChildSource(const std::wstring& path, ULONG* interface_index = nullptr) {
         Sleep(10);
     } while (GetTickCount64() < deadline);
     throw std::runtime_error("no native WFP route indication for child");
+}
+
+struct TestSocket {
+    SOCKET value = INVALID_SOCKET;
+    explicit TestSocket(SOCKET socket) : value(socket) {}
+    ~TestSocket() { if (value != INVALID_SOCKET) closesocket(value); }
+    TestSocket(const TestSocket&) = delete;
+    TestSocket& operator=(const TestSocket&) = delete;
+};
+
+void SocketCheck(bool ok, const char* operation) {
+    if (!ok) throw std::runtime_error(std::string(operation) +
+                                      ": WSA error " + std::to_string(WSAGetLastError()));
+}
+
+void SocketReady(SOCKET socket, bool write = false) {
+    fd_set ready, errors;
+    FD_ZERO(&ready);
+    FD_ZERO(&errors);
+    FD_SET(socket, &ready);
+    FD_SET(socket, &errors);
+    timeval timeout{0, 700000};
+    const int result = select(0, write ? nullptr : &ready, write ? &ready : nullptr,
+                              &errors, &timeout);
+    if (result == 0) throw std::runtime_error("loopback socket timed out after 700 ms");
+    SocketCheck(result > 0, "loopback select");
+    int error = 0;
+    int size = sizeof(error);
+    SocketCheck(getsockopt(socket, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&error), &size) == 0,
+                "loopback SO_ERROR");
+    if (error != 0) throw std::runtime_error("loopback socket: WSA error " + std::to_string(error));
+}
+
+void ReceiveExact(SOCKET socket, char* data, int size) {
+    int received = 0;
+    while (received < size) {
+        SocketReady(socket);
+        const int count = recv(socket, data + received, size - received, 0);
+        SocketCheck(count > 0, "loopback TCP receive");
+        received += count;
+    }
+}
+
+void LoopbackExchange(const wchar_t* address, int family, bool udp) {
+    const int type = udp ? SOCK_DGRAM : SOCK_STREAM;
+    const int protocol = udp ? IPPROTO_UDP : IPPROTO_TCP;
+    TestSocket server(socket(family, type, protocol));
+    TestSocket client(socket(family, type, protocol));
+    SocketCheck(server.value != INVALID_SOCKET && client.value != INVALID_SOCKET, "loopback sockets");
+    SOCKADDR_INET endpoint{};
+    endpoint.si_family = static_cast<ADDRESS_FAMILY>(family);
+    const int length = family == AF_INET ? sizeof(sockaddr_in) : sizeof(sockaddr_in6);
+    void* ip = family == AF_INET ? static_cast<void*>(&endpoint.Ipv4.sin_addr) :
+                                  static_cast<void*>(&endpoint.Ipv6.sin6_addr);
+    Check(InetPtonW(family, address, ip) == 1, "loopback address");
+    SocketCheck(bind(server.value, reinterpret_cast<sockaddr*>(&endpoint), length) == 0, "loopback bind");
+    if (!udp) SocketCheck(listen(server.value, 1) == 0, "loopback listen");
+    int endpoint_size = length;
+    SocketCheck(getsockname(server.value, reinterpret_cast<sockaddr*>(&endpoint), &endpoint_size) == 0,
+                "loopback server endpoint");
+    u_long nonblocking = 1;
+    SocketCheck(ioctlsocket(client.value, FIONBIO, &nonblocking) == 0, "loopback nonblocking client");
+    const int connected = connect(client.value, reinterpret_cast<sockaddr*>(&endpoint), length);
+    SocketCheck(connected == 0 || WSAGetLastError() == WSAEWOULDBLOCK, "loopback connect");
+    if (connected != 0) SocketReady(client.value, true);
+
+    SOCKADDR_INET local{};
+    int local_size = sizeof(local);
+    SocketCheck(getsockname(client.value, reinterpret_cast<sockaddr*>(&local), &local_size) == 0,
+                "loopback client source");
+    if (family == AF_INET) {
+        Check((ntohl(local.Ipv4.sin_addr.s_addr) >> 24) == 127, "loopback must keep a 127/8 source");
+    } else {
+        const IN6_ADDR expected = IN6ADDR_LOOPBACK_INIT;
+        Check(std::memcmp(&local.Ipv6.sin6_addr, &expected, sizeof(expected)) == 0,
+              "IPv6 loopback must keep source ::1");
+    }
+
+    constexpr char payload[] = "pmkext-loopback";
+    constexpr int payload_size = sizeof(payload);
+    SocketCheck(send(client.value, payload, payload_size, 0) == payload_size, "loopback send");
+    SocketReady(server.value);
+    char received[sizeof(payload)]{};
+    if (udp) {
+        SOCKADDR_INET peer{};
+        int peer_size = sizeof(peer);
+        SocketCheck(recvfrom(server.value, received, payload_size, 0,
+                             reinterpret_cast<sockaddr*>(&peer), &peer_size) == payload_size,
+                    "loopback UDP receive");
+        Check(std::memcmp(received, payload, sizeof(payload)) == 0, "loopback UDP payload");
+        SocketCheck(sendto(server.value, received, payload_size, 0,
+                           reinterpret_cast<sockaddr*>(&peer), peer_size) == payload_size,
+                    "loopback UDP reply");
+    } else {
+        TestSocket accepted(accept(server.value, nullptr, nullptr));
+        SocketCheck(accepted.value != INVALID_SOCKET, "loopback accept");
+        ReceiveExact(accepted.value, received, payload_size);
+        Check(std::memcmp(received, payload, sizeof(payload)) == 0, "loopback TCP payload");
+        SocketCheck(send(accepted.value, received, payload_size, 0) == payload_size, "loopback TCP reply");
+    }
+    if (udp) {
+        SocketReady(client.value);
+        SocketCheck(recv(client.value, received, payload_size, 0) == payload_size, "loopback UDP echo receive");
+    } else {
+        ReceiveExact(client.value, received, payload_size);
+    }
+    Check(std::memcmp(received, payload, sizeof(payload)) == 0, "loopback echo payload");
+    std::printf("PASS: %s loopback %ls round trip with native loopback source\n", udp ? "UDP" : "TCP", address);
+}
+
+int LoopbackChild() {
+    WSADATA data{};
+    if (WSAStartup(MAKEWORD(2, 2), &data) != 0) return 1;
+    int result = 0;
+    try {
+        for (bool udp : {false, true}) {
+            LoopbackExchange(L"127.0.0.1", AF_INET, udp);
+            LoopbackExchange(L"127.0.0.2", AF_INET, udp);
+            LoopbackExchange(L"::1", AF_INET6, udp);
+        }
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "FAIL: %s\n", error.what());
+        result = 1;
+    }
+    WSACleanup();
+    return result;
+}
+
+void CheckLoopback(const std::wstring& path) {
+    Check(RunChild(path, L"--loopback-child", 10000).exit_code == 0,
+          "selected application must retain IPv4/IPv6 TCP/UDP loopback connectivity");
 }
 
 int RouteChild() {
@@ -268,6 +423,7 @@ struct Runtime {
 
 int wmain(int argc, wchar_t** argv) {
     if (argc == 2 && std::wcscmp(argv[1], L"--route-child") == 0) return RouteChild();
+    if (argc == 2 && std::wcscmp(argv[1], L"--loopback-child") == 0) return LoopbackChild();
     if ((argc != 4 && argc != 6) || std::wcscmp(argv[1], L"--duration") != 0 ||
         std::wcscmp(argv[2], L"30") != 0 || (argc == 6 && std::wcscmp(argv[4], L"--interface-address") != 0)) {
         std::fprintf(stderr, "Usage: app_interface_runtime.exe --duration 30 absolute-driver.sys [--interface-address IPv4]\n");
@@ -297,6 +453,7 @@ int wmain(int argc, wchar_t** argv) {
         runtime.StartReader(deadline);
 
         const DWORD baseline = ChildSource(app.path);
+        CheckLoopback(app.path);
         Check(baseline != 0xffffffff && baseline != 0, "baseline native TCP route");
         SOCKADDR_INET destination{};
         destination.Ipv4.sin_family = AF_INET;
@@ -329,11 +486,17 @@ int wmain(int argc, wchar_t** argv) {
         std::printf("default source=0x%08lx alternate source=0x%08lx alternate LUID=%llu\n",
                     baseline, alternate_source, alternate.Value);
         set(alternate.Value, false);
-        const DWORD selected = ChildSource(app.path);
-        Check(selected == alternate_source, "Unicode executable must use the selected non-default interface");
+        ULONG selected_interface = 0;
+        ULONG alternate_interface = 0;
+        Check(ConvertInterfaceLuidToIndex(&alternate, &alternate_interface) == NO_ERROR,
+              "selected interface index");
+        const DWORD selected = ChildSource(app.path, &selected_interface);
+        Check(selected == alternate_source && selected_interface == alternate_interface,
+              "Unicode executable must use the selected non-default interface and source");
         Check(ChildSource(app.original) == baseline, "other executable path must keep its default route");
         Check(ChildSource(app.path) == alternate_source, "policy persists across process exit and relaunch");
-        std::printf("PASS: actual interface selection and per-path isolation\n");
+        CheckLoopback(app.path);
+        std::printf("PASS: actual interface selection, per-path isolation, and loopback over IOCTL\n");
 
         set(default_luid.Value, true);
         Check(ChildSource(app.path) == baseline, "WriteFile replaces route policy");
@@ -343,6 +506,7 @@ int wmain(int argc, wchar_t** argv) {
         Check(ChildSource(app.path) == baseline, "IOCTL removal restores default route");
         set(alternate.Value, true);
         Check(ChildSource(app.path) == alternate_source, "WriteFile add selects the alternate interface");
+        CheckLoopback(app.path);
         set(0, true);
         Check(ChildSource(app.path) == baseline, "WriteFile removal restores the default route");
         std::printf("PASS: WriteFile add/update/remove and idempotent commands\n");
