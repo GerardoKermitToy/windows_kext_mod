@@ -5,6 +5,7 @@
 
 #include <windows.h>
 #include <winsvc.h>
+#include <fwpmu.h>
 
 #include <cstdio>
 #include <cstring>
@@ -27,6 +28,8 @@ constexpr uint32_t MakeCtlCode(uint32_t function) {
 constexpr uint32_t kIoctlVersion = MakeCtlCode(0x800);
 constexpr uint32_t kIoctlShutdown = MakeCtlCode(0x801);
 constexpr uint32_t kIoctlStartProcessMonitoring = MakeCtlCode(0x803);
+constexpr uint32_t kIoctlSetAppInterface = MakeCtlCode(0x804);
+static_assert(kIoctlSetAppInterface == 0x9c40e010);
 static_assert(kIoctlStartProcessMonitoring == 0x9c40e00c);
 
 // Every record is [InfoType: u8, size: u32 LE, payload: size bytes].
@@ -373,7 +376,8 @@ private:
 
 } // namespace
 
-bool Driver::DeviceControl(uint32_t code, uint8_t* out, uint32_t out_len, std::string& error) {
+bool Driver::DeviceControl(uint32_t code, uint8_t* out, uint32_t out_len, std::string& error,
+                           const uint8_t* input, uint32_t input_len) {
     if (device_ == nullptr) {
         error = "device not open";
         return false;
@@ -385,7 +389,7 @@ bool Driver::DeviceControl(uint32_t code, uint8_t* out, uint32_t out_len, std::s
     }
     HANDLE device = static_cast<HANDLE>(device_);
     DWORD returned = 0;
-    const BOOL ok = DeviceIoControl(device, code, nullptr, 0, out, out_len,
+    const BOOL ok = DeviceIoControl(device, code, const_cast<uint8_t*>(input), input_len, out, out_len,
                                     &returned, ov.get());
     return FinishOverlapped(device, ov.get(), ok, "DeviceIoControl", nullptr, error);
 }
@@ -404,6 +408,55 @@ bool Driver::StartProcessMonitoring(std::string& error, bool via_write) {
         return SendCommand(buf, sizeof(buf), error);
     }
     return DeviceControl(kIoctlStartProcessMonitoring, nullptr, 0, error);
+}
+
+bool Driver::BuildAppInterfaceCommand(const std::wstring& path, uint64_t luid,
+                                       std::vector<uint8_t>& command, std::string& error) {
+    command.clear();
+    if (path.empty() || path.find(wchar_t{}) != std::wstring::npos) {
+        error = "application path is empty or contains an embedded NUL";
+        return false;
+    }
+    FWP_BYTE_BLOB* app_id = nullptr;
+    const DWORD status = FwpmGetAppIdFromFileName0(path.c_str(), &app_id);
+    if (status != ERROR_SUCCESS) {
+        error = "FwpmGetAppIdFromFileName failed: " + LastErrorText(status);
+        return false;
+    }
+    struct AppIdGuard {
+        FWP_BYTE_BLOB* value;
+        ~AppIdGuard() { FwpmFreeMemory0(reinterpret_cast<void**>(&value)); }
+    } guard{app_id};
+    constexpr uint32_t kMaxAppIdSize = 65534;
+    if (app_id == nullptr || app_id->data == nullptr || app_id->size < 4 ||
+        app_id->size > kMaxAppIdSize || (app_id->size & 1) != 0) {
+        error = "FwpmGetAppIdFromFileName returned an invalid UTF-16 app ID";
+        return false;
+    }
+    // Command 10: LUID:u64 LE, app_id_size:u32 LE, canonical UTF-16LE path.
+    command.resize(1 + 12 + app_id->size);
+    command[0] = static_cast<uint8_t>(CommandType::SetAppInterface);
+    for (unsigned i = 0; i < 8; ++i) {
+        command[1 + i] = static_cast<uint8_t>(luid >> (i * 8));
+    }
+    for (unsigned i = 0; i < 4; ++i) {
+        command[9 + i] = static_cast<uint8_t>(app_id->size >> (i * 8));
+    }
+    std::memcpy(command.data() + 13, app_id->data, app_id->size);
+    return true;
+}
+
+bool Driver::SetAppInterface(const std::wstring& path, uint64_t luid, std::string& error,
+                             bool via_write) {
+    std::vector<uint8_t> command;
+    if (!BuildAppInterfaceCommand(path, luid, command, error)) {
+        return false;
+    }
+    if (via_write) {
+        return SendCommand(command.data(), command.size(), error);
+    }
+    return DeviceControl(kIoctlSetAppInterface, nullptr, 0, error, command.data() + 1,
+                         static_cast<uint32_t>(command.size() - 1));
 }
 
 bool Driver::SendCommand(const uint8_t* data, size_t len, std::string& error) {

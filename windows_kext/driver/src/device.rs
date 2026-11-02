@@ -13,6 +13,7 @@ use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Address, Ipv6Address};
 use wdk::{
     driver::Driver,
     filter_engine::{
+        app_interface::AppInterfacePolicies,
         callout_data::{CalloutData, ClassifyDefer},
         net_buffer::{NetBufferList, NetworkAllocator},
         packet::{InjectInfo, InjectionPath, Injector},
@@ -114,6 +115,7 @@ impl CommandWriteError {
 // Device Context
 pub struct Device {
     pub(crate) filter_engine: PassiveMutex<FilterEngine>,
+    app_interfaces: PassiveMutex<AppInterfacePolicies>,
     /// Serializes the complete event-stream read transaction: consuming a saved
     /// fragment, waiting for/dequeuing records, and publishing the next fragment.
     /// A spin lock cannot protect this state because an empty stream may wait.
@@ -186,6 +188,8 @@ impl Device {
         let read_stream = PassiveMutex::new(ArrayHolder::default())
             .map_err(|err| format!("read stream lock error: {}", err))?;
         let process_monitor = ProcessMonitor::new()?;
+        let app_interfaces = PassiveMutex::new(AppInterfacePolicies::new())
+            .map_err(|err| format!("app interface lock error: {}", err))?;
 
         let filter_engine = FilterEngine::new(driver, 0x7dab1057_8e2b_40c4_9b85_693e381d7896)
             .map_err(|err| alloc::format!("filter engine error: {}", err))?;
@@ -197,6 +201,7 @@ impl Device {
 
         Ok(Self {
             filter_engine,
+            app_interfaces,
             read_stream,
             event_queue: EventQueue::new(), // Queue for events to user-space
             process_monitor,
@@ -224,6 +229,25 @@ impl Device {
             .lock()
             .map_err(|err| format!("failed to acquire filter engine: {}", err))?;
         filter_engine.commit(callouts::get_callout_vec())
+    }
+
+    pub(crate) fn set_app_interface(&self, payload: &[u8]) -> Result<(), NTSTATUS> {
+        let command = protocol::command::parse_set_app_interface(payload)
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+        self.app_interfaces.lock().map_err(|_| STATUS_INVALID_DEVICE_STATE)?
+            .set(command.app_id, command.luid)
+    }
+
+    pub(crate) fn stop_app_interface_policies(&self) {
+        loop {
+            let result = self.app_interfaces.lock().map_err(|_| STATUS_INVALID_DEVICE_STATE)
+                .and_then(|mut policies| policies.close());
+            match result {
+                Ok(()) => return,
+                Err(status) => err!("failed to close app interface policies: NTSTATUS({:#010x})", status as u32),
+            }
+            wdk::utils::sleep_ms(1);
+        }
     }
 
     /// Returns whether the nonzero PID belongs to the current device-handle owner.
@@ -405,6 +429,10 @@ impl Device {
                     err!("Unknown command number {} at byte {}", command, offset);
                     return Err(CommandWriteError::new(STATUS_INVALID_PARAMETER, offset));
                 }
+                Err(CommandParseError::InvalidPayloadLength { command }) => {
+                    err!("Invalid {:?} payload length at byte {}", command, offset);
+                    return Err(CommandWriteError::new(STATUS_INVALID_PARAMETER, offset));
+                }
                 Err(CommandParseError::TruncatedPayload {
                     command,
                     expected,
@@ -421,7 +449,7 @@ impl Device {
                 }
             };
 
-            if let Err(status) = self.apply_command(command, payload) {
+            if let Err(status) = self.apply_command(command, payload, write_request.get_file_object()) {
                 return Err(CommandWriteError::new(status, offset));
             }
             offset += 1 + payload.len();
@@ -431,8 +459,9 @@ impl Device {
         Ok(())
     }
 
-    fn apply_command(&self, command: CommandType, payload: &[u8]) -> Result<(), NTSTATUS> {
+    fn apply_command(&self, command: CommandType, payload: &[u8], file_object: *mut c_void) -> Result<(), NTSTATUS> {
         match command {
+            CommandType::SetAppInterface => crate::entry::set_app_interface(self, file_object, payload)?,
             CommandType::Shutdown => {
                 wdk::dbg!("Shutdown command");
                 self.shutdown();
@@ -930,7 +959,7 @@ impl Device {
     /// pending user-space decisions. This runs from PASSIVE_LEVEL dispatch or
     /// DriverUnload and is idempotent.
     pub fn shutdown(&self) {
-        crate::entry::stop_process_session_for_shutdown(self);
+        crate::entry::stop_session_for_shutdown(self);
         // A user-mode shutdown command can arrive before service-driven unload.
         // Close callback admission here as well as in DriverUnload so no classify
         // can enqueue a new packet after the cache and event queue are drained.

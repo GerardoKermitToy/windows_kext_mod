@@ -53,6 +53,12 @@ pub enum ControlCode {
         METHOD_BUFFERED,
         FILE_READ_DATA | FILE_WRITE_DATA
     ),
+    SetAppInterface = ctl_code!(
+        SIOCTL_TYPE,
+        0x804,
+        METHOD_BUFFERED,
+        FILE_READ_DATA | FILE_WRITE_DATA
+    ),
 }
 
 impl Display for ControlCode {
@@ -61,6 +67,7 @@ impl Display for ControlCode {
             ControlCode::Version => _ = write!(f, "Version"),
             ControlCode::ShutdownRequest => _ = write!(f, "Shutdown"),
             ControlCode::StartProcessMonitoring => _ = write!(f, "StartProcessMonitoring"),
+            ControlCode::SetAppInterface => _ = write!(f, "SetAppInterface"),
         };
         return Ok(());
     }

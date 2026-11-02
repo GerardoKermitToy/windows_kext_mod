@@ -356,6 +356,15 @@ impl WriteRequest {
         }
     }
 
+    /// Opaque identity of the device open that owns this request.
+    pub fn get_file_object(&self) -> *mut c_void {
+        // SAFETY: The uncompleted request keeps its native stack location live.
+        unsafe {
+            let stack = self.irp.current_stack_location();
+            if stack.is_null() { core::ptr::null_mut() } else { (*stack).FileObject.cast() }
+        }
+    }
+
     pub fn mark_all_as_read(&mut self) {
         self.information = self.buffer_len;
     }
@@ -382,6 +391,7 @@ pub struct DeviceControlRequest {
     irp: IrpPtr,
     buffer: *mut u8,
     buffer_len: usize,
+    input_buffer_len: usize,
     fill_index: usize,
     control_code: u32,
 }
@@ -453,8 +463,8 @@ impl DeviceControlRequest {
         let irp = unsafe { IrpPtr::new(irp)? };
         // SAFETY: the IRP is still owned by this uncompleted wrapper.
         let irp_sp = unsafe { irp.current_stack_location() };
-        let (output_buffer_length, control_code) = if irp_sp.is_null() {
-            (0, 0)
+        let (output_buffer_length, input_buffer_length, control_code) = if irp_sp.is_null() {
+            (0, 0, 0)
         } else {
             // SAFETY: the constructor contract identifies an IRP_MJ_DEVICE_CONTROL
             // stack entry. The native Parameters storage is live, aligned, and its
@@ -462,18 +472,19 @@ impl DeviceControlRequest {
             let device_io = unsafe {
                 &*core::ptr::addr_of!((*irp_sp).Parameters).cast::<DeviceIOControlParams>()
             };
-            (device_io.output_buffer_length, device_io.io_control_code)
+            (device_io.output_buffer_length, device_io.input_buffer_length, device_io.io_control_code)
         };
-        let (buffer, buffer_len) = unsafe {
-            // SAFETY: METHOD_BUFFERED SystemBuffer covers the advertised output
-            // length, even when the caller also supplied an input buffer.
-            normalize_buffer(irp.system_buffer(), output_buffer_length)
+        let (buffer, allocated_len) = unsafe {
+            // SAFETY: METHOD_BUFFERED SystemBuffer covers max(input, output).
+            // Output capacity is not the length of initialized input data.
+            normalize_buffer(irp.system_buffer(), output_buffer_length.max(input_buffer_length))
         };
 
         Some(Self {
             irp,
             buffer,
-            buffer_len,
+            buffer_len: (output_buffer_length as usize).min(allocated_len),
+            input_buffer_len: (input_buffer_length as usize).min(allocated_len),
             fill_index: 0,
             control_code,
         })
@@ -518,6 +529,24 @@ impl DeviceControlRequest {
         self.irp.complete(STATUS_NOT_IMPLEMENTED, 0)
     }
 
+    /// Opaque identity of the device open that owns this request.
+    pub fn get_file_object(&self) -> *mut c_void {
+        // SAFETY: The uncompleted request keeps its native stack location live.
+        unsafe {
+            let stack = self.irp.current_stack_location();
+            if stack.is_null() { core::ptr::null_mut() } else { (*stack).FileObject.cast() }
+        }
+    }
+
+    pub fn get_input_buffer(&self) -> &[u8] {
+        if self.input_buffer_len == 0 {
+            return &[];
+        }
+        // SAFETY: This live METHOD_BUFFERED IRP owns the advertised input bytes.
+        // The shared borrow excludes output writes until the borrow ends.
+        unsafe { core::slice::from_raw_parts(self.buffer, self.input_buffer_len) }
+    }
+
     pub fn get_control_code(&self) -> u32 {
         self.control_code
     }
@@ -544,9 +573,31 @@ mod tests {
                 buffer.as_mut_ptr()
             },
             buffer_len: buffer.len(),
+            input_buffer_len: 0,
             fill_index: 0,
             control_code: 0,
         }
+    }
+
+    #[test]
+    fn input_only_ioctl_keeps_input_without_exposing_output_space() {
+        let mut bytes = [1, 2, 3, 4];
+        let mut request = device_control_request(&mut bytes);
+        request.input_buffer_len = bytes.len();
+        request.buffer_len = 0;
+        assert_eq!(request.get_input_buffer(), &[1, 2, 3, 4]);
+        assert_eq!(request.free_space(), 0);
+        assert!(!request.write_exact(&[9]));
+        assert_eq!(request.get_input_buffer(), &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn input_length_does_not_include_uninitialized_output_capacity() {
+        let mut bytes = [1, 2, 0xaa, 0xaa];
+        let mut request = device_control_request(&mut bytes);
+        request.input_buffer_len = 2;
+        assert_eq!(request.get_input_buffer(), &[1, 2]);
+        assert_eq!(request.free_space(), 4);
     }
 
     #[test]

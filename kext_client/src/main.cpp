@@ -16,8 +16,11 @@
 #include "DelayedVerdicts.h"
 #include "ProcessSuspensions.h"
 #include "RecordOutput.h"
+#include "RoutePolicies.h"
 
 #include <windows.h>
+#include <ws2tcpip.h>
+#include <iphlpapi.h>
 
 #include <atomic>
 #include <cstdarg>
@@ -46,6 +49,10 @@ FILE* g_out = stdout;
 struct Options {
     std::wstring sys_path;
     std::wstring out_path;
+    std::wstring app_path;
+    std::wstring app_interface;    // decimal interface index or Windows alias
+    uint64_t app_interface_luid = 0;
+    bool has_interface_luid = false;
     unsigned duration_s = 0;       // 0 = until Ctrl+C
     unsigned poll_ms = 1000;
     unsigned verdict_delay_ms = 0; // 0 = send immediately
@@ -162,6 +169,25 @@ bool ParseUnsignedDecimal(const wchar_t* text, uint64_t maximum, uint64_t& resul
     return true;
 }
 
+bool ParseInterfaceLuid(const wchar_t* text, uint64_t& result) {
+    if (text == nullptr || text[0] != L'0' || (text[1] != L'x' && text[1] != L'X')) {
+        return ParseUnsignedDecimal(text, ~uint64_t{0}, result);
+    }
+    if (text[2] == L'\0') return false;
+    uint64_t value = 0;
+    for (const wchar_t* cursor = text + 2; *cursor != L'\0'; ++cursor) {
+        unsigned digit = 0;
+        if (*cursor >= L'0' && *cursor <= L'9') digit = *cursor - L'0';
+        else if (*cursor >= L'a' && *cursor <= L'f') digit = *cursor - L'a' + 10;
+        else if (*cursor >= L'A' && *cursor <= L'F') digit = *cursor - L'A' + 10;
+        else return false;
+        if (value > (~uint64_t{0} - digit) / 16) return false;
+        value = value * 16 + digit;
+    }
+    result = value;
+    return true;
+}
+
 // Writes a record and flushes it.
 //
 // Flushing per record is deliberate. A redirected stdout is block-buffered, so
@@ -229,6 +255,22 @@ void PrintUsage() {
         "                   and do not suppress logs or warnings.\n"
         "\n"
         "Behaviour:\n"
+        "  Startup checks IPv4 and IPv6 route policies through nsi.lib (read-only).\n"
+        "  Unconfirmed families are enabled through netsh (active store).\n"
+        "  Already-enabled state is unchanged; persistent settings are not changed.\n"
+        "  --help and invalid arguments do not change this setting.\n"
+        "\n"
+        "  --app PATH       set an interface policy for this executable path.\n"
+        "                   Does not launch the program. Requires exactly one of:\n"
+        "  --interface INDEX_OR_ALIAS\n"
+        "                   prefer this decimal interface index or Windows alias.\n"
+        "  --interface-luid LUID\n"
+        "                   native LUID in decimal or 0x hexadecimal; 0 removes.\n"
+        "                   One --app per run; applies to all instances at that path.\n"
+        "                   The assignment is removed when the monitor exits.\n"
+        "                   Only new connections use the policy. IPv4 and IPv6 route\n"
+        "                   policies are enabled automatically at startup.\n"
+        "\n"
         "  --no-inbound-udp-pid-fallback\n"
         "                   write EnableInboundUdpCacheMissPidFallback=0 before load.\n"
         "                   Default: 1; the driver reads it once at startup.\n"
@@ -285,7 +327,9 @@ void PrintUsage() {
         "  kext_monitor.exe --duration 30 --filter-pid 1234 --filter-protocol 6\n"
         "  kext_monitor.exe --duration 30 --filter-protocol 58\n"
         "  kext_monitor.exe --duration 30 --verdict accept --match 192.168.219.15\n"
-        "  kext_monitor.exe --duration 30 --verdict-delay-ms 250\n");
+        "  kext_monitor.exe --duration 30 --verdict-delay-ms 250\n"
+        "  kext_monitor.exe --duration 30 --app \"C:\\Apps\\client.exe\" --interface 76\n"
+        "  kext_monitor.exe --duration 30 --app \"C:\\Apps\\client.exe\" --interface \"wg0\"\n");
 }
 
 // Returns false on a malformed argument list.
@@ -318,6 +362,34 @@ bool ParseArgs(int argc, wchar_t** argv, Options& opt) {
                 return false;
             }
             opt.out_path = argv[++i];
+        } else if (a == L"--app") {
+            if (!opt.app_path.empty() || i + 1 >= argc || argv[i + 1][0] == L'\0' ||
+                std::wstring(argv[i + 1]).starts_with(L"--")) {
+                std::printf("ERROR: --app needs one executable path and may be specified only once\n");
+                return false;
+            }
+            opt.app_path = argv[++i];
+        } else if (a == L"--interface") {
+            if (!opt.app_interface.empty() || opt.has_interface_luid || i + 1 >= argc ||
+                argv[i + 1][0] == L'\0' || argv[i + 1][0] == L'-' || argv[i + 1][0] == L'+') {
+                std::printf("ERROR: --interface needs one index or alias; do not combine interface selectors\n");
+                return false;
+            }
+            opt.app_interface = argv[++i];
+            if (opt.app_interface.find_first_not_of(L"0123456789") == std::wstring::npos) {
+                uint64_t index = 0;
+                if (!ParseUnsignedDecimal(opt.app_interface.c_str(), ~uint32_t{0}, index) || index == 0) {
+                    std::printf("ERROR: --interface index must be from 1 to 4294967295\n");
+                    return false;
+                }
+            }
+        } else if (a == L"--interface-luid") {
+            if (opt.has_interface_luid || !opt.app_interface.empty() || i + 1 >= argc ||
+                !ParseInterfaceLuid(argv[++i], opt.app_interface_luid)) {
+                std::printf("ERROR: --interface-luid needs one unsigned 64-bit decimal or 0x value; do not combine interface selectors\n");
+                return false;
+            }
+            opt.has_interface_luid = true;
         } else if (a == L"--timestamps") {
             opt.timestamps = true;
         } else if (a == L"--process-events-only") {
@@ -546,6 +618,11 @@ bool ParseArgs(int argc, wchar_t** argv, Options& opt) {
         }
     }
 
+    if (opt.app_path.empty() != (opt.app_interface.empty() && !opt.has_interface_luid)) {
+        std::printf("ERROR: --app requires --interface or --interface-luid, and vice versa\n");
+        return false;
+    }
+
     // --match is optional. Without it the verdict applies to every connection,
     // which is a legitimate diagnostic mode but not a harmless one: a block
     // or drop cuts the network
@@ -611,6 +688,50 @@ std::wstring ResolveSysPath(const std::wstring& arg) {
     return path + L"portmaster-kext.sys";
 }
 
+bool ResolveAppInterface(Options& opt, std::string& error) {
+    const DWORD capacity = GetFullPathNameW(opt.app_path.c_str(), 0, nullptr, nullptr);
+    if (capacity == 0) {
+        error = "GetFullPathNameW(application) failed: error " + std::to_string(GetLastError());
+        return false;
+    }
+    std::wstring path(capacity, L'\0');
+    const DWORD length = GetFullPathNameW(opt.app_path.c_str(), capacity, path.data(), nullptr);
+    if (length == 0 || length >= capacity) {
+        error = "could not resolve the application path";
+        return false;
+    }
+    path.resize(length);
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+        error = "application path must name an existing file";
+        return false;
+    }
+    opt.app_path = std::move(path);
+
+    NET_LUID luid = {};
+    DWORD status = NO_ERROR;
+    if (opt.has_interface_luid) {
+        if (opt.app_interface_luid == 0) return true;
+        luid.Value = opt.app_interface_luid;
+    } else {
+        uint64_t index = 0;
+        if (ParseUnsignedDecimal(opt.app_interface.c_str(), ~uint32_t{0}, index)) {
+            status = ConvertInterfaceIndexToLuid(static_cast<NET_IFINDEX>(index), &luid);
+        } else {
+            status = ConvertInterfaceAliasToLuid(opt.app_interface.c_str(), &luid);
+        }
+    }
+    NET_IFINDEX index = 0;
+    if (status == NO_ERROR) status = ConvertInterfaceLuidToIndex(&luid, &index);
+    if (status != NO_ERROR || index == 0) {
+        error = "cannot resolve the selected interface: error " +
+            std::to_string(status == NO_ERROR ? ERROR_NOT_FOUND : status);
+        return false;
+    }
+    opt.app_interface_luid = luid.Value;
+    return true;
+}
+
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
@@ -666,11 +787,25 @@ int wmain(int argc, wchar_t** argv) {
         return 1;
     }
 
+    std::string error;
+    if (!opt.app_path.empty() && !ResolveAppInterface(opt, error)) {
+        std::fprintf(opt.process_events_only ? stderr : stdout,
+                     "\nERROR: app interface options: %s\n", error.c_str());
+        return 1;
+    }
+    if (!pmkext::monitor::EnableRoutePolicies(error)) {
+        std::fprintf(opt.process_events_only ? stderr : stdout,
+                     "\nERROR: cannot enable IPv4/IPv6 route policies: %s\n", error.c_str());
+        return 1;
+    }
+    if (!opt.process_events_only) {
+        std::printf("IPv4/IPv6 route policies: enabled (active store).\n");
+    }
+
     pmkext::Driver driver(L"PortmasterKext");
     g_driver = &driver;
     SetConsoleCtrlHandler(ConsoleHandler, TRUE);
 
-    std::string error;
     if (!driver.Install(sys_path, error, opt.inbound_udp_pid_fallback)) {
         std::fprintf(opt.process_events_only ? stderr : stdout,
                      "\nERROR: install failed: %s\n", error.c_str());
@@ -684,6 +819,22 @@ int wmain(int argc, wchar_t** argv) {
         std::fprintf(opt.process_events_only ? stderr : stdout,
                      "\nERROR: open device failed: %s\n", error.c_str());
         return 1;
+    }
+
+    if (!opt.app_path.empty()) {
+        if (!driver.SetAppInterface(opt.app_path, opt.app_interface_luid, error)) {
+            std::fprintf(opt.process_events_only ? stderr : stdout,
+                         "\nERROR: set app interface failed: %s\n", error.c_str());
+            return 1;
+        }
+        if (!opt.process_events_only) {
+            if (opt.app_interface_luid == 0) {
+                std::wprintf(L"App interface policy removed: %s\n", opt.app_path.c_str());
+            } else {
+                std::wprintf(L"App interface: %s -> LUID %llu\n", opt.app_path.c_str(),
+                             static_cast<unsigned long long>(opt.app_interface_luid));
+            }
+        }
     }
 
     if (opt.process_events_only &&

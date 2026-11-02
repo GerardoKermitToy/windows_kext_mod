@@ -334,14 +334,29 @@ pub(crate) fn restart_process_monitor(device: &device::Device) -> Result<(), NTS
     device.process_monitor.restart(&device.event_queue)
 }
 
+/// Serialize policy changes with handle cleanup and shutdown. A late command
+/// cannot recreate the policies of a session whose owner has already left.
+pub(crate) fn set_app_interface(device: &device::Device, file_object: *mut core::ffi::c_void, payload: &[u8]) -> Result<(), NTSTATUS> {
+    let _session_guard = DISPATCH_GATE.acquire_session();
+    if DISPATCH_GATE.is_unloading()
+        || DISPATCH_GATE.session_shutdown.load(Ordering::Acquire)
+        || file_object.is_null()
+        || device.owner_file_object.load(Ordering::Acquire) != file_object
+    {
+        return Err(STATUS_DEVICE_NOT_READY);
+    }
+    device.set_app_interface(payload)
+}
+
 /// Serializes permanent shutdown with CREATE and explicit process requests, so
 /// neither can reopen the process monitor after shutdown stops it.
-pub(crate) fn stop_process_session_for_shutdown(device: &device::Device) {
+pub(crate) fn stop_session_for_shutdown(device: &device::Device) {
     let _session_guard = DISPATCH_GATE.acquire_session();
     DISPATCH_GATE
         .session_shutdown
         .store(true, Ordering::Release);
     device.stop_process_monitor(true);
+    device.stop_app_interface_policies();
 }
 
 /// Loads the published Device pointer.
@@ -661,6 +676,7 @@ unsafe extern "system" fn driver_cleanup(
         if !file_object.is_null() && device.owner_file_object.load(Ordering::Acquire) == file_object
         {
             device.stop_process_monitor(false);
+            device.stop_app_interface_policies();
             // Stop new reads before signaling the wait. Reads that passed the
             // admission check are counted by DispatchGate and are drained below.
             close_and_wait_for_reads(device);
@@ -813,6 +829,11 @@ unsafe extern "system" fn device_control(
     };
 
     match control_code {
+        ControlCode::SetAppInterface => {
+            if let Err(status) = set_app_interface(device, control_request.get_file_object(), control_request.get_input_buffer()) {
+                return control_request.fail(status);
+            }
+        }
         ControlCode::Version => {
             wdk::info!("IOCTL: {}", control_code);
             if !control_request.write_exact(&VERSION) {

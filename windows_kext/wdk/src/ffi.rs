@@ -8,7 +8,7 @@ use windows_sys::{
     Win32::{
         Foundation::{BOOLEAN, HANDLE, NTSTATUS, UNICODE_STRING},
         NetworkManagement::WindowsFilteringPlatform::{
-            FWPM_CALLOUT0, FWPM_FILTER0, FWPM_PROVIDER_CONTEXT3, FWPM_SESSION0, FWPM_SUBLAYER0,
+            FWPM_CALLOUT0, FWPM_FILTER0, FWPM_FILTER_CONDITION0, FWPM_PROVIDER_CONTEXT3, FWPM_SESSION0, FWPM_SUBLAYER0, FWP_IP_VERSION,
             FWP_CONDITION_VALUE0, FWP_MATCH_TYPE, FWP_VALUE0,
         },
         Networking::WinSock::{ADDRESS_FAMILY, SCOPE_ID},
@@ -358,6 +358,10 @@ const _: () = {
 // #[link(name = "ndis", kind = "static")]
 #[link(name = "c_helper", kind = "static")]
 extern "system" {
+    // The pinned windows-sys declaration links this WDK routine to ntdll.dll;
+    // kernel code must resolve the ntoskrnl export through our native imports.
+    pub(crate) fn RtlDowncaseUnicodeChar(source: u16) -> u16;
+
     // fwpmk.h exports from fwpkclnt.sys return NTSTATUS. Do not use the
     // DWORD-returning fwpmu.h declarations from windows-sys for kernel calls.
     pub(crate) fn FwpmEngineOpen0(
@@ -369,6 +373,18 @@ extern "system" {
     ) -> NTSTATUS;
 
     pub(crate) fn FwpmEngineClose0(engineHandle: HANDLE) -> NTSTATUS;
+
+    // fwpmk.h (NTDDI_WIN11_ZN): kernel NTSTATUS, not the fwpmu.h Win32 DWORD.
+    pub(crate) fn FwpmConnectionPolicyAdd0(
+        engineHandle: HANDLE,
+        connectionPolicy: *const FWPM_PROVIDER_CONTEXT3,
+        ipVersion: FWP_IP_VERSION,
+        weight: u64,
+        numFilterConditions: u32,
+        filterConditions: *const FWPM_FILTER_CONDITION0,
+        sd: PSECURITY_DESCRIPTOR,
+    ) -> NTSTATUS;
+    pub(crate) fn FwpmConnectionPolicyDeleteByKey0(engineHandle: HANDLE, key: *const GUID) -> NTSTATUS;
 
     pub(crate) fn FwpmSubLayerAdd0(
         engineHandle: HANDLE,

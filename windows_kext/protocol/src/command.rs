@@ -18,6 +18,7 @@ pub enum CommandType {
     PrintMemoryStats      = 7,
     CleanEndedConnections = 8,
     StartProcessMonitoring = 9,
+    SetAppInterface        = 10,
 }
 
 // These are private wire-layout markers. They must not be exposed as borrowed
@@ -78,6 +79,18 @@ pub struct UpdateV6 {
     pub verdict: u8,
 }
 
+/// Canonical NUL-terminated UTF-16LE native path from FwpmGetAppIdFromFileName0.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetAppInterface<'a> {
+    /// Zero removes the policy; otherwise a native NET_LUID value.
+    pub luid: u64,
+    pub app_id: &'a [u8],
+}
+
+// Payload: LUID:u64 LE, app_id_size:u32 LE, app_id:UTF-16LE (including NUL).
+pub const SET_APP_INTERFACE_HEADER_SIZE: usize = 12;
+pub const MAX_APP_ID_SIZE: usize = 65534;
+
 pub const VERDICT_PAYLOAD_SIZE: usize = size_of::<VerdictWire>();
 pub const UPDATE_V4_PAYLOAD_SIZE: usize = size_of::<UpdateV4Wire>();
 pub const UPDATE_V6_PAYLOAD_SIZE: usize = size_of::<UpdateV6Wire>();
@@ -89,7 +102,7 @@ const _: () = {
 };
 
 impl CommandType {
-    /// Returns the exact payload size following the one-byte command type.
+    /// Returns the fixed payload size, or the header size for SetAppInterface.
     pub const fn payload_size(self) -> usize {
         match self {
             Self::Shutdown
@@ -102,6 +115,7 @@ impl CommandType {
             Self::Verdict => VERDICT_PAYLOAD_SIZE,
             Self::UpdateV4 => UPDATE_V4_PAYLOAD_SIZE,
             Self::UpdateV6 => UPDATE_V6_PAYLOAD_SIZE,
+            Self::SetAppInterface => SET_APP_INTERFACE_HEADER_SIZE,
         }
     }
 }
@@ -118,6 +132,9 @@ pub fn parse_type(bytes: &[u8]) -> Option<CommandType> {
 pub enum CommandParseError {
     Empty,
     UnknownType(u8),
+    InvalidPayloadLength {
+        command: CommandType,
+    },
     TruncatedPayload {
         command: CommandType,
         expected: usize,
@@ -127,8 +144,8 @@ pub enum CommandParseError {
 
 /// Splits the first complete command from a buffer of concatenated commands.
 ///
-/// Command payload sizes are fixed by [`CommandType`], so no additional batch
-/// header or per-command length field is required.
+/// Fixed commands need no size prefix. SetAppInterface carries its app-ID byte
+/// length in the header so it can be safely followed by another command.
 pub fn split_first_command(bytes: &[u8]) -> Result<(CommandType, &[u8], &[u8]), CommandParseError> {
     let Some(value) = bytes.first().copied() else {
         return Err(CommandParseError::Empty);
@@ -137,7 +154,14 @@ pub fn split_first_command(bytes: &[u8]) -> Result<(CommandType, &[u8], &[u8]), 
         return Err(CommandParseError::UnknownType(value));
     };
 
-    let expected = command.payload_size();
+    let mut expected = command.payload_size();
+    if command == CommandType::SetAppInterface && bytes.len() > expected {
+        let size = read_u32_le(bytes, 9).unwrap() as usize;
+        if !valid_app_id_size(size) {
+            return Err(CommandParseError::InvalidPayloadLength { command });
+        }
+        expected += size;
+    }
     let payload_end = 1 + expected;
     if bytes.len() < payload_end {
         return Err(CommandParseError::TruncatedPayload {
@@ -152,6 +176,12 @@ pub fn split_first_command(bytes: &[u8]) -> Result<(CommandType, &[u8], &[u8]), 
 
 /// Checks that a slice contains exactly one complete command payload.
 pub fn has_valid_payload_length(command: CommandType, payload: &[u8]) -> bool {
+    if command == CommandType::SetAppInterface {
+        return read_u32_le(payload, 8).is_some_and(|size| {
+            valid_app_id_size(size as usize)
+                && payload.len() == SET_APP_INTERFACE_HEADER_SIZE + size as usize
+        });
+    }
     payload.len() == command.payload_size()
 }
 
@@ -164,6 +194,11 @@ fn read_u16_le(bytes: &[u8], offset: usize) -> Option<u16> {
     Some(u16::from_le_bytes(value))
 }
 
+fn read_u32_le(bytes: &[u8], offset: usize) -> Option<u32> {
+    let value: [u8; 4] = bytes.get(offset..offset + 4)?.try_into().ok()?;
+    Some(u32::from_le_bytes(value))
+}
+
 fn read_u64_le(bytes: &[u8], offset: usize) -> Option<u64> {
     let value: [u8; 8] = bytes.get(offset..offset + 8)?.try_into().ok()?;
     Some(u64::from_le_bytes(value))
@@ -171,6 +206,31 @@ fn read_u64_le(bytes: &[u8], offset: usize) -> Option<u64> {
 
 fn read_array<const N: usize>(bytes: &[u8], offset: usize) -> Option<[u8; N]> {
     bytes.get(offset..offset + N)?.try_into().ok()
+}
+
+fn valid_app_id_size(size: usize) -> bool {
+    (4..=MAX_APP_ID_SIZE).contains(&size) && size % 2 == 0
+}
+
+pub fn parse_set_app_interface(bytes: &[u8]) -> Option<SetAppInterface<'_>> {
+    if !has_valid_payload_length(CommandType::SetAppInterface, bytes) {
+        return None;
+    }
+    let app_id = &bytes[SET_APP_INTERFACE_HEADER_SIZE..];
+    // The wire buffer can be unaligned. Never cast it to a UTF-16 slice.
+    if !app_id.starts_with(&[0x5c, 0]) || !app_id.ends_with(&[0, 0]) {
+        return None;
+    }
+    let units = app_id[..app_id.len() - 2]
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]));
+    if core::char::decode_utf16(units).any(|ch| !matches!(ch, Ok(ch) if ch != '\0')) {
+        return None;
+    }
+    Some(SetAppInterface {
+        luid: read_u64_le(bytes, 0)?,
+        app_id,
+    })
 }
 
 pub fn parse_verdict(bytes: &[u8]) -> Option<Verdict> {
@@ -279,6 +339,16 @@ fn test_go_command_file() {
                 CommandType::PrintMemoryStats => {}
                 CommandType::CleanEndedConnections => {}
                 CommandType::StartProcessMonitoring => {}
+                CommandType::SetAppInterface => {
+                    let mut header = [0; SET_APP_INTERFACE_HEADER_SIZE];
+                    file.read_exact(&mut header).unwrap();
+                    let size = read_u32_le(&header, 8).unwrap() as usize;
+                    assert!(valid_app_id_size(size));
+                    let mut buf = header.to_vec();
+                    buf.resize(header.len() + size, 0);
+                    file.read_exact(&mut buf[header.len()..]).unwrap();
+                    assert!(parse_set_app_interface(&buf).is_some());
+                }
             }
         } else {
             panic!("Unknown command: {}", command[0]);
@@ -377,4 +447,69 @@ fn decodes_unaligned_little_endian_payload() {
             verdict: 10,
         })
     );
+}
+
+#[cfg(test)]
+fn app_interface_payload(luid: u64, path: &str) -> Vec<u8> {
+    let app_id: Vec<u8> = path.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let mut payload = luid.to_le_bytes().to_vec();
+    payload.extend_from_slice(&(app_id.len() as u32).to_le_bytes());
+    payload.extend_from_slice(&app_id);
+    payload
+}
+
+#[test]
+fn app_interface_preserves_unicode_full_width_luid_and_unaligned_payload() {
+    let path = concat!(r"\device\harddiskvolume3\Тест\应用\é🚀.exe", "\0");
+    let payload = app_interface_payload(0xfedc_ba98_7654_3210, path);
+    let mut batch = vec![CommandType::SetAppInterface as u8];
+    batch.extend_from_slice(&payload);
+    batch.push(CommandType::GetLogs as u8);
+    let (command, data, rest) = split_first_command(&batch).unwrap();
+    assert_eq!(command, CommandType::SetAppInterface);
+    let parsed = parse_set_app_interface(data).unwrap();
+    assert_eq!(parsed.luid, 0xfedc_ba98_7654_3210);
+    let units: Vec<u16> = parsed
+        .app_id
+        .chunks_exact(2)
+        .map(|p| u16::from_le_bytes([p[0], p[1]]))
+        .collect();
+    assert_eq!(String::from_utf16(&units).unwrap(), path);
+    assert_eq!(rest, &[CommandType::GetLogs as u8]);
+    assert_eq!(
+        parse_set_app_interface(&app_interface_payload(0, path))
+            .unwrap()
+            .luid,
+        0
+    );
+}
+
+#[test]
+fn app_interface_rejects_truncation_oversize_nuls_and_bad_utf16() {
+    let valid = app_interface_payload(7, concat!(r"\device\volume\app.exe", "\0"));
+    let mut command = vec![CommandType::SetAppInterface as u8];
+    command.extend_from_slice(&valid);
+    for end in 1..command.len() {
+        assert!(split_first_command(&command[..end]).is_err());
+        assert!(parse_set_app_interface(&valid[..end - 1]).is_none());
+    }
+    for size in [0u32, 1, 2, 3, 65535, u32::MAX] {
+        let mut malformed = command.clone();
+        malformed[9..13].copy_from_slice(&size.to_le_bytes());
+        assert!(split_first_command(&malformed).is_err());
+    }
+    for path in [
+        concat!(r"C:\app.exe", "\0"),
+        r"\app.exe",
+        "\\bad\0name.exe\0",
+    ] {
+        assert!(parse_set_app_interface(&app_interface_payload(1, path)).is_none());
+    }
+    let mut malformed = valid.clone();
+    malformed[SET_APP_INTERFACE_HEADER_SIZE + 2..SET_APP_INTERFACE_HEADER_SIZE + 4]
+        .copy_from_slice(&0xd800u16.to_le_bytes());
+    assert!(parse_set_app_interface(&malformed).is_none());
+    let mut trailing = valid.clone();
+    trailing.push(0);
+    assert!(parse_set_app_interface(&trailing).is_none());
 }

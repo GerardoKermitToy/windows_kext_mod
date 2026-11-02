@@ -32,6 +32,154 @@ repository root:
 ctest --test-dir kext_client/build -C Release --output-on-failure
 ```
 
+## Monitor command-line interface selection
+
+Use `--app PATH` with exactly one interface selector:
+
+- `--interface INDEX_OR_ALIAS`: a nonzero decimal interface index, or the Windows
+  adapter alias (for example, `wg0` or `Ethernet 2`). The monitor resolves
+  it to a LUID using the documented IP Helper APIs.
+- `--interface-luid LUID`: the native 64-bit LUID in decimal or `0x` hexadecimal.
+  LUID zero removes an assignment. Other values must resolve to an existing
+  interface.
+
+```bash
+./kext_client/build/kext_monitor.exe --duration 30 --app "C:/Apps/client.exe" --interface 76 ./windows_kext/portmaster-kext.sys
+```
+
+```bash
+./kext_client/build/kext_monitor.exe --duration 30 --app "C:/Apps/client.exe" --interface "wg0" ./windows_kext/portmaster-kext.sys
+```
+
+One application is supported per monitor run. A relative Unicode application path
+is resolved to an absolute path; the file and interface are checked before
+`netsh` or service installation. The monitor does **not** launch the application.
+After opening the device, it calls `SetAppInterface` over IOCTL and stops startup
+on failure. The policy applies to new connections from every instance of that
+executable path, including future instances, and is removed when the monitor
+closes the device or exits. Existing connections are not migrated. Status output
+is suppressed in `--process-events-only` mode; fatal diagnostics remain on stderr.
+
+## Application interface policies
+
+`pmkext::Driver::SetAppInterface(const std::wstring& path, uint64_t luid,
+std::string& error, bool via_write = false)` installs an interface policy for
+**every instance of the executable at that path**, not for a PID. Pass a fully
+qualified Unicode executable filename and a native `NET_LUID::Value` (not an
+interface index). LUID zero removes the assignment; removing a missing assignment
+is successful and does not open a WFP session.
+
+The client uses `FwpmGetAppIdFromFileName0` to resolve the filename to WFP's
+canonical native application path. It sends that UTF-16LE blob unchanged: there
+is no ANSI conversion, locale-dependent lowercase operation, or UTF-8 path on
+the wire. The driver then applies Windows' native Unicode case mapping with
+`RtlDowncaseUnicodeChar` before lookup and WFP insertion. This matters on the test
+OS: `FwpmGetAppIdFromFileName0` preserved `Тест\\Приложение`, but ALE supplied
+`тест\\приложение`; using the userspace blob verbatim did not match. Normalization
+also makes replacement/removal use the same identity across case variants.
+Low-level clients must perform the filename-to-native-path resolution too; a plain
+DOS path is not a WFP app ID. Cyrillic, CJK, accented Latin characters, surrogate
+pairs such as emoji, and Unicode case variants are covered by tests.
+
+Both transports use the same payload:
+
+```text
+luid:        u64 little-endian
+app_id_size: u32 little-endian (bytes, including the UTF-16 NUL terminator)
+app_id:      app_id_size bytes of canonical UTF-16LE native path
+```
+
+- IOCTL `SetAppInterface`: `CTL_CODE(40000, 0x804, METHOD_BUFFERED,
+  FILE_READ_DATA | FILE_WRITE_DATA)` = `0x9c40e010`. The payload is input-only;
+  there is no output buffer or response body.
+- `WriteFile`: byte `10` (`CommandType::SetAppInterface`), then that payload.
+  The explicit app-ID byte size permits concatenating this variable-size command
+  with other commands in one write. Commands before an invalid record remain
+  applied, as with the existing fixed-size commands.
+
+The driver rejects oversized paths (more than 65,534 bytes), odd byte counts,
+missing or embedded NUL terminators, malformed UTF-16, and truncated payloads.
+It calls the kernel `FwpmConnectionPolicyAdd0` with `FWPM_CONDITION_ALE_APP_ID`
+and `FWP_NETWORK_CONNECTION_POLICY_NEXT_HOP_INTERFACE` (`FWP_UINT64`). IPv4 and
+IPv6 policies are added, replaced, or removed in one WFP transaction. Failed
+updates preserve the previous pair. Setting an unchanged assignment is a no-op.
+WFP management failures are returned to the caller, rather than logged as success.
+
+Policies belong to a separate dynamic WFP session. Device-handle cleanup or
+shutdown closes it and removes all assignments. Process exit does **not** delete
+a path policy: other instances may still be running or start later. No process
+monitoring, timer, userspace decision, or new per-packet driver lookup is needed.
+Updates are serialized at `PASSIVE_LEVEL`, never under a packet-path spin lock.
+
+This uses the newer Windows 11 kernel connection-policy API (WDK guard
+`NTDDI_WIN11_ZN`), which must be exported by the target OS. The driver directly
+imports it; older Windows versions without those exports cannot load this build.
+Interface selection is a routing policy for new connections, not a migration of
+already-established flows. It does not apply to other executable paths, child
+executables, or DNS requests made by a separate DNS service.
+
+**Required OS setting:** route-policy evaluation is independently enabled for
+IPv4 and IPv6. `FwpmConnectionPolicyAdd0` can succeed while this setting is
+**disabled**, in which case the stack keeps using the normal route. Check
+`netsh interface ipv4 show global` / `netsh interface ipv6 show global`.
+To enable evaluation for the current boot (Administrator):
+
+```bash
+netsh interface ipv4 set global routepolicies=enabled store=active
+```
+
+```bash
+netsh interface ipv6 set global routepolicies=enabled store=active
+```
+
+`kext_monitor` checks active IPv4 **and** IPv6 route policies before loading the
+driver. Each family is queried independently through `NsiGetAllParameters`, linked
+normally through `build/nsi.lib` generated from `src/nsi.def`; there is no manual
+`LoadLibrary`/`GetProcAddress`. The library imports only this read-only query,
+never an NSI setter. The IP global-table layout is a private Windows ABI: only a
+successful exact-size query with the route-policy flag equal to `1` confirms that
+evaluation is enabled. A disabled flag, unexpected value, incompatible layout, or
+query error all mean "not confirmed".
+
+For each unconfirmed family, the monitor enables evaluation through the system
+`netsh.exe` using the corresponding command above. Confirmed families do **not**
+launch netsh. The executable is selected from the Windows system directory and
+launched directly without a shell or PATH lookup. Each command is idempotent;
+netsh is the only configuration-writing path, with no NSI or registry writes.
+Netsh output is suppressed so localized messages do not mix with monitor records.
+Every attempted command must succeed; creation failures, nonzero exit codes, or
+a 10-second timeout per child stop startup with a family-specific error before
+loading the driver. A timed-out child is terminated. When NSI cannot confirm the
+state, successful netsh completion is the fallback result; NSI compatibility is
+not required for startup. The OS loader must provide the imported NSI query.
+These are independent active-store changes: if IPv6 activation fails after IPv4
+succeeds, IPv4 remains enabled.
+
+Help, invalid arguments, a missing driver file, and a rejected duplicate instance
+do not change these settings. Both stay enabled after the monitor exits; neither
+change is persisted across reboot.
+
+The driver and client library do not change this machine-wide setting, interface
+metrics, or route tables. `store=active` does not persist across reboot; persistent
+configuration is a separate administrator decision. Applications using only the
+library still require explicit administrator configuration for both address
+families. To restore a previously disabled active setting, use the same command
+with `routepolicies=disabled`.
+
+After building, the bounded Administrator-only runtime probe checks native WFP
+objects, both command transports, replacement/removal, handle cleanup, and actual
+TCP interface selection. It is deliberately **not** registered with offline CTest:
+
+```bash
+./kext_client/build/app_interface_runtime.exe --duration 30 ./windows_kext/portmaster-kext.sys --interface-address 10.94.59.5
+```
+
+The optional interface address selects a second adapter with a usable route.
+The live probe makes short TCP connections to `1.1.1.1:443`, sends no application
+data, and fails if the policy is stored but does not change the observed route.
+Successful IOCTL completion proves policy installation, not successful egress:
+OS support and a usable route on the selected interface remain necessary.
+
 ## Process lifecycle events
 
 Loading the driver or opening its device does **not** start process collection.

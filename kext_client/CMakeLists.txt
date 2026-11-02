@@ -17,7 +17,7 @@ add_library(pmkext STATIC
 target_include_directories(pmkext PUBLIC include)
 
 # Advapi32 provides SCM functions; Ws2_32 provides IP literal parsing.
-target_link_libraries(pmkext PUBLIC advapi32 ws2_32)
+target_link_libraries(pmkext PUBLIC advapi32 ws2_32 fwpuclnt)
 
 if(MSVC)
     target_compile_options(pmkext PRIVATE /W4 /permissive-)
@@ -42,12 +42,45 @@ else()
     )
 endif()
 
+# Import only the read-only NSI query. Configuration changes stay in netsh.
+set(NSI_IMPORT_LIBRARY "${CMAKE_CURRENT_BINARY_DIR}/nsi.lib")
+set(NSI_DEFINITION "${CMAKE_CURRENT_SOURCE_DIR}/src/nsi.def")
+if(MSVC)
+    if(CMAKE_CXX_COMPILER_ARCHITECTURE_ID STREQUAL "ARM64")
+        set(NSI_MACHINE ARM64)
+    elseif(CMAKE_SIZEOF_VOID_P EQUAL 8)
+        set(NSI_MACHINE X64)
+    else()
+        message(FATAL_ERROR "The monitor's NSI query ABI requires a 64-bit target.")
+    endif()
+    add_custom_command(OUTPUT "${NSI_IMPORT_LIBRARY}"
+        COMMAND "${CMAKE_AR}" /nologo "/def:${NSI_DEFINITION}"
+                "/machine:${NSI_MACHINE}" "/out:${NSI_IMPORT_LIBRARY}"
+        DEPENDS "${NSI_DEFINITION}"
+        BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/nsi.exp"
+        VERBATIM)
+else()
+    if(NOT CMAKE_DLLTOOL OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+        message(FATAL_ERROR "Generating nsi.lib requires a 64-bit target and dlltool.")
+    endif()
+    add_custom_command(OUTPUT "${NSI_IMPORT_LIBRARY}"
+        COMMAND "${CMAKE_DLLTOOL}" --input-def "${NSI_DEFINITION}"
+                --output-lib "${NSI_IMPORT_LIBRARY}"
+        DEPENDS "${NSI_DEFINITION}"
+        VERBATIM)
+endif()
+add_custom_target(nsi_import_library DEPENDS "${NSI_IMPORT_LIBRARY}")
+add_library(nsi_import STATIC IMPORTED)
+set_target_properties(nsi_import PROPERTIES IMPORTED_LOCATION "${NSI_IMPORT_LIBRARY}")
+add_dependencies(nsi_import nsi_import_library)
+
 # Console monitor.
 add_executable(kext_monitor
     src/main.cpp
+    src/RoutePolicies.cpp
 )
 
-target_link_libraries(kext_monitor PRIVATE pmkext)
+target_link_libraries(kext_monitor PRIVATE pmkext iphlpapi nsi_import)
 
 # wmain requires the Unicode entry point.
 if(MSVC)
@@ -69,6 +102,33 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(route_policy_tests tests/route_policy_tests.cpp src/RoutePolicies.cpp)
+    target_include_directories(route_policy_tests PRIVATE src)
+    target_link_libraries(route_policy_tests PRIVATE pmkext nsi_import)
+    add_test(NAME route_policy_tests COMMAND route_policy_tests)
+    set_tests_properties(route_policy_tests PROPERTIES TIMEOUT 10)
+
+    add_test(NAME app_interface_cli_tests
+        COMMAND "${CMAKE_COMMAND}" "-DMONITOR=$<TARGET_FILE:kext_monitor>"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/app_interface_cli_tests.cmake")
+    set_tests_properties(app_interface_cli_tests PROPERTIES TIMEOUT 30)
+
+    add_executable(app_interface_tests tests/app_interface_tests.cpp)
+    target_link_libraries(app_interface_tests PRIVATE pmkext)
+    add_test(NAME app_interface_tests COMMAND app_interface_tests)
+    set_tests_properties(app_interface_tests PROPERTIES TIMEOUT 15)
+
+    # Explicit bounded administrator-only probe; never load a driver in CTest.
+    add_executable(app_interface_runtime tests/app_interface_runtime.cpp)
+    target_link_libraries(app_interface_runtime PRIVATE pmkext iphlpapi)
+    if(MSVC)
+        target_compile_options(app_interface_tests PRIVATE /utf-8)
+        target_compile_options(app_interface_runtime PRIVATE /utf-8)
+        target_link_options(app_interface_runtime PRIVATE /ENTRY:wmainCRTStartup)
+    else()
+        target_link_options(app_interface_runtime PRIVATE -municode)
+    endif()
+
     add_executable(verdict_tests tests/verdict_tests.cpp)
     target_link_libraries(verdict_tests PRIVATE pmkext)
     add_test(NAME verdict_tests COMMAND verdict_tests)

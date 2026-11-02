@@ -43,6 +43,7 @@ enum class CommandType : uint8_t {
     PrintMemoryStats      = 7,
     CleanEndedConnections = 8,
     StartProcessMonitoring = 9,
+    SetAppInterface    = 10,
 };
 
 // Verdict, from driver/src/connection.rs:22
@@ -246,6 +247,15 @@ public:
     // via_write selects the equivalent one-byte WriteFile command (9).
     bool StartProcessMonitoring(std::string& error, bool via_write = false);
 
+    // Selects an interface for new IPv4/IPv6 connections from every instance of
+    // the executable at path (a fully qualified Unicode filename). The client
+    // uses FwpmGetAppIdFromFileName0; the driver matches FWPM_CONDITION_ALE_APP_ID.
+    // LUID 0 removes the policy. Policies also end on handle cleanup/shutdown,
+    // not on process exit. Requires the Windows 11 kernel connection-policy API.
+    // IOCTL 0x9c40e010 by default; via_write selects command 10.
+    bool SetAppInterface(const std::wstring& path, uint64_t luid, std::string& error,
+                         bool via_write = false);
+
     // Commands written to the device (protocol/src/command.rs).
     bool SendVerdict(uint64_t id, Verdict verdict, std::string& error);
     bool RequestLogs(std::string& error);
@@ -261,8 +271,11 @@ public:
 private:
     friend struct DriverTestAccess;
 
+    static bool BuildAppInterfaceCommand(const std::wstring& path, uint64_t luid,
+                                         std::vector<uint8_t>& command, std::string& error);
     bool SendCommand(const uint8_t* data, size_t len, std::string& error);
-    bool DeviceControl(uint32_t code, uint8_t* out, uint32_t out_len, std::string& error);
+    bool DeviceControl(uint32_t code, uint8_t* out, uint32_t out_len, std::string& error,
+                       const uint8_t* input = nullptr, uint32_t input_len = 0);
     // Consumes whole records from buffer_, returns bytes consumed.
     size_t Dispatch(const Handlers& handlers);
     void ReaderLoop(const Handlers& handlers);

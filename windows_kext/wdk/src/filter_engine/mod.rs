@@ -17,6 +17,7 @@ use self::classify::ClassifyOut;
 use self::layer::IncomingValues;
 use self::metadata::FwpsIncomingMetadataValues;
 
+pub mod app_interface;
 pub mod callout;
 pub mod callout_data;
 pub(crate) mod classify;
