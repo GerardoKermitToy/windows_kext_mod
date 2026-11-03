@@ -14,8 +14,20 @@ use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
 use self::callout::{Callout, FilterType};
 use self::callout_data::{CalloutData, CalloutDataParts};
 use self::classify::ClassifyOut;
-use self::layer::IncomingValues;
+use self::layer::{IncomingValues, Layer};
 use self::metadata::FwpsIncomingMetadataValues;
+
+const DEFAULT_SUBLAYER_WEIGHT: u16 = u16::MAX;
+// Native NAT runs in UNIVERSAL (0x8000). Leave room for BFE's collision
+// adjustment: requesting the occupied 0x7FFF can move us above UNIVERSAL.
+const INBOUND_PACKET_SUBLAYER_WEIGHT: u16 = 0x7000;
+
+fn filter_sublayer_guid(layer: Layer, default_guid: u128, inbound_packet_guid: u128) -> u128 {
+    match layer {
+        Layer::InboundIppacketV4 | Layer::InboundIppacketV6 => inbound_packet_guid,
+        _ => default_guid,
+    }
+}
 
 pub mod app_interface;
 pub mod callout;
@@ -38,6 +50,7 @@ pub struct FilterEngine {
     device_object: *mut c_void,
     handle: HANDLE,
     sublayer_guid: u128,
+    inbound_packet_sublayer_guid: u128,
     committed: bool,
     callouts: Option<Vec<Box<Callout>>>,
 }
@@ -56,7 +69,11 @@ pub enum UnregisterCalloutsResult {
 }
 
 impl FilterEngine {
-    pub fn new(driver: &Driver, layer_guid: u128) -> Result<Self, String> {
+    pub fn new(
+        driver: &Driver,
+        layer_guid: u128,
+        inbound_packet_sublayer_guid: u128,
+    ) -> Result<Self, String> {
         let device_object = driver.get_device_object();
         if device_object.is_null() {
             return Err("WDF control device has no WDM device object".to_owned());
@@ -76,6 +93,7 @@ impl FilterEngine {
             device_object,
             handle: filter_engine_handle,
             sublayer_guid: layer_guid,
+            inbound_packet_sublayer_guid,
             committed: false,
             callouts: None,
         })
@@ -111,13 +129,14 @@ impl FilterEngine {
     fn commit_inner(&mut self, callouts: Vec<Callout>) -> Result<(), String> {
         let mut filter_engine = Transaction::begin_write(self)?;
         filter_engine
-            .register_sublayer()
+            .register_sublayers()
             .map_err(|err| format!("filter_engine: {}", err))?;
 
         dbg!("Callouts count: {}", callouts.len());
         let device_object = filter_engine.device_object;
         let filter_engine_handle = filter_engine.handle;
         let sublayer_guid = filter_engine.sublayer_guid;
+        let inbound_packet_sublayer_guid = filter_engine.inbound_packet_sublayer_guid;
 
         for callout in callouts {
             let mut callout = Box::new(callout);
@@ -140,7 +159,10 @@ impl FilterEngine {
                 callout.register_runtime_callout(device_object, catch_all_callout)?;
             }
             callout.register_management_callout(filter_engine_handle)?;
-            callout.register_filter(filter_engine_handle, sublayer_guid)?;
+            callout.register_filter(
+                filter_engine_handle,
+                filter_sublayer_guid(callout.layer, sublayer_guid, inbound_packet_sublayer_guid),
+            )?;
 
             dbg!(
                 "registering callout: {} -> {}",
@@ -166,6 +188,7 @@ impl FilterEngine {
         };
         let filter_engine_handle = filter_engine.handle;
         let sublayer_guid = filter_engine.sublayer_guid;
+        let inbound_packet_sublayer_guid = filter_engine.inbound_packet_sublayer_guid;
         let old_filter_ids = filter_engine
             .callouts
             .as_ref()
@@ -187,7 +210,14 @@ impl FilterEngine {
                         }
                         // Create new filter. `register_filter` records the new
                         // ID, but the old ID snapshot is restored if commit fails.
-                        if let Err(err) = callout.register_filter(filter_engine_handle, sublayer_guid) {
+                        if let Err(err) = callout.register_filter(
+                            filter_engine_handle,
+                            filter_sublayer_guid(
+                                callout.layer,
+                                sublayer_guid,
+                                inbound_packet_sublayer_guid,
+                            ),
+                        ) {
                             return Err(format!("filter_engine: {}", err));
                         }
                     }
@@ -211,18 +241,23 @@ impl FilterEngine {
         result
     }
 
-    fn register_sublayer(&self) -> Result<(), String> {
-        let result = ffi::register_sublayer(
+    fn register_sublayers(&self) -> Result<(), String> {
+        ffi::register_sublayer(
             self.handle,
             "PortmasterSublayer",
-            "The Portmaster sublayer holds all it's filters.",
+            "The Portmaster sublayer holds non-receive-packet filters.",
             self.sublayer_guid,
-        );
-        if let Err(code) = result {
-            return Err(format!("failed to register sublayer: {}", code));
-        }
-
-        Ok(())
+            DEFAULT_SUBLAYER_WEIGHT,
+        )
+        .map_err(|err| format!("failed to register sublayer: {}", err))?;
+        ffi::register_sublayer(
+            self.handle,
+            "PortmasterInboundPacketSublayer",
+            "Portmaster receive-packet filters run after native NAT.",
+            self.inbound_packet_sublayer_guid,
+            INBOUND_PACKET_SUBLAYER_WEIGHT,
+        )
+        .map_err(|err| format!("failed to register inbound packet sublayer: {}", err))
     }
 
     fn unregister_runtime_callouts(&mut self) -> Result<UnregisterCalloutsResult, String> {
@@ -259,7 +294,7 @@ impl FilterEngine {
         }
 
         // The session is dynamic, so a successful close synchronously removes
-        // its filters, management callouts, and sublayer. Runtime FWPS callouts
+        // its filters, management callouts, and sublayers. Runtime FWPS callouts
         // intentionally remain registered until the caller performs the
         // separate unregister step below.
         ffi::filter_engine_close(self.handle)
@@ -424,6 +459,46 @@ unsafe extern "system" fn catch_all_callout(
         {
             let (action, flags) = classify_out.perf_result();
             perf_span.set_result(action, flags);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inbound_packet_filters_run_below_native_nat() {
+        assert!(INBOUND_PACKET_SUBLAYER_WEIGHT <= 0x7000);
+        for layer in [Layer::InboundIppacketV4, Layer::InboundIppacketV6] {
+            assert_eq!(filter_sublayer_guid(layer, 11, 22), 22);
+        }
+    }
+
+    #[test]
+    fn other_filters_keep_their_original_sublayer_and_priority() {
+        assert_eq!(DEFAULT_SUBLAYER_WEIGHT, u16::MAX);
+        for layer in [
+            Layer::OutboundIppacketV4,
+            Layer::OutboundIppacketV6,
+            Layer::AleAuthConnectV4,
+            Layer::AleAuthConnectV6,
+            Layer::AleAuthRecvAcceptV4,
+            Layer::AleAuthRecvAcceptV6,
+            Layer::AleResourceAssignmentV4,
+            Layer::AleResourceAssignmentV6,
+            Layer::AleResourceReleaseV4,
+            Layer::AleResourceReleaseV6,
+            Layer::AleEndpointClosureV4,
+            Layer::AleEndpointClosureV6,
+            Layer::AleFlowEstablishedV4,
+            Layer::AleFlowEstablishedV6,
+            Layer::StreamV4,
+            Layer::StreamV6,
+            Layer::DatagramDataV4,
+            Layer::DatagramDataV6,
+        ] {
+            assert_eq!(filter_sublayer_guid(layer, 11, 22), 11);
         }
     }
 }

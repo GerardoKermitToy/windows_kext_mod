@@ -130,6 +130,7 @@ pub(crate) fn register_sublayer(
     name: &str,
     description: &str,
     guid: u128,
+    weight: u16,
 ) -> Result<(), String> {
     let Ok(name) = U16CString::from_str(name) else {
         return Err("invalid argument name".to_owned());
@@ -144,7 +145,7 @@ pub(crate) fn register_sublayer(
         sublayer.displayData.name = name.as_ptr() as _;
         sublayer.displayData.description = description.as_ptr() as _;
         sublayer.flags = 0;
-        sublayer.weight = 0xFFFF; // Set to Max value. Weight compared to other sublayers.
+        sublayer.weight = weight;
 
         let status = FwpmSubLayerAdd0(filter_engine_handle, &sublayer, core::ptr::null_mut());
         check_ntstatus(status)?;

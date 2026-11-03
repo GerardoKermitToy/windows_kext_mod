@@ -191,8 +191,12 @@ impl Device {
         let app_interfaces = PassiveMutex::new(AppInterfacePolicies::new())
             .map_err(|err| format!("app interface lock error: {}", err))?;
 
-        let filter_engine = FilterEngine::new(driver, 0x7dab1057_8e2b_40c4_9b85_693e381d7896)
-            .map_err(|err| alloc::format!("filter engine error: {}", err))?;
+        let filter_engine = FilterEngine::new(
+            driver,
+            0x7dab1057_8e2b_40c4_9b85_693e381d7896,
+            0x6fa23e94_a0fc_45e3_a17e_8a738ead6f42,
+        )
+        .map_err(|err| alloc::format!("filter engine error: {}", err))?;
         // Initialize the passive-level lock before publishing the Device. WFP
         // filters are committed separately, after the complete Device has been
         // stored in the global pointer.

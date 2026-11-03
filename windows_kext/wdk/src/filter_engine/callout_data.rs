@@ -414,6 +414,10 @@ impl<'a> CalloutData<'a> {
         ClassifyDefer::reauthorization(packet_list)
     }
 
+    pub fn can_set_action(&self) -> bool {
+        self.classify_out.can_set_action()
+    }
+
     pub fn action_permit(&mut self) {
         self.provisional_block = false;
         self.classify_out.action_permit();
@@ -518,6 +522,45 @@ mod tests {
             classify_context: core::ptr::null(),
             layer_data: core::ptr::null_mut(),
         })
+    }
+
+    #[test]
+    fn action_write_check_preserves_an_already_absorbed_packet() {
+        let metadata = empty_metadata();
+        let mut classify_out = ClassifyOut::test_writable();
+        classify_out.action_block();
+        classify_out.set_absorb();
+        classify_out.clear_write_flag();
+        {
+            let data = callout_data(&mut classify_out, &metadata);
+            assert!(!data.can_set_action());
+        }
+        assert!(classify_out.test_is_block());
+        assert!(classify_out.test_absorbs());
+        assert!(!classify_out.can_set_action());
+    }
+
+    #[test]
+    fn action_write_check_preserves_a_nonwritable_permit() {
+        let metadata = empty_metadata();
+        let mut classify_out = ClassifyOut::test_writable();
+        classify_out.action_permit();
+        classify_out.clear_write_flag();
+        {
+            let data = callout_data(&mut classify_out, &metadata);
+            assert!(!data.can_set_action());
+        }
+        assert!(classify_out.test_is_permit());
+        assert!(!classify_out.test_absorbs());
+        assert!(!classify_out.can_set_action());
+    }
+
+    #[test]
+    fn action_write_check_allows_a_writable_indication() {
+        let metadata = empty_metadata();
+        let mut classify_out = ClassifyOut::test_writable();
+        let data = callout_data(&mut classify_out, &metadata);
+        assert!(data.can_set_action());
     }
 
     #[test]

@@ -146,6 +146,13 @@ fn ip_packet_layer(
     direction: Direction,
     fields: PacketLayerFields,
 ) {
+    // A higher-priority provider may already have absorbed the packet (for
+    // example, NAT forwarding). Never clone or reinject an indication whose
+    // action is no longer ours to change.
+    if !data.can_set_action() {
+        return;
+    }
+
     // Fail closed until a later path explicitly permits the indication. Do not
     // make this provisional action hard: the callback still needs to replace it.
     data.set_default_block_and_absorb();
