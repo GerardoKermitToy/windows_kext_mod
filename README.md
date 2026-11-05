@@ -789,17 +789,24 @@ This protected value cannot be changed from the running target system. Do not ch
 Copy the public **`localhost-pk.der`** certificate to a firmware-readable USB drive (typically FAT32). Do not put the PFX/private keys on that drive. Enter the machine's UEFI/BIOS settings:
 
 1. Switch Secure Boot key management from **Standard Mode** to **Custom Mode**. The exact menu names and enrollment procedure depend on the firmware vendor.
-2. In **Platform Key (PK)** management, replace/enroll the PK using **`localhost-pk.der`**, the same certificate whose private key signed `SiPolicy.p7b`. This certificate belongs in **PK**, not in db or KEK. The KM driver certificate is authorized by the CI policy and does not need to be enrolled as the firmware PK.
+2. In **Platform Key (PK)** management, replace/enroll the PK using **`localhost-pk.der`**, the same certificate whose private key signed `SiPolicy.p7b`. Enrolling this custom PK is **required for the driver-signing procedure described here**, regardless of firmware version. This certificate belongs in **PK**, not in db or KEK. The KM driver certificate is authorized by the CI policy and does not need to be enrolled as the firmware PK.
 3. Preserve the existing **KEK, db, and dbx** entries needed to boot Windows and maintain revocations. Do not use a blanket **Clear all Secure Boot keys** operation. Ensure db trusts the certificate chain of the installed Windows boot manager.
-4. Leave **Secure Boot enabled and active**, save the firmware settings, and boot the configured Windows installation. **Custom Mode is not the same as disabling Secure Boot**; the machine must not remain in Setup Mode without an enrolled PK.
+4. Before booting Windows, check the Microsoft certificates in KEK and db and, if needed, add the certificates described below.
+5. Leave **Secure Boot enabled and active**, save the firmware settings, and boot the configured Windows installation. **Custom Mode is not the same as disabling Secure Boot**; the machine must not remain in Setup Mode without an enrolled PK.
 
-**Optional Microsoft certificate updates.** If the appropriate current Microsoft certificates are not already installed, firmware may allow appending them to **db**. Microsoft's [Secure Boot certificate-expiration and CA-update guidance](https://support.microsoft.com/en-us/servicing/os/secure-boot/2025/06/windows-secure-boot-certificate-expiration-and-ca-updates) explains the transition. Public db certificates are available in Microsoft's [secureboot_objects repository](https://github.com/microsoft/secureboot_objects/tree/main/PreSignedObjects/DB/Certificates), including:
+**Microsoft KEK and db certificate updates.** Manually adding these certificates is particularly relevant on some systems with **AMI BIOS/UEFI**. On newer firmware the necessary certificates may already be present, so adding them again may not be necessary. Check the actual firmware entries rather than relying on the firmware manufacturer or age alone. Microsoft's [Secure Boot certificate-expiration and CA-update guidance](https://support.microsoft.com/en-us/servicing/os/secure-boot/2025/06/windows-secure-boot-certificate-expiration-and-ca-updates) explains the transition.
 
-- `windows uefi ca 2023.der` — Windows bootloaders;
-- `microsoft uefi ca 2023.der` — third-party bootloaders/EFI applications;
-- `microsoft option rom uefi ca 2023.der` — third-party option ROMs.
+When an update is needed, download the public DER certificates from the Microsoft repository, copy them to the firmware-readable USB drive, and use the firmware's Secure Boot key-management menus to **append** them to the indicated stores:
 
-Append only the certificates appropriate for the machine; do not replace the entire db or put these certificates in the PK slot. The linked directory contains **db certificates**, not the Microsoft KEK update. Follow the separate Microsoft/OEM guidance for KEK updates; adding db certificates alone does not complete the whole certificate-transition process.
+- **KEK** — [`microsoft corporation kek 2k ca 2023.der`](https://github.com/microsoft/secureboot_objects/tree/main/PreSignedObjects/KEK/Certificates). This is a Key Exchange Key certificate for authorizing Secure Boot database updates.
+- **db** — from the [Microsoft db certificates directory](https://github.com/microsoft/secureboot_objects/tree/main/PreSignedObjects/DB/Certificates):
+  - `windows uefi ca 2023.der` — Windows bootloaders;
+  - `microsoft option rom uefi ca 2023.der` — third-party option ROMs;
+  - `microsoft uefi ca 2023.der` — third-party bootloaders and EFI applications.
+
+In practice, adding **only `windows uefi ca 2023.der` to db** is sufficient for a Windows boot manager signed by that CA to boot, provided the rest of its boot chain is trusted and not revoked. The other db certificates cover third-party bootloaders, EFI applications, and option ROMs; the KEK certificate is for database updates. A Windows-only boot test does not establish that those other components or future certificate updates will work.
+
+Append only certificates appropriate for the machine. Do not replace the entire KEK or db, remove dbx revocations, or put Microsoft KEK/db certificates in the PK slot. Firmware menus and accepted file formats vary; follow the manufacturer's instructions if direct DER import is not supported.
 
 After Windows starts, verify from an elevated Windows PowerShell session:
 
