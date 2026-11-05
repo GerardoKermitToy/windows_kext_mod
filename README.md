@@ -1,3 +1,5 @@
+**English** | [Русский](README.ru.md)
+
 # Modified Portmaster Windows Kernel Extension
 
 This repository contains a modified version of the original Portmaster Windows Kernel Extension. **Version 3.0.0.0 is not API-compatible with the original Portmaster Windows Kernel Extension.** The driver and its user-mode client must both support the version 3 connection-event format described below.
