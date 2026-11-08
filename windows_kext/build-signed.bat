@@ -44,6 +44,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
     "$metadata = Get-Content -LiteralPath '%~dp0release\templates\version.rc' -Raw;" ^
     "$metadata = $metadata.Replace('{{version}}', ($version -join ', ')).Replace('{{version_str}}', ($version -join '.'));" ^
     "$metadata = $metadata.Replace('Portmaster Windows Kernel Extension Driver', 'WFP Callout Driver').Replace('PortmasterKext64.sys', 'portmaster-kext.sys');" ^
+    "$productNameKey = 'VALUE ' + [char]34 + 'ProductName' + [char]34 + ', ' + [char]34;" ^
+    "$metadata = $metadata.Replace($productNameKey + 'Portmaster Windows Kernel Extension' + [char]34, $productNameKey + 'FirewallX Windows Kernel Extension' + [char]34);" ^
+    "$copyrightKey = 'VALUE ' + [char]34 + 'LegalCopyright' + [char]34 + ', ' + [char]34;" ^
+    "$comment = 'VALUE ' + [char]34 + 'Comments' + [char]34 + ', ' + [char]34 + 'https://github.com/GerardoKermitToy/windows_kext_mod' + [char]34;" ^
+    "$metadata = $metadata.Replace($copyrightKey, $comment + [Environment]::NewLine + '            ' + $copyrightKey + 'skrudjmdk & ');" ^
     "Set-Content -LiteralPath '%VERSION_RC%' -Value $metadata -Encoding ASCII"
 if errorlevel 1 exit /b 1
 
