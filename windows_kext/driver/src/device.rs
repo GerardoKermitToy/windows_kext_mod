@@ -30,6 +30,7 @@ use windows_sys::Win32::Foundation::{
 };
 
 use crate::{
+    address_monitor::{self, AddressMonitor},
     array_holder::ArrayHolder,
     bandwidth::Bandwidth,
     callouts,
@@ -114,6 +115,7 @@ impl CommandWriteError {
 
 // Device Context
 pub struct Device {
+    pub(crate) address_monitor: AddressMonitor,
     pub(crate) filter_engine: PassiveMutex<FilterEngine>,
     app_interfaces: PassiveMutex<AppInterfacePolicies>,
     /// Serializes the complete event-stream read transaction: consuming a saved
@@ -188,6 +190,7 @@ impl Device {
         let read_stream = PassiveMutex::new(ArrayHolder::default())
             .map_err(|err| format!("read stream lock error: {}", err))?;
         let process_monitor = ProcessMonitor::new()?;
+        let address_monitor = AddressMonitor::new()?;
         let app_interfaces = PassiveMutex::new(AppInterfacePolicies::new())
             .map_err(|err| format!("app interface lock error: {}", err))?;
 
@@ -204,6 +207,7 @@ impl Device {
             .map_err(|err| format!("filter engine lock error: {}", err))?;
 
         Ok(Self {
+            address_monitor,
             filter_engine,
             app_interfaces,
             read_stream,
@@ -233,6 +237,12 @@ impl Device {
             .lock()
             .map_err(|err| format!("failed to acquire filter engine: {}", err))?;
         filter_engine.commit(callouts::get_callout_vec())
+    }
+
+    pub(crate) fn refresh_local_addresses(&self) -> Result<(), NTSTATUS> {
+        let addresses = address_monitor::local_address_ranges()?;
+        self.app_interfaces.lock().map_err(|_| STATUS_INVALID_DEVICE_STATE)?
+            .update_addresses(addresses)
     }
 
     pub(crate) fn set_app_interface(&self, payload: &[u8]) -> Result<(), NTSTATUS> {
@@ -901,6 +911,7 @@ impl Device {
     /// runtime registration is gone. Injection-handle destruction is last because
     /// WFP waits for all pending injections before each handle is destroyed.
     pub fn prepare_unload(&self) {
+        self.address_monitor.stop();
         self.drain_udp_flow_contexts();
         self.unregister_wfp_state();
         self.destroy_injection_handles();
@@ -1330,6 +1341,7 @@ impl Device {
 
 impl Drop for Device {
     fn drop(&mut self) {
+        self.address_monitor.stop();
         self.stop_process_monitor(true);
         // Normal unload closes this barrier before reaching Drop.  Keep the
         // guard here as a last line of defense for an initialization/error path

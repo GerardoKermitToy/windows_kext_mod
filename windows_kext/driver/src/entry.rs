@@ -510,6 +510,32 @@ pub unsafe extern "system" fn driver_entry(
         return windows_sys::Win32::Foundation::STATUS_FAILED_DRIVER_ENTRY;
     }
 
+    // Register before enabling user I/O, so every newly installed interface
+    // policy sees a complete baseline address inventory. The callback merely
+    // signals a pinned event; start() handles registration rollback on failure.
+    if let Err(status) = unsafe { &*device }.address_monitor.start(unsafe { &*device }) {
+        DISPATCH_GATE.close();
+        unsafe { &*device }.begin_unload();
+        unsafe { &*device }.shutdown();
+        unsafe { &*device }.prepare_unload();
+        wdk::callback_barrier::CALLBACK_BARRIER.close_all_and_wait();
+        DISPATCH_GATE.wait_for_all();
+        DISPATCH_GATE.wait_for_lifetime();
+        let published = DEVICE.swap(core::ptr::null_mut(), Ordering::AcqRel);
+        if !published.is_null() {
+            unsafe {
+                drop(Box::from_raw(published));
+            }
+        }
+        #[cfg(feature = "perf-etw")]
+        wdk::perf::unregister();
+        wdk::err!(
+            "driver_entry: failed to start local address monitor: NTSTATUS({:#010x})",
+            status as u32
+        );
+        return windows_sys::Win32::Foundation::STATUS_FAILED_DRIVER_ENTRY;
+    }
+
     // I/O has remained disabled since WdfDeviceCreate. Enable it only after the
     // singleton, all WFP state, and every callback dependency are visible.
     driver.finish_initialization();

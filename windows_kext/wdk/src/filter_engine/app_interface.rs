@@ -7,15 +7,18 @@ use windows_sys::{
     core::GUID,
     Wdk::System::SystemServices::ExUuidCreate,
     Win32::{
-        Foundation::{HANDLE, NTSTATUS, STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_HANDLE},
+        Foundation::{
+            HANDLE, NTSTATUS, STATUS_DEVICE_NOT_READY, STATUS_INSUFFICIENT_RESOURCES,
+            STATUS_INVALID_HANDLE,
+        },
         NetworkManagement::WindowsFilteringPlatform::{
             FWPM_CONDITION_ALE_APP_ID, FWPM_CONDITION_IP_REMOTE_ADDRESS, FWPM_FILTER_CONDITION0,
             FWPM_NETWORK_CONNECTION_POLICY_CONTEXT, FWPM_NETWORK_CONNECTION_POLICY_SETTING0,
             FWPM_NETWORK_CONNECTION_POLICY_SETTINGS0, FWPM_PROVIDER_CONTEXT3, FWPM_SESSION0,
             FWPM_SESSION_FLAG_DYNAMIC, FWP_BYTE_ARRAY16, FWP_BYTE_ARRAY16_TYPE, FWP_BYTE_BLOB,
             FWP_BYTE_BLOB_TYPE, FWP_IP_VERSION, FWP_IP_VERSION_V4, FWP_IP_VERSION_V6,
-            FWP_MATCH_EQUAL, FWP_MATCH_NOT_EQUAL, FWP_NETWORK_CONNECTION_POLICY_NEXT_HOP_INTERFACE,
-            FWP_UINT64, FWP_V4_ADDR_AND_MASK, FWP_V4_ADDR_MASK,
+            FWP_MATCH_EQUAL, FWP_MATCH_RANGE, FWP_NETWORK_CONNECTION_POLICY_NEXT_HOP_INTERFACE,
+            FWP_RANGE0, FWP_RANGE_TYPE, FWP_UINT32, FWP_UINT64,
         },
         System::Rpc::RPC_C_AUTHN_WINNT,
     },
@@ -31,15 +34,19 @@ use crate::ffi::RtlDowncaseUnicodeChar;
 #[cfg(test)]
 use windows_sys::Wdk::System::SystemServices::RtlDowncaseUnicodeChar;
 
+use super::address_ranges::{AddressRange, AddressRanges};
+
 struct AppPolicy {
     app_id: Vec<u8>,
     luid: u64,
-    keys: [GUID; 2],
+    // One key per disjoint permitted destination interval in each family.
+    keys: [Vec<GUID>; 2],
 }
 
 pub struct AppInterfacePolicies {
     handle: HANDLE,
     policies: Vec<AppPolicy>,
+    addresses: Option<AddressRanges>,
 }
 
 // The session is accessed only under Device's PASSIVE_LEVEL mutex. Raw handles
@@ -59,6 +66,7 @@ impl AppInterfacePolicies {
         Self {
             handle: ptr::null_mut(),
             policies: Vec::new(),
+            addresses: None,
         }
     }
 
@@ -86,9 +94,8 @@ impl AppInterfacePolicies {
         Ok(())
     }
 
-    /// `app_id` must be the validated canonical UTF-16LE blob returned by
-    /// FwpmGetAppIdFromFileName0, including its NUL terminator. LUID zero removes
-    /// the policy. Both address families are changed atomically.
+    /// `app_id` is the validated canonical UTF-16LE WFP app ID. LUID zero
+    /// removes the policy. All intervals and both families change atomically.
     pub fn set(&mut self, app_id: &[u8], luid: u64) -> Result<(), NTSTATUS> {
         let app_id = downcase_app_id(app_id)?;
         let existing = self
@@ -102,19 +109,19 @@ impl AppInterfacePolicies {
         } else if luid == 0 {
             return Ok(());
         }
-
-        // Reserve every Rust allocation before modifying WFP. A failed update
-        // keeps the previous policies and the local bookkeeping unchanged.
+        let addresses = self.addresses.as_ref().ok_or(STATUS_DEVICE_NOT_READY)?;
         let new_policy = if existing.is_none() {
             self.policies
                 .try_reserve(1)
                 .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
-            let mut keys = [GUID::from_u128(0); 2];
-            for key in &mut keys {
-                // SAFETY: A live GUID output is supplied at PASSIVE_LEVEL.
-                check(unsafe { ExUuidCreate(key) })?;
-            }
-            Some(AppPolicy { app_id, luid, keys })
+            Some(AppPolicy {
+                app_id,
+                luid,
+                keys: [
+                    make_keys(&[], addresses.ipv4.len())?,
+                    make_keys(&[], addresses.ipv6.len())?,
+                ],
+            })
         } else {
             None
         };
@@ -122,22 +129,30 @@ impl AppInterfacePolicies {
         self.open()?;
         let transaction = PolicyTransaction::begin(self.handle)?;
         if let Some(index) = existing {
-            for key in &self.policies[index].keys {
-                // SAFETY: The key belongs to this live dynamic session.
-                check(unsafe { FwpmConnectionPolicyDeleteByKey0(self.handle, key) })?;
-            }
+            delete_keys(self.handle, &self.policies[index].keys[0])?;
+            delete_keys(self.handle, &self.policies[index].keys[1])?;
         }
         if luid != 0 {
             let policy = existing
                 .map(|i| &self.policies[i])
                 .unwrap_or_else(|| new_policy.as_ref().unwrap());
-            for (key, version) in policy
-                .keys
-                .iter()
-                .zip([FWP_IP_VERSION_V4, FWP_IP_VERSION_V6])
-            {
-                add_policy(self.handle, key, version, &policy.app_id, luid)?;
-            }
+            let addresses = self.addresses.as_ref().unwrap();
+            add_ranges(
+                self.handle,
+                policy,
+                luid,
+                0,
+                &policy.keys[0],
+                &addresses.ipv4,
+            )?;
+            add_ranges(
+                self.handle,
+                policy,
+                luid,
+                1,
+                &policy.keys[1],
+                &addresses.ipv6,
+            )?;
         }
         transaction.commit()?;
 
@@ -150,6 +165,71 @@ impl AppInterfacePolicies {
         } else {
             self.policies.push(new_policy.unwrap());
         }
+        Ok(())
+    }
+
+    /// Replace the canonical snapshot and atomically rebuild every affected
+    /// policy. If allocation or WFP fails, both the old snapshot and all old
+    /// policies remain active. Unchanged address families are left untouched.
+    pub fn update_addresses(&mut self, addresses: AddressRanges) -> Result<(), NTSTATUS> {
+        let changed = [
+            self.addresses
+                .as_ref()
+                .map_or(true, |old| old.ipv4 != addresses.ipv4),
+            self.addresses
+                .as_ref()
+                .map_or(true, |old| old.ipv6 != addresses.ipv6),
+        ];
+        if !changed[0] && !changed[1] {
+            return Ok(());
+        }
+        if self.policies.is_empty() {
+            self.addresses = Some(addresses);
+            return Ok(());
+        }
+
+        let lengths = [addresses.ipv4.len(), addresses.ipv6.len()];
+        let mut replacement = Vec::new();
+        replacement
+            .try_reserve_exact(self.policies.len())
+            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+        for policy in &self.policies {
+            replacement.push([
+                if changed[0] {
+                    Some(make_keys(&policy.keys[0], lengths[0])?)
+                } else {
+                    None
+                },
+                if changed[1] {
+                    Some(make_keys(&policy.keys[1], lengths[1])?)
+                } else {
+                    None
+                },
+            ]);
+        }
+        let transaction = PolicyTransaction::begin(self.handle)?;
+        for (policy, keys) in self.policies.iter().zip(&replacement) {
+            for family in 0..2 {
+                if let Some(keys) = &keys[family] {
+                    delete_keys(self.handle, &policy.keys[family])?;
+                    let ranges = if family == 0 {
+                        &addresses.ipv4
+                    } else {
+                        &addresses.ipv6
+                    };
+                    add_ranges(self.handle, policy, policy.luid, family, keys, ranges)?;
+                }
+            }
+        }
+        transaction.commit()?;
+        for (policy, keys) in self.policies.iter_mut().zip(replacement) {
+            for (family, keys) in keys.into_iter().enumerate() {
+                if let Some(keys) = keys {
+                    policy.keys[family] = keys;
+                }
+            }
+        }
+        self.addresses = Some(addresses);
         Ok(())
     }
 
@@ -199,67 +279,39 @@ fn downcase_app_id(app_id: &[u8]) -> Result<Vec<u8>, NTSTATUS> {
 
 #[cfg(test)]
 mod tests {
-    use super::{downcase_app_id, policy_conditions, LoopbackAddresses};
+    use super::{downcase_app_id, policy_conditions};
     use alloc::{string::String, vec, vec::Vec};
     use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
-        FWPM_CONDITION_ALE_APP_ID, FWPM_CONDITION_IP_REMOTE_ADDRESS, FWP_BYTE_ARRAY16_TYPE,
-        FWP_BYTE_BLOB, FWP_BYTE_BLOB_TYPE, FWP_IP_VERSION_V4, FWP_IP_VERSION_V6, FWP_MATCH_EQUAL,
-        FWP_MATCH_NOT_EQUAL, FWP_V4_ADDR_MASK,
+        FWPM_CONDITION_ALE_APP_ID, FWPM_CONDITION_IP_REMOTE_ADDRESS, FWP_BYTE_BLOB,
+        FWP_BYTE_BLOB_TYPE, FWP_MATCH_EQUAL, FWP_MATCH_RANGE, FWP_RANGE0, FWP_RANGE_TYPE,
     };
 
     #[test]
-    fn policy_matches_the_app_and_excludes_each_familys_loopback_destinations() {
+    fn policy_matches_app_and_one_destination_interval() {
         let mut app_id = encoded(concat!(r"\device\volume\app.exe", "\0"));
         let mut blob = FWP_BYTE_BLOB {
             size: app_id.len() as u32,
             data: app_id.as_mut_ptr(),
         };
-        let mut loopback = LoopbackAddresses::new();
+        let mut range: FWP_RANGE0 = unsafe { core::mem::zeroed() };
+        let conditions = policy_conditions(&mut blob, &mut range);
         let key = |guid: &windows_sys::core::GUID| (guid.data1, guid.data2, guid.data3, guid.data4);
-        for version in [FWP_IP_VERSION_V4, FWP_IP_VERSION_V6] {
-            let conditions = policy_conditions(&mut blob, version, &mut loopback);
-            assert_eq!(conditions.len(), 2);
-            assert_eq!(
-                key(&conditions[0].fieldKey),
-                key(&FWPM_CONDITION_ALE_APP_ID)
-            );
-            assert_eq!(conditions[0].matchType, FWP_MATCH_EQUAL);
-            assert_eq!(conditions[0].conditionValue.r#type, FWP_BYTE_BLOB_TYPE);
-            assert_eq!(
-                unsafe { conditions[0].conditionValue.Anonymous.byteBlob },
-                core::ptr::addr_of_mut!(blob)
-            );
-            assert_eq!(
-                key(&conditions[1].fieldKey),
-                key(&FWPM_CONDITION_IP_REMOTE_ADDRESS)
-            );
-            assert_eq!(conditions[1].matchType, FWP_MATCH_NOT_EQUAL);
-            if version == FWP_IP_VERSION_V4 {
-                assert_eq!(conditions[1].conditionValue.r#type, FWP_V4_ADDR_MASK);
-                let mask = unsafe { &*conditions[1].conditionValue.Anonymous.v4AddrMask };
-                assert_eq!(mask.addr, 0x7f00_0000);
-                assert_eq!(mask.mask, 0xff00_0000);
-                for address in [0x7f00_0000, 0x7f00_0001, 0x7f00_0002, 0x7fff_ffff] {
-                    assert_eq!(address & mask.mask, mask.addr);
-                }
-                for address in [
-                    0x0101_0101,
-                    0x0a00_0001,
-                    0x7eff_ffff,
-                    0x8000_0000,
-                    0xc0a8_0001,
-                ] {
-                    assert_ne!(address & mask.mask, mask.addr);
-                }
-            } else {
-                assert_eq!(conditions[1].conditionValue.r#type, FWP_BYTE_ARRAY16_TYPE);
-                let address = unsafe { &*conditions[1].conditionValue.Anonymous.byteArray16 };
-                assert_eq!(
-                    address.byteArray16,
-                    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
-                );
-            }
-        }
+        assert_eq!(
+            key(&conditions[0].fieldKey),
+            key(&FWPM_CONDITION_ALE_APP_ID)
+        );
+        assert_eq!(conditions[0].matchType, FWP_MATCH_EQUAL);
+        assert_eq!(conditions[0].conditionValue.r#type, FWP_BYTE_BLOB_TYPE);
+        assert_eq!(
+            key(&conditions[1].fieldKey),
+            key(&FWPM_CONDITION_IP_REMOTE_ADDRESS)
+        );
+        assert_eq!(conditions[1].matchType, FWP_MATCH_RANGE);
+        assert_eq!(conditions[1].conditionValue.r#type, FWP_RANGE_TYPE);
+        assert_eq!(
+            unsafe { conditions[1].conditionValue.Anonymous.rangeValue },
+            core::ptr::addr_of_mut!(range)
+        );
     }
 
     fn encoded(path: &str) -> Vec<u8> {
@@ -333,47 +385,61 @@ impl Drop for PolicyTransaction {
     }
 }
 
-struct LoopbackAddresses {
-    ipv4: FWP_V4_ADDR_AND_MASK,
-    ipv6: FWP_BYTE_ARRAY16,
+fn make_keys(old: &[GUID], count: usize) -> Result<Vec<GUID>, NTSTATUS> {
+    let mut keys = Vec::new();
+    keys.try_reserve_exact(count)
+        .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+    keys.extend_from_slice(&old[..old.len().min(count)]);
+    while keys.len() < count {
+        let mut key = GUID::from_u128(0);
+        // SAFETY: A live GUID output is supplied at PASSIVE_LEVEL.
+        check(unsafe { ExUuidCreate(&mut key) })?;
+        keys.push(key);
+    }
+    Ok(keys)
 }
 
-impl LoopbackAddresses {
-    fn new() -> Self {
-        Self {
-            // FWP's IPv4 address/mask values use host byte order.
-            ipv4: FWP_V4_ADDR_AND_MASK {
-                addr: 0x7f00_0000,
-                mask: 0xff00_0000,
-            },
-            ipv6: FWP_BYTE_ARRAY16 {
-                byteArray16: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
-            },
-        }
+fn delete_keys(handle: HANDLE, keys: &[GUID]) -> Result<(), NTSTATUS> {
+    for key in keys {
+        // SAFETY: Each key belongs to this live dynamic session.
+        check(unsafe { FwpmConnectionPolicyDeleteByKey0(handle, key) })?;
     }
+    Ok(())
+}
+
+fn add_ranges(
+    handle: HANDLE,
+    policy: &AppPolicy,
+    luid: u64,
+    family: usize,
+    keys: &[GUID],
+    ranges: &[AddressRange],
+) -> Result<(), NTSTATUS> {
+    debug_assert_eq!(keys.len(), ranges.len());
+    let version = if family == 0 {
+        FWP_IP_VERSION_V4
+    } else {
+        FWP_IP_VERSION_V6
+    };
+    for (key, range) in keys.iter().zip(ranges) {
+        add_policy(handle, key, version, &policy.app_id, luid, *range)?;
+    }
+    Ok(())
 }
 
 fn policy_conditions(
     blob: &mut FWP_BYTE_BLOB,
-    version: FWP_IP_VERSION,
-    loopback: &mut LoopbackAddresses,
+    range: &mut FWP_RANGE0,
 ) -> [FWPM_FILTER_CONDITION0; 2] {
     let mut conditions: [FWPM_FILTER_CONDITION0; 2] = unsafe { mem::zeroed() };
     conditions[0].fieldKey = FWPM_CONDITION_ALE_APP_ID;
     conditions[0].matchType = FWP_MATCH_EQUAL;
     conditions[0].conditionValue.r#type = FWP_BYTE_BLOB_TYPE;
     conditions[0].conditionValue.Anonymous.byteBlob = blob;
-    // IS_LOOPBACK is not sufficient at connection-policy route lookup on the test
-    // OS. Exclude destinations explicitly before forcing an external interface.
     conditions[1].fieldKey = FWPM_CONDITION_IP_REMOTE_ADDRESS;
-    conditions[1].matchType = FWP_MATCH_NOT_EQUAL;
-    if version == FWP_IP_VERSION_V4 {
-        conditions[1].conditionValue.r#type = FWP_V4_ADDR_MASK;
-        conditions[1].conditionValue.Anonymous.v4AddrMask = &mut loopback.ipv4;
-    } else {
-        conditions[1].conditionValue.r#type = FWP_BYTE_ARRAY16_TYPE;
-        conditions[1].conditionValue.Anonymous.byteArray16 = &mut loopback.ipv6;
-    }
+    conditions[1].matchType = FWP_MATCH_RANGE;
+    conditions[1].conditionValue.r#type = FWP_RANGE_TYPE;
+    conditions[1].conditionValue.Anonymous.rangeValue = range;
     conditions
 }
 
@@ -383,14 +449,31 @@ fn add_policy(
     version: FWP_IP_VERSION,
     app_id: &[u8],
     mut luid: u64,
+    interval: AddressRange,
 ) -> Result<(), NTSTATUS> {
     let mut blob = FWP_BYTE_BLOB {
         size: app_id.len() as u32,
         data: app_id.as_ptr().cast_mut(),
     };
-    let mut loopback = LoopbackAddresses::new();
-    let conditions = policy_conditions(&mut blob, version, &mut loopback);
-
+    let mut low6 = FWP_BYTE_ARRAY16 {
+        byteArray16: interval.first.to_be_bytes(),
+    };
+    let mut high6 = FWP_BYTE_ARRAY16 {
+        byteArray16: interval.last.to_be_bytes(),
+    };
+    let mut range: FWP_RANGE0 = unsafe { mem::zeroed() };
+    if version == FWP_IP_VERSION_V4 {
+        range.valueLow.r#type = FWP_UINT32;
+        range.valueHigh.r#type = FWP_UINT32;
+        range.valueLow.Anonymous.uint32 = interval.first as u32;
+        range.valueHigh.Anonymous.uint32 = interval.last as u32;
+    } else {
+        range.valueLow.r#type = FWP_BYTE_ARRAY16_TYPE;
+        range.valueHigh.r#type = FWP_BYTE_ARRAY16_TYPE;
+        range.valueLow.Anonymous.byteArray16 = &mut low6;
+        range.valueHigh.Anonymous.byteArray16 = &mut high6;
+    }
+    let conditions = policy_conditions(&mut blob, &mut range);
     let mut setting: FWPM_NETWORK_CONNECTION_POLICY_SETTING0 = unsafe { mem::zeroed() };
     setting.r#type = FWP_NETWORK_CONNECTION_POLICY_NEXT_HOP_INTERFACE;
     setting.value.r#type = FWP_UINT64;
@@ -408,9 +491,8 @@ fn add_policy(
     context.displayData.name = name.as_mut_ptr();
     context.r#type = FWPM_NETWORK_CONNECTION_POLICY_CONTEXT;
     context.Anonymous.networkConnectionPolicy = &mut settings;
-
-    // SAFETY: Every pointed-to value is live through this synchronous call. WFP
-    // copies the app ID/settings; it does not retain these Rust stack pointers.
+    // SAFETY: The app ID, interval and settings all remain live through this
+    // synchronous call; WFP copies them before returning.
     check(unsafe {
         FwpmConnectionPolicyAdd0(
             handle,

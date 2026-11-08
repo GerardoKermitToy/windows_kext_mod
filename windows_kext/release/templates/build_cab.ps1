@@ -16,6 +16,7 @@ link.exe /OUT:{{sys_file}} `
 "C:\Program Files (x86)\Windows Kits\10\lib\$SDK_Version\km\x64\wdmsec.lib" `
 "C:\Program Files (x86)\Windows Kits\10\lib\$SDK_Version\km\x64\ndis.lib" `
 "C:\Program Files (x86)\Windows Kits\10\lib\$SDK_Version\km\x64\fwpkclnt.lib" `
+"C:\Program Files (x86)\Windows Kits\10\lib\$SDK_Version\km\x64\netio.lib" `
 "C:\Program Files (x86)\Windows Kits\10\lib\$SDK_Version\um\x64\uuid.lib" `
 "C:\Program Files (x86)\Windows Kits\10\lib\$SDK_Version\km\x64\BufferOverflowK.lib" `
 "C:\Program Files (x86)\Windows Kits\10\lib\$SDK_Version\km\x64\ntoskrnl.lib" `

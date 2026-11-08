@@ -100,22 +100,48 @@ app_id:      app_id_size bytes of canonical UTF-16LE native path
 The driver rejects oversized paths (more than 65,534 bytes), odd byte counts,
 missing or embedded NUL terminators, malformed UTF-16, and truncated payloads.
 It calls the kernel `FwpmConnectionPolicyAdd0` with `FWPM_CONDITION_ALE_APP_ID`
-and `FWP_NETWORK_CONNECTION_POLICY_NEXT_HOP_INTERFACE` (`FWP_UINT64`). A second
-`FWPM_CONDITION_IP_REMOTE_ADDRESS` condition uses `FWP_MATCH_NOT_EQUAL` to exclude
-all of `127.0.0.0/8` for IPv4 and `::1` for IPv6. Those destinations retain normal
-local routing instead of being forced onto the selected external/VPN adapter.
+and `FWP_NETWORK_CONNECTION_POLICY_NEXT_HOP_INTERFACE` (`FWP_UINT64`). The driver
+subscribes to local IPv4/IPv6 unicast-address changes and takes an initial address
+snapshot before accepting policy commands. The entire IPv4 `127.0.0.0/8` range,
+IPv6 `::1`, and every local unicast address are excluded as destinations, so
+Windows chooses their normal routes instead of forcing the selected interface.
 An `IS_LOOPBACK` flag condition alone did not prevent `WSAEADDRNOTAVAIL` at
-connection-policy route lookup on the test OS; the address exclusions are
-intentional. IPv4 and IPv6 policies are added, replaced, or removed in one WFP
-transaction. Failed updates preserve the previous pair. Setting an unchanged
-assignment is a no-op.
-WFP management failures are returned to the caller, rather than logged as success.
+connection-policy route lookup on the test OS; explicit exclusions are intentional.
+
+WFP policies represent the complement of those exclusions as disjoint permitted
+`FWP_MATCH_RANGE` intervals, each with an app-ID condition and one remote-address
+condition. Duplicate addresses, adjacent exclusions and changes to address metadata
+that do not alter the effective intervals do not create extra policies or trigger
+WFP updates. When the effective address set changes, all affected applications and
+address families are rebuilt atomically in one WFP transaction; unchanged families
+are left alone. A failed update keeps the previous policies and is retried with an
+exponential delay capped at 30 seconds. New assignments use the most recently
+applied snapshot. As with all connection policies, these updates affect new
+connections, not already-established flows.
+
+The address notification callback only signals a coalescing event. A single worker
+sleeps without polling while idle, reads a new snapshot when signaled, and never
+runs on the packet classify path. Initial notification registration or snapshot
+failure prevents driver startup rather than installing incomplete exceptions.
+There can be one WFP policy per permitted range per application and IP family,
+so the number of WFP objects grows with the number of distinct local addresses
+and application assignments. This trades WFP storage and connection-policy lookup
+work for avoiding a driver-side address lookup on each packet; CPU usage has not
+been benchmarked.
+The table contains unicast addresses, not multicast or broadcast addresses. The
+runtime tests cover the default network compartment; coverage of addresses in
+other Windows network compartments has not been verified. WFP's connection-policy
+remote-address condition does not include an IPv6 scope ID, so a numeric IPv6
+link-local address assigned locally is excluded in every scope.
+Setting an unchanged assignment is a no-op. WFP management failures for assignment
+commands are returned to the caller, rather than logged as success.
 
 Policies belong to a separate dynamic WFP session. Device-handle cleanup or
 shutdown closes it and removes all assignments. Process exit does **not** delete
 a path policy: other instances may still be running or start later. No process
-monitoring, timer, userspace decision, or new per-packet driver lookup is needed.
-Updates are serialized at `PASSIVE_LEVEL`, never under a packet-path spin lock.
+monitoring, periodic polling, userspace decision, or new per-packet driver lookup
+is needed. Updates are serialized at `PASSIVE_LEVEL`, never under a packet-path
+spin lock.
 
 This uses the newer Windows 11 kernel connection-policy API (WDK guard
 `NTDDI_WIN11_ZN`), which must be exported by the target OS. The driver directly
@@ -177,7 +203,7 @@ objects, both command transports, replacement/removal, handle cleanup, and actua
 TCP interface selection. It is deliberately **not** registered with offline CTest:
 
 ```bash
-./kext_client/build/app_interface_runtime.exe --duration 30 ./windows_kext/portmaster-kext.sys --interface-address 10.94.59.5
+./kext_client/build/app_interface_runtime.exe --duration 60 ./windows_kext/portmaster-kext.sys
 ```
 
 The optional interface address selects a second adapter with a usable route.
@@ -185,9 +211,14 @@ The live probe makes short TCP connections to `1.1.1.1:443`, sends no applicatio
 data to that endpoint, and fails if the policy is stored but does not change the
 observed source and interface. It also verifies TCP/UDP echo round trips to
 `127.0.0.1`, `127.0.0.2`, and `::1` from the selected Unicode EXE path, both without
-a policy and with policies installed through IOCTL and WriteFile. WFP inspection
-checks the loopback-address exclusion on both policy filters. Only the bounded
-`--loopback-child` mode is registered in CTest; it never opens or loads the driver.
+a policy and with policies installed through IOCTL and WriteFile. It inspects the
+WFP ranges against the current unicast inventory, then temporarily adds and removes
+one IPv4 and one IPv6 address on the loopback interface. It verifies updates to
+already-installed policies, a policy installed after an address appears, and TCP/
+UDP round trips to the temporary addresses, and address changes racing driver
+shutdown. The test removes its temporary addresses before exiting, including on
+normal exception paths. Only the bounded `--loopback-child` mode is registered in
+CTest; it never opens or loads the driver.
 Successful IOCTL completion proves policy installation, not successful egress:
 OS support and a usable route on the selected interface remain necessary.
 

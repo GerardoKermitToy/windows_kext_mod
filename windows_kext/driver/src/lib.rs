@@ -9,6 +9,8 @@ extern crate alloc;
 // used by the other modules are unavailable. Keep kernel-independent modules and
 // test doubles in that graph; compile the full driver graph for non-test builds.
 #[cfg(not(test))]
+mod address_monitor;
+#[cfg(not(test))]
 mod ale_callouts;
 mod ale_policy;
 mod array_holder;
