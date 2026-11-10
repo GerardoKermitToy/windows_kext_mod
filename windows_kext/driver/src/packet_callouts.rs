@@ -467,12 +467,14 @@ fn ip_packet_layer(
             } else if matches!(direction, Direction::Inbound) {
                 let fallback_pid = inbound_udp_fallback_pid(
                     key.protocol,
+                    key.local_address,
                     crate::registry_settings::inbound_udp_pid_fallback_enabled(),
                     || device.connection_cache.find_active_udp_pid(&key),
                 );
                 let Some(pid) = fallback_pid else {
                     // Preserve native ALE authorization when the option is off,
-                    // no live UDP match exists, or its PID is unknown/System.
+                    // the destination is multicast, no live UDP match exists, or
+                    // its PID is unknown/System.
                     data.action_permit();
                     return;
                 };

@@ -1,4 +1,4 @@
-use smoltcp::wire::IpProtocol;
+use smoltcp::wire::{IpAddress, IpProtocol};
 
 use crate::connection::Direction;
 
@@ -80,15 +80,17 @@ pub(crate) fn classify_packet_injection(
 }
 
 /// A missing inbound UDP tuple may borrow only process attribution, and only
-/// from the first live match. Unknown/System attribution still needs native ALE
-/// authorization. Callers invoke this only after the normal cache lookup misses.
+/// from the first live match. Multicast destinations and Unknown/System attribution
+/// still need native ALE authorization. Callers invoke this only after the normal
+/// cache lookup misses.
 #[inline]
 pub(crate) fn inbound_udp_fallback_pid(
     protocol: IpProtocol,
+    local_address: IpAddress,
     enabled: bool,
     lookup: impl FnOnce() -> Option<u64>,
 ) -> Option<u64> {
-    if !enabled || protocol != IpProtocol::Udp {
+    if !enabled || protocol != IpProtocol::Udp || local_address.is_multicast() {
         return None;
     }
 
@@ -221,7 +223,7 @@ mod tests {
         InjectionStatus, PacketInjectionAction,
     };
     use crate::connection::Direction;
-    use smoltcp::wire::IpProtocol;
+    use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Address, Ipv6Address};
 
     #[test]
     fn raw_receive_copies_never_enter_native_connection_lifecycle() {
@@ -237,10 +239,11 @@ mod tests {
 
     #[test]
     fn inbound_udp_fallback_does_not_lookup_when_disabled_or_not_udp() {
+        let local_address = IpAddress::Ipv4(Ipv4Address::new(192, 0, 2, 1));
         for protocol in [IpProtocol::Udp, IpProtocol::Tcp, IpProtocol::Icmp] {
             for enabled in [false, true] {
                 let mut calls = 0;
-                let pid = inbound_udp_fallback_pid(protocol, enabled, || {
+                let pid = inbound_udp_fallback_pid(protocol, local_address, enabled, || {
                     calls += 1;
                     Some(123)
                 });
@@ -253,16 +256,60 @@ mod tests {
 
     #[test]
     fn inbound_udp_fallback_leaves_missing_unknown_and_system_pid_to_ale() {
+        let local_address = IpAddress::Ipv4(Ipv4Address::new(192, 0, 2, 1));
         for pid in [None, Some(0), Some(4)] {
             assert_eq!(
-                inbound_udp_fallback_pid(IpProtocol::Udp, true, || pid),
+                inbound_udp_fallback_pid(IpProtocol::Udp, local_address, true, || pid),
                 None
             );
         }
         assert_eq!(
-            inbound_udp_fallback_pid(IpProtocol::Udp, true, || Some(123)),
+            inbound_udp_fallback_pid(IpProtocol::Udp, local_address, true, || Some(123)),
             Some(123),
         );
+    }
+
+    #[test]
+    fn inbound_udp_fallback_leaves_multicast_destinations_to_ale() {
+        let destinations = [
+            IpAddress::Ipv4(Ipv4Address::new(224, 0, 0, 0)),
+            IpAddress::Ipv4(Ipv4Address::new(224, 0, 0, 251)),
+            IpAddress::Ipv4(Ipv4Address::new(239, 255, 255, 255)),
+            IpAddress::Ipv6(Ipv6Address::new(0xff00, 0, 0, 0, 0, 0, 0, 0)),
+            IpAddress::Ipv6(Ipv6Address::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb)),
+            IpAddress::Ipv6(Ipv6Address::new(0xffff, 0, 0, 0, 0, 0, 0, 0xffff)),
+        ];
+
+        for local_address in destinations {
+            let mut calls = 0;
+            let pid = inbound_udp_fallback_pid(IpProtocol::Udp, local_address, true, || {
+                calls += 1;
+                Some(123)
+            });
+            assert_eq!(pid, None, "multicast destination: {local_address}");
+            assert_eq!(calls, 0, "multicast destination: {local_address}");
+        }
+    }
+
+    #[test]
+    fn inbound_udp_fallback_preserves_non_multicast_destinations() {
+        let destinations = [
+            IpAddress::Ipv4(Ipv4Address::new(223, 255, 255, 255)),
+            IpAddress::Ipv4(Ipv4Address::new(240, 0, 0, 0)),
+            IpAddress::Ipv4(Ipv4Address::new(255, 255, 255, 255)),
+            IpAddress::Ipv6(Ipv6Address::new(0xfeff, 0, 0, 0, 0, 0, 0, 0xffff)),
+            IpAddress::Ipv6(Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+        ];
+
+        for local_address in destinations {
+            let mut calls = 0;
+            let pid = inbound_udp_fallback_pid(IpProtocol::Udp, local_address, true, || {
+                calls += 1;
+                Some(123)
+            });
+            assert_eq!(pid, Some(123), "non-multicast destination: {local_address}");
+            assert_eq!(calls, 1, "non-multicast destination: {local_address}");
+        }
     }
 
     #[test]
