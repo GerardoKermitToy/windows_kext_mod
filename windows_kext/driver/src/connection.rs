@@ -114,6 +114,9 @@ pub struct ConnectionExtra {
     /// Packet-layer fallbacks may expire on inactivity until a real endpoint is
     /// associated. Ordinary inbound ALE state must wait for socket closure.
     pub(crate) idle_expiration: bool,
+    /// Nonzero only for inbound UDP multicast, where one tuple can be received
+    /// by several independent sockets with different policies and lifetimes.
+    pub(crate) multicast_endpoint: u64,
 }
 
 pub trait Connection {
@@ -158,6 +161,8 @@ pub trait Connection {
     fn get_direction(&self) -> Direction;
     /// Returns the unique cache-instance ID of the connection.
     fn get_instance_id(&self) -> u64;
+    /// Returns the receiving endpoint for inbound multicast, or zero otherwise.
+    fn get_multicast_endpoint(&self) -> u64;
     /// Returns the process ID of the connection.
     fn get_process_id(&self) -> u64;
     /// Ends the connection.
@@ -254,6 +259,7 @@ impl ConnectionV4 {
                 end_timestamp: 0,
                 native_lifecycle,
                 idle_expiration: matches!(direction, Direction::Outbound),
+                multicast_endpoint: 0,
             },
         })
     }
@@ -333,6 +339,10 @@ impl Connection for ConnectionV4 {
 
     fn get_instance_id(&self) -> u64 {
         self.instance_id
+    }
+
+    fn get_multicast_endpoint(&self) -> u64 {
+        self.extra.multicast_endpoint
     }
 
     fn get_process_id(&self) -> u64 {
@@ -438,6 +448,7 @@ impl ConnectionV6 {
                 end_timestamp: 0,
                 native_lifecycle,
                 idle_expiration: matches!(direction, Direction::Outbound),
+                multicast_endpoint: 0,
             },
         })
     }
@@ -516,6 +527,10 @@ impl Connection for ConnectionV6 {
 
     fn get_instance_id(&self) -> u64 {
         self.instance_id
+    }
+
+    fn get_multicast_endpoint(&self) -> u64 {
+        self.extra.multicast_endpoint
     }
 
     fn get_process_id(&self) -> u64 {

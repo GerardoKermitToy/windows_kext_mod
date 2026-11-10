@@ -473,9 +473,16 @@ impl Device {
         Ok(())
     }
 
-    fn apply_command(&self, command: CommandType, payload: &[u8], file_object: *mut c_void) -> Result<(), NTSTATUS> {
+    fn apply_command(
+        &self,
+        command: CommandType,
+        payload: &[u8],
+        file_object: *mut c_void,
+    ) -> Result<(), NTSTATUS> {
         match command {
-            CommandType::SetAppInterface => crate::entry::set_app_interface(self, file_object, payload)?,
+            CommandType::SetAppInterface => {
+                crate::entry::set_app_interface(self, file_object, payload)?
+            }
             CommandType::Shutdown => {
                 wdk::dbg!("Shutdown command");
                 self.shutdown();
@@ -1036,9 +1043,20 @@ impl Device {
         direction: crate::connection::Direction,
         ale_layer: bool,
     ) -> Option<PendingPacket> {
+        let (key, mut packet) = value;
+        if key.protocol == IpProtocol::Udp
+            && key.local_address.is_multicast()
+            && matches!(direction, crate::connection::Direction::Inbound)
+        {
+            if let (Some(instance_id), Packet::AleLayer(defer)) =
+                (connection_instance_id, &mut packet)
+            {
+                defer.set_multicast_instance_id(instance_id);
+            }
+        }
         let pending = PendingPacket {
-            key: value.0,
-            packet: value.1,
+            key,
+            packet,
             connection_instance_id,
             // The sampled timestamp is assigned after the verdict ID is allocated.
             #[cfg(feature = "perf-etw")]

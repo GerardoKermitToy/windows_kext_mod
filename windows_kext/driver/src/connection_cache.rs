@@ -107,7 +107,7 @@ impl ConnectionCache {
         process_id: u64,
         direction: Direction,
     ) -> Result<ConnectionRegistration, String> {
-        self.register_connection_with_lifecycle(key, process_id, direction, true, 0)
+        self.register_connection_with_lifecycle(key, process_id, direction, true, 0, 0)
     }
 
     /// Registers a fallback connection for which WFP exposed no endpoint identity.
@@ -120,7 +120,7 @@ impl ConnectionCache {
         process_id: u64,
         direction: Direction,
     ) -> Result<ConnectionRegistration, String> {
-        self.register_connection_with_lifecycle(key, process_id, direction, false, 0)
+        self.register_connection_with_lifecycle(key, process_id, direction, false, 0, 0)
     }
 
     /// Registers a new exact inbound UDP tuple using only the donor's PID.
@@ -175,6 +175,29 @@ impl ConnectionCache {
             direction,
             key.protocol != IpProtocol::Udp,
             thread_id,
+            0,
+        )
+    }
+
+    /// Registers an inbound multicast receiver independently of other sockets
+    /// sharing the same tuple. A concrete WFP endpoint is required.
+    pub fn register_multicast_receiver(
+        &self,
+        key: &Key,
+        endpoint: u64,
+        process_id: u64,
+        thread_id: u64,
+    ) -> Result<ConnectionRegistration, String> {
+        if endpoint == 0 || key.protocol != IpProtocol::Udp || !key.local_address.is_multicast() {
+            return Err("invalid multicast receiving endpoint".into());
+        }
+        self.register_connection_with_lifecycle(
+            key,
+            process_id,
+            Direction::Inbound,
+            false,
+            thread_id,
+            endpoint,
         )
     }
 
@@ -185,6 +208,7 @@ impl ConnectionCache {
         direction: Direction,
         native_lifecycle: bool,
         thread_id: u64,
+        multicast_endpoint: u64,
     ) -> Result<ConnectionRegistration, String> {
         if unlikely(key.is_ipv6()) {
             let mut connection = if native_lifecycle {
@@ -193,6 +217,7 @@ impl ConnectionCache {
                 ConnectionV6::from_untracked_key(key, process_id, direction)?
             };
             connection.thread_id = thread_id;
+            connection.extra.multicast_endpoint = multicast_endpoint;
             Ok(self.register_connection_v6(connection))
         } else {
             let mut connection = if native_lifecycle {
@@ -201,6 +226,7 @@ impl ConnectionCache {
                 ConnectionV4::from_untracked_key(key, process_id, direction)?
             };
             connection.thread_id = thread_id;
+            connection.extra.multicast_endpoint = multicast_endpoint;
             Ok(self.register_connection_v4(connection))
         }
     }
@@ -256,6 +282,35 @@ impl ConnectionCache {
                 inserted: false,
                 instance_id,
             },
+        }
+    }
+
+    /// Looks up the policy and generation for one receiving socket only.
+    pub fn read_multicast_receiver(
+        &self,
+        key: &Key,
+        endpoint: u64,
+    ) -> Option<(Verdict, u64, bool)> {
+        if unlikely(key.is_ipv6()) {
+            self.connections_v6
+                .read_lock()
+                .read_multicast_endpoint(key, endpoint, |connection| {
+                    Some((
+                        connection.verdict,
+                        connection.get_instance_id(),
+                        connection.has_native_lifecycle(),
+                    ))
+                })
+        } else {
+            self.connections_v4
+                .read_lock()
+                .read_multicast_endpoint(key, endpoint, |connection| {
+                    Some((
+                        connection.verdict,
+                        connection.get_instance_id(),
+                        connection.has_native_lifecycle(),
+                    ))
+                })
         }
     }
 
@@ -396,12 +451,16 @@ impl ConnectionCache {
     pub fn update_connection(&self, key: Key, verdict: Verdict) {
         if unlikely(key.is_ipv6()) {
             let mut connections = self.connections_v6.write_lock();
-            if let Some(conn) = connections.get_mut(&key) {
+            if key.protocol == IpProtocol::Udp && key.local_address.is_multicast() {
+                connections.for_each_live_match(&key, |conn| conn.verdict = verdict);
+            } else if let Some(conn) = connections.get_mut(&key) {
                 conn.verdict = verdict;
             }
         } else {
             let mut connections = self.connections_v4.write_lock();
-            if let Some(conn) = connections.get_mut(&key) {
+            if key.protocol == IpProtocol::Udp && key.local_address.is_multicast() {
+                connections.for_each_live_match(&key, |conn| conn.verdict = verdict);
+            } else if let Some(conn) = connections.get_mut(&key) {
                 conn.verdict = verdict;
             }
         }
@@ -779,6 +838,205 @@ mod tests {
             cache.read_connection_v6(tuple, |conn| Some((conn.process_id, conn.thread_id)))
         } else {
             cache.read_connection_v4(tuple, |conn| Some((conn.process_id, conn.thread_id)))
+        }
+    }
+
+    #[test]
+    fn multicast_receivers_keep_independent_verdicts_and_lifetimes() {
+        let v4 = Key {
+            protocol: IpProtocol::Udp,
+            local_address: IpAddress::Ipv4(Ipv4Address::new(239, 255, 42, 101)),
+            local_port: 5353,
+            remote_address: IpAddress::Ipv4(Ipv4Address::new(192, 0, 2, 1)),
+            remote_port: 40_000,
+        };
+        let v6 = Key {
+            local_address: IpAddress::Ipv6(Ipv6Address::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb)),
+            remote_address: IpAddress::Ipv6(Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)),
+            ..v4
+        };
+        for tuple in [v4, v6] {
+            let cache = ConnectionCache::new();
+            let a = cache
+                .register_multicast_receiver(&tuple, 10, 100, 1)
+                .unwrap();
+            let b = cache
+                .register_multicast_receiver(&tuple, 20, 200, 2)
+                .unwrap();
+            assert!(a.inserted && b.inserted);
+            assert_ne!(a.instance_id, b.instance_id);
+            let repeated = cache
+                .register_multicast_receiver(&tuple, 10, 100, 1)
+                .unwrap();
+            assert!(!repeated.inserted);
+            assert_eq!(repeated.instance_id, a.instance_id);
+
+            cache.update_connection_instance(tuple, a.instance_id, Verdict::PermanentBlock);
+            cache.update_connection_instance(tuple, b.instance_id, Verdict::PermanentAccept);
+            assert!(
+                matches!(cache.read_multicast_receiver(&tuple, 10), Some((Verdict::PermanentBlock, id, _)) if id == a.instance_id)
+            );
+            assert!(
+                matches!(cache.read_multicast_receiver(&tuple, 20), Some((Verdict::PermanentAccept, id, _)) if id == b.instance_id)
+            );
+            assert!(cache.read_multicast_receiver(&tuple, 0).is_none());
+            assert!(cache.read_multicast_receiver(&tuple, 30).is_none());
+
+            let ended = if tuple.is_ipv6() {
+                cache
+                    .end_connection_instance_v6(tuple, a.instance_id)
+                    .map(|c| c.process_id)
+            } else {
+                cache
+                    .end_connection_instance_v4(tuple, a.instance_id)
+                    .map(|c| c.process_id)
+            };
+            assert_eq!(ended, Some(100));
+            assert!(cache.read_multicast_receiver(&tuple, 10).is_none());
+            assert!(
+                matches!(cache.read_multicast_receiver(&tuple, 20), Some((Verdict::PermanentAccept, id, _)) if id == b.instance_id)
+            );
+            assert!(cache
+                .update_connection_instance(tuple, a.instance_id, Verdict::PermanentAccept)
+                .is_none());
+
+            let replacement = cache
+                .register_multicast_receiver(&tuple, 10, 300, 3)
+                .unwrap();
+            assert!(replacement.inserted);
+            assert_ne!(replacement.instance_id, a.instance_id);
+            assert!(cache
+                .update_connection_instance(tuple, a.instance_id, Verdict::PermanentBlock)
+                .is_none());
+            assert!(
+                matches!(cache.read_multicast_receiver(&tuple, 10), Some((Verdict::Undecided, id, _)) if id == replacement.instance_id)
+            );
+
+            // The wire update has only a tuple; its scope is every live owner.
+            cache.update_connection(tuple, Verdict::PermanentDrop);
+            assert!(matches!(
+                cache.read_multicast_receiver(&tuple, 10),
+                Some((Verdict::PermanentDrop, _, _))
+            ));
+            assert!(matches!(
+                cache.read_multicast_receiver(&tuple, 20),
+                Some((Verdict::PermanentDrop, _, _))
+            ));
+        }
+    }
+
+    #[test]
+    fn concurrent_multicast_registration_deduplicates_only_the_same_endpoint() {
+        let tuple = Key {
+            protocol: IpProtocol::Udp,
+            local_address: IpAddress::Ipv4(Ipv4Address::new(239, 255, 42, 101)),
+            local_port: 5353,
+            remote_address: IpAddress::Ipv4(Ipv4Address::new(192, 0, 2, 1)),
+            remote_port: 40_000,
+        };
+        let cache = ConnectionCache::new();
+        let barrier = std::sync::Barrier::new(32);
+        let results = std::thread::scope(|scope| {
+            let mut threads = Vec::new();
+            for n in 0..32 {
+                let cache = &cache;
+                let barrier = &barrier;
+                threads.push(scope.spawn(move || {
+                    let endpoint = if n % 2 == 0 { 10 } else { 20 };
+                    barrier.wait();
+                    (
+                        endpoint,
+                        cache
+                            .register_multicast_receiver(&tuple, endpoint, endpoint, 0)
+                            .unwrap(),
+                    )
+                }));
+            }
+            threads
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        let first_a = results
+            .iter()
+            .find(|(endpoint, _)| *endpoint == 10)
+            .unwrap()
+            .1
+            .instance_id;
+        let first_b = results
+            .iter()
+            .find(|(endpoint, _)| *endpoint == 20)
+            .unwrap()
+            .1
+            .instance_id;
+        assert_ne!(first_a, first_b);
+        assert_eq!(
+            results.iter().filter(|(_, result)| result.inserted).count(),
+            2
+        );
+        for (endpoint, result) in results {
+            assert_eq!(
+                result.instance_id,
+                if endpoint == 10 { first_a } else { first_b }
+            );
+        }
+        // A handle-less closure or UDP fallback must not end an endpoint-owned
+        // multicast generation, even if its process ID happens to match.
+        let ended =
+            cache.end_all_on_endpoint_v4((IpProtocol::Udp, tuple.local_port), None, Some(10));
+        assert!(ended.unwrap().is_empty());
+        assert!(cache.read_multicast_receiver(&tuple, 10).is_some());
+        assert!(cache.read_multicast_receiver(&tuple, 20).is_some());
+    }
+
+    #[test]
+    fn multicast_same_process_sockets_end_independently_in_either_callback_order() {
+        let tuple = Key {
+            protocol: IpProtocol::Udp,
+            local_address: IpAddress::Ipv4(Ipv4Address::new(239, 255, 42, 101)),
+            local_port: 5353,
+            remote_address: IpAddress::Ipv4(Ipv4Address::new(192, 0, 2, 1)),
+            remote_port: 40_000,
+        };
+        for flow_first in [false, true] {
+            let cache = ConnectionCache::new();
+            let mut endpoints = crate::udp_endpoint_cache::UdpEndpointCache::new();
+            let a = cache
+                .register_multicast_receiver(&tuple, 10, 123, 0)
+                .unwrap();
+            let b = cache
+                .register_multicast_receiver(&tuple, 20, 123, 0)
+                .unwrap();
+            assert_ne!(a.instance_id, b.instance_id);
+            assert!(endpoints.associate_instance(10, tuple, a.instance_id));
+            assert!(endpoints.associate_instance(20, tuple, b.instance_id));
+            if flow_first {
+                assert!(endpoints.dissociate(10, tuple, a.instance_id));
+                assert!(cache
+                    .end_connection_instance_v4(tuple, a.instance_id)
+                    .is_some());
+                assert!(endpoints.take(10).is_none());
+            } else {
+                assert!(endpoints.take(10).is_some());
+                assert!(cache
+                    .end_connection_instance_v4(tuple, a.instance_id)
+                    .is_some());
+                assert!(!endpoints.dissociate(10, tuple, a.instance_id));
+            }
+            assert!(cache
+                .end_connection_instance_v4(tuple, a.instance_id)
+                .is_none());
+            assert_eq!(
+                endpoints.with_instance_id(20, &tuple, Some),
+                Some(b.instance_id)
+            );
+            assert!(cache.read_multicast_receiver(&tuple, 20).is_some());
+            assert!(cache
+                .end_connection_instance_v4(tuple, b.instance_id)
+                .is_some());
+            assert!(cache
+                .end_connection_instance_v4(tuple, b.instance_id)
+                .is_none());
         }
     }
 

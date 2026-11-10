@@ -103,9 +103,7 @@ impl PacketInjectionOrigin {
 
 fn packet_injection_origin(state: FWPS_PACKET_INJECTION_STATE) -> PacketInjectionOrigin {
     match state {
-        FWPS_PACKET_INJECTION_STATE::FWPS_PACKET_NOT_INJECTED => {
-            PacketInjectionOrigin::NotInjected
-        }
+        FWPS_PACKET_INJECTION_STATE::FWPS_PACKET_NOT_INJECTED => PacketInjectionOrigin::NotInjected,
         FWPS_PACKET_INJECTION_STATE::FWPS_PACKET_INJECTED_BY_SELF
         | FWPS_PACKET_INJECTION_STATE::FWPS_PACKET_PREVIOUSLY_INJECTED_BY_SELF => {
             PacketInjectionOrigin::InjectedBySelf
@@ -132,8 +130,13 @@ impl TransportProtocol {
         matches!(self, Self::Tcp)
     }
 
-    fn uses_network_send_for_ale(self, inbound: bool, loopback: bool) -> bool {
-        matches!(self, Self::Tcp | Self::Udp) && inbound && loopback
+    fn uses_network_send_for_ale(
+        self,
+        inbound: bool,
+        loopback: bool,
+        multicast_replay: bool,
+    ) -> bool {
+        matches!(self, Self::Tcp | Self::Udp) && inbound && loopback && !multicast_replay
     }
 }
 
@@ -209,6 +212,8 @@ pub struct TransportPacketList {
     event_data_offset: usize,
     remote_ip: [u8; 16],
     endpoint_handle: u64,
+    /// Opaque generation ID, set only for a saved inbound multicast datagram.
+    multicast_instance_id: u64,
     remote_scope_id: SCOPE_ID,
     // Owned copy of the WFP control data. The original WFP pointer is only
     // valid during the ALE classify callback; the bytes are copied here so they outlive it.
@@ -224,6 +229,13 @@ pub struct TransportPacketList {
     // Storing send_params here ensures it lives on the heap inside Box<TransportPacketList>
     // until the WFP completion callback (free_transport_packet) drops it.
     send_params: FWPS_TRANSPORT_SEND_PARAMS1,
+}
+
+impl TransportPacketList {
+    /// Targets a deferred multicast replay at the original connection generation.
+    pub fn set_multicast_instance_id(&mut self, instance_id: u64) {
+        self.multicast_instance_id = instance_id;
+    }
 }
 
 // The list is moved from classify to the verdict path and then reclaimed by a
@@ -589,6 +601,7 @@ impl Injector {
             event_data_offset,
             remote_ip,
             endpoint_handle: callout_data.get_transport_endpoint_handle().unwrap_or(0),
+            multicast_instance_id: 0,
             remote_scope_id,
             control_data,
             inbound,
@@ -607,19 +620,18 @@ impl Injector {
 
     /// Injects a saved ALE packet after its pended operation is complete.
     ///
-    /// Inbound TCP and UDP loopback packets are returned through network-send
-    /// injection. Windows completes transport-receive injection of either protocol
-    /// with `STATUS_DATA_NOT_ACCEPTED`; a TCP network-receive comparison fails with
-    /// the same status. UDP loses the datagram, while TCP waits for the sender's
-    /// one-second SYN retransmission. Routing the complete IP packet back through
-    /// loopback send preserves immediate delivery. Non-loopback UDP uses transport
-    /// injection in the caller's current context. Non-loopback TCP is always
-    /// transferred to a regular DPC before either transport injection API is called.
+    /// Ordinary inbound TCP/UDP loopback packets use network-send injection:
+    /// transport-receive injection of unicast loopback can complete with
+    /// STATUS_DATA_NOT_ACCEPTED. Multicast UDP replays instead use transport
+    /// receive even for loopback: on the tested Windows system this delivers to
+    /// the selected receivers without transmitting each replay on the network.
+    /// Non-loopback TCP is transferred to a DPC for transport injection.
     pub fn inject_ale_packet(&self, packet_list: TransportPacketList) -> Result<(), String> {
-        if packet_list
-            .protocol
-            .uses_network_send_for_ale(packet_list.inbound, packet_list.loopback)
-        {
+        if packet_list.protocol.uses_network_send_for_ale(
+            packet_list.inbound,
+            packet_list.loopback,
+            packet_list.multicast_instance_id != 0,
+        ) {
             let inject_info = InjectInfo {
                 ipv6: packet_list.ipv6,
                 inbound: true,
@@ -705,6 +717,12 @@ impl Injector {
             return Err("failed to inject packet: invalid handle value".to_string());
         }
 
+        // The WFP context is an opaque integer token, not a dereferenceable
+        // pointer. Fail closed rather than truncating a generation on 32-bit.
+        let multicast_context = usize::try_from(packet_list.multicast_instance_id)
+            .map_err(|_| "multicast generation does not fit injection context".to_string())?
+            as *mut c_void;
+
         // Box the entire packet_list so that remote_ip and send_params are
         // heap-allocated. Their addresses remain stable until
         // free_transport_packet drops the Box after WFP calls the completion.
@@ -745,7 +763,7 @@ impl Injector {
             let status = if (*raw_ptr).inbound {
                 FwpsInjectTransportReceiveAsync0(
                     transport_inject_handle,
-                    core::ptr::null_mut(),
+                    multicast_context,
                     core::ptr::null_mut(),
                     0,
                     address_family,
@@ -861,11 +879,7 @@ impl Injector {
     /// self-injection keeps the context supplied by `inject_net_buffer_list` live
     /// until classification returns. A previously injected NBL does not provide
     /// that lifetime guarantee and must never be used to dereference its context.
-    pub unsafe fn mark_network_packet_recaptured(
-        &self,
-        nbl: *const NET_BUFFER_LIST,
-        ipv6: bool,
-    ) {
+    pub unsafe fn mark_network_packet_recaptured(&self, nbl: *const NET_BUFFER_LIST, ipv6: bool) {
         let handle = if unlikely(ipv6) {
             self.packet_inject_handle_v6.load(Ordering::Acquire)
         } else {
@@ -953,13 +967,29 @@ impl Injector {
         }
 
         let state = unsafe {
-            FwpsQueryPacketInjectionState0(
-                transport_inject_handle,
-                nbl,
-                core::ptr::null_mut(),
-            )
+            FwpsQueryPacketInjectionState0(transport_inject_handle, nbl, core::ptr::null_mut())
         };
         packet_injection_origin(state)
+    }
+
+    /// Returns the opaque generation ID of a self-injected multicast replay.
+    /// The context is an integer token, never a pointer to dereference, so it
+    /// remains safe even for WFP's PREVIOUSLY_INJECTED_BY_SELF state.
+    ///
+    /// # Safety
+    /// `nbl` must be null or a live WFP NBL for this synchronous query.
+    pub unsafe fn transport_multicast_target(&self, nbl: *const NET_BUFFER_LIST) -> Option<u64> {
+        let handle = self.transport_injection.handle.load(Ordering::Acquire);
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE || nbl.is_null() {
+            return None;
+        }
+        let mut context = core::ptr::null_mut();
+        let state = unsafe { FwpsQueryPacketInjectionState0(handle, nbl, &mut context) };
+        if packet_injection_origin(state).is_self_injected() && !context.is_null() {
+            Some(context as usize as u64)
+        } else {
+            None
+        }
     }
 
     /// Returns whether WFP identifies this transport-layer NBL as self-injected.
@@ -1187,7 +1217,7 @@ mod tests {
 
     #[test]
     fn only_current_self_injection_can_expose_a_live_context() {
-        let context = core::ptr::NonNull::<u8>::dangling().as_ptr().cast();
+        let context = core::ptr::NonNull::<u64>::dangling().as_ptr().cast();
         for state in [
             FWPS_PACKET_INJECTION_STATE::FWPS_PACKET_NOT_INJECTED,
             FWPS_PACKET_INJECTION_STATE::FWPS_PACKET_INJECTED_BY_SELF,
@@ -1292,11 +1322,12 @@ mod tests {
     }
 
     #[test]
-    fn only_inbound_loopback_uses_ale_network_send() {
+    fn ale_loopback_multicast_uses_transport_not_network_send() {
         for protocol in [TransportProtocol::Tcp, TransportProtocol::Udp] {
-            assert!(protocol.uses_network_send_for_ale(true, true));
-            assert!(!protocol.uses_network_send_for_ale(false, true));
-            assert!(!protocol.uses_network_send_for_ale(true, false));
+            assert!(protocol.uses_network_send_for_ale(true, true, false));
+            assert!(!protocol.uses_network_send_for_ale(false, true, false));
+            assert!(!protocol.uses_network_send_for_ale(true, false, false));
+            assert!(!protocol.uses_network_send_for_ale(true, true, true));
         }
     }
 

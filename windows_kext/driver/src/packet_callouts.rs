@@ -253,6 +253,19 @@ fn ip_packet_layer(
         };
         first = false;
 
+        // A multicast datagram has not yet been delivered to any particular
+        // socket here. Its tuple may have multiple receiving endpoints with
+        // different verdicts, so do not apply a tuple-only cached policy to it.
+        // ALE receive/accept sees the concrete endpoint and enforces its verdict.
+        if unlikely(
+            inbound
+                && key.protocol == smoltcp::wire::IpProtocol::Udp
+                && key.local_address.is_multicast(),
+        ) {
+            data.action_permit();
+            continue;
+        }
+
         let transport_protocol = matches!(
             key.protocol,
             smoltcp::wire::IpProtocol::Tcp | smoltcp::wire::IpProtocol::Udp

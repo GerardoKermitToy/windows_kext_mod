@@ -96,6 +96,13 @@ impl ClassifyDefer {
         }
     }
 
+    /// Binds a saved multicast packet to the receiving connection generation.
+    pub fn set_multicast_instance_id(&mut self, instance_id: u64) {
+        if let Some(packet) = self.packet_list.as_mut() {
+            packet.set_multicast_instance_id(instance_id);
+        }
+    }
+
     /// Completes an ALE operation or returns a saved reauthorization packet.
     ///
     /// This method is callable from a classify callback, including at

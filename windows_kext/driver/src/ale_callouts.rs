@@ -1,6 +1,7 @@
 use crate::ale_policy::{
-    can_reuse_ended_tcp_policy, classify_ale_injection, self_injected_endpoint_identifies_socket,
-    should_capture_ale_packet, should_permit_ale_tcp_reset, should_skip_cross_direction_ale_clone,
+    can_reuse_ended_tcp_policy, classify_ale_injection, multicast_replay_matches,
+    self_injected_endpoint_identifies_socket, should_capture_ale_packet,
+    should_permit_ale_tcp_reset, should_skip_cross_direction_ale_clone,
     should_skip_injected_outbound_flow, should_skip_raw_receive, AleInjectionAction,
     InjectionStatus,
 };
@@ -489,7 +490,47 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
         _ => endpoint_handle,
     };
 
+    // The network tuple alone cannot identify a multicast receiver. Require a
+    // concrete socket identity rather than borrowing another process's verdict.
+    let multicast_endpoint = if matches!(ale_data.protocol, IpProtocol::Udp)
+        && matches!(ale_data.connection_direction, Direction::Inbound)
+        && matches!(ale_data.packet_direction, Direction::Inbound)
+        && key.local_address.is_multicast()
+    {
+        let Some(endpoint) = endpoint_handle else {
+            crate::err!("multicast receive authorization has no endpoint: {}", key);
+            data.action_block_hard();
+            return;
+        };
+        Some(endpoint)
+    } else {
+        None
+    };
+
+    if let Some(endpoint) = multicast_endpoint.filter(|_| {
+        injection_status.is_self_injected() && !network_injection_origin.is_self_injected()
+    }) {
+        // A transport replay fans out to every matching socket. Permit it only
+        // for the exact generation that owned the saved packet. Network-layer
+        // injections, by contrast, still need normal per-receiver authorization.
+        // SAFETY: WFP owns the NBL for this classify callback.
+        let target = unsafe { device.injector.transport_multicast_target(layer_data as _) };
+        let live_id = device
+            .connection_cache
+            .read_multicast_receiver(&key, endpoint)
+            .map(|(_, live_id, _)| live_id);
+        if target.is_some_and(|instance_id| multicast_replay_matches(instance_id, live_id)) {
+            data.action_permit();
+        } else {
+            data.action_block_hard();
+        }
+        return;
+    }
+
     match injection_action {
+        // The only self-injected multicast indication reaching this branch is
+        // an ordinary network injection that still needs per-receiver policy.
+        AleInjectionAction::PermitSelfInjected if multicast_endpoint.is_some() => {}
         AleInjectionAction::PermitSelfInjected => {
             if self_injected_endpoint_identifies_socket(ale_data.packet_direction) {
                 if let Some(connection_instance_id) =
@@ -587,20 +628,25 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
     }
 
     // Check if connection is already in cache.
-    let cached = if unlikely(ale_data.is_ipv6) {
+    let cached = if let Some(endpoint) = multicast_endpoint {
         device
             .connection_cache
-            .read_connection_v6(&key, |conn| -> Option<(Verdict, u64, bool)> {
-                // Function is behind spin lock, just copy and return.
-                Some((conn.verdict, conn.get_instance_id(), true))
-            })
+            .read_multicast_receiver(&key, endpoint)
+            .map(|(verdict, instance_id, tracked)| (verdict, instance_id, true, tracked))
+    } else if unlikely(ale_data.is_ipv6) {
+        device.connection_cache.read_connection_v6(
+            &key,
+            |conn| -> Option<(Verdict, u64, bool, bool)> {
+                Some((conn.verdict, conn.get_instance_id(), true, false))
+            },
+        )
     } else {
-        device
-            .connection_cache
-            .read_connection_v4(&key, |conn| -> Option<(Verdict, u64, bool)> {
-                // Function is behind spin lock, just copy and return.
-                Some((conn.verdict, conn.get_instance_id(), true))
-            })
+        device.connection_cache.read_connection_v4(
+            &key,
+            |conn| -> Option<(Verdict, u64, bool, bool)> {
+                Some((conn.verdict, conn.get_instance_id(), true, false))
+            },
+        )
     };
     // Completing or reinjecting a pended operation can produce one final TCP
     // reauthorization after endpoint closure has ended its cache generation. Its
@@ -615,22 +661,22 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
         if unlikely(ale_data.is_ipv6) {
             device.connection_cache.read_ended_connection_v6(
                 &key,
-                |conn| -> Option<(Verdict, u64, bool)> {
-                    Some((conn.verdict, conn.get_instance_id(), false))
+                |conn| -> Option<(Verdict, u64, bool, bool)> {
+                    Some((conn.verdict, conn.get_instance_id(), false, false))
                 },
             )
         } else {
             device.connection_cache.read_ended_connection_v4(
                 &key,
-                |conn| -> Option<(Verdict, u64, bool)> {
-                    Some((conn.verdict, conn.get_instance_id(), false))
+                |conn| -> Option<(Verdict, u64, bool, bool)> {
+                    Some((conn.verdict, conn.get_instance_id(), false, false))
                 },
             )
         }
     });
 
     // Connection already in cache.
-    if let Some((verdict, connection_instance_id, live)) = cached {
+    if let Some((verdict, connection_instance_id, live, multicast_tracked)) = cached {
         if live {
             // Outbound TCP reauthorization may omit the optional parent. Keep
             // its existing resource/flow identity instead of adding a detached
@@ -640,7 +686,9 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
                 (IpProtocol::Tcp, Direction::Outbound)
             ) && ale_data.reauthorize
                 && parent_endpoint_handle.is_none();
-            if !parentless_tcp_reauthorization {
+            if !parentless_tcp_reauthorization
+                && (multicast_endpoint.is_none() || !multicast_tracked)
+            {
                 track_endpoint_instance(
                     device,
                     endpoint_handle,
@@ -657,6 +705,36 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
             );
         }
         crate::dbg!("processing existing connection: {} {}", key, verdict);
+        // Temporary verdicts apply to one datagram, not to the socket's future
+        // traffic. Multicast bypasses packet-layer policy, so request the next
+        // decision here rather than treating an old Accept/Block/Drop as permanent.
+        if multicast_endpoint.is_some()
+            && matches!(verdict, Verdict::Accept | Verdict::Block | Verdict::Drop)
+        {
+            match save_packet(device, &mut data, &ale_data, false) {
+                Ok(Some(packet)) => {
+                    if let Some(pending) = device.publish_pending_packet(
+                        (key, packet),
+                        Some(connection_instance_id),
+                        ale_data.process_id,
+                        ale_data.connection_metadata(&data),
+                        ale_data.packet_direction,
+                        true,
+                    ) {
+                        if let Err(err) = device.inject_packet(pending.packet, true) {
+                            crate::err!("failed to discard stale multicast packet: {}", err);
+                        }
+                    }
+                }
+                Ok(None) => return,
+                Err(err) => {
+                    crate::err!("failed to pend multicast packet: {}", err);
+                    return;
+                }
+            }
+            data.block_and_absorb();
+            return;
+        }
         match verdict {
             // No verdict yet
             Verdict::Undecided if unlikely(!live) => {
@@ -776,12 +854,21 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
         // lookup and insertion under one write guard, so a concurrent classify
         // callback cannot create another live entry for this tuple. UDP starts
         // untracked and is promoted only after endpoint association succeeds.
-        let registration_result = device.connection_cache.register_ale_connection(
-            &key,
-            ale_data.process_id,
-            ale_data.get_thread_id(device),
-            ale_data.connection_direction,
-        );
+        let registration_result = if let Some(endpoint) = multicast_endpoint {
+            device.connection_cache.register_multicast_receiver(
+                &key,
+                endpoint,
+                ale_data.process_id,
+                ale_data.get_thread_id(device),
+            )
+        } else {
+            device.connection_cache.register_ale_connection(
+                &key,
+                ale_data.process_id,
+                ale_data.get_thread_id(device),
+                ale_data.connection_direction,
+            )
+        };
         let registration = match registration_result {
             Ok(registration) => {
                 if registration.inserted {
@@ -1851,10 +1938,21 @@ pub fn ale_flow_established_monitor(data: CalloutData) {
                 })
             };
             associated.or_else(|| {
-                device
-                    .connection_cache
-                    .get_untracked_connection_instance_id(&key)
+                if key.local_address.is_multicast() {
+                    // Never bind a flow to another receiver's tuple or resurrect
+                    // an endpoint association already consumed by closure.
+                    device
+                        .connection_cache
+                        .read_multicast_receiver(&key, endpoint_handle)
+                        .and_then(|(_, instance_id, tracked)| (!tracked).then_some(instance_id))
+                } else {
+                    device
+                        .connection_cache
+                        .get_untracked_connection_instance_id(&key)
+                }
             })
+        } else if key.local_address.is_multicast() {
+            None
         } else {
             device.connection_cache.get_connection_instance_id(&key)
         };

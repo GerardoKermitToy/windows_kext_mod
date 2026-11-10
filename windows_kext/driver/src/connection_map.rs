@@ -478,7 +478,11 @@ fn matches_endpoint<T: Connection>(
         .unwrap_or(true);
     let lifecycle_matches = !untracked_only || !connection.has_native_lifecycle();
 
-    !connection.has_ended() && address_matches && process_matches && lifecycle_matches
+    !connection.has_ended()
+        && connection.get_multicast_endpoint() == 0
+        && address_matches
+        && process_matches
+        && lifecycle_matches
 }
 
 #[inline]
@@ -516,7 +520,11 @@ impl<T: Connection + Clone> ConnectionMap<T> {
         self.insert_if_absent_with(conn, |_| {})
     }
 
-    /// Inserts `conn` only when its exact tuple has no live cache entry.
+    /// Inserts a connection if its exact tuple and multicast owner are not live.
+    ///
+    /// Ordinary connections use owner zero and retain tuple-only deduplication.
+    /// Inbound multicast uses the WFP receiving endpoint to keep each socket's
+    /// PID, verdict, and generation independent.
     ///
     /// The caller owns the map exclusively for this entire check-and-insert, so
     /// two classify callbacks cannot both observe absence and create duplicate
@@ -532,16 +540,18 @@ impl<T: Connection + Clone> ConnectionMap<T> {
         let key = conn.get_key();
         let endpoint = remote_endpoint_from_connection(&conn);
         let instance_id = conn.get_instance_id();
+        let multicast_endpoint = conn.get_multicast_endpoint();
         let connections = self
             .0
             .entry(key.small())
             .or_insert_with(RemoteConnections::empty);
 
         if let Some(bucket) = connections.get_mut(&endpoint) {
-            if let Some(existing) = bucket
-                .iter_mut()
-                .find(|existing| existing.remote_equals(&key) && !existing.has_ended())
-            {
+            if let Some(existing) = bucket.iter_mut().find(|existing| {
+                existing.get_multicast_endpoint() == multicast_endpoint
+                    && !existing.has_ended()
+                    && existing.remote_equals(&key)
+            }) {
                 let existing_id = existing.get_instance_id();
                 update_existing(existing);
                 return Err((conn, existing_id));
@@ -633,6 +643,40 @@ impl<T: Connection + Clone> ConnectionMap<T> {
         })?;
         refresh_untracked_activity(conn);
         Some(conn)
+    }
+
+    /// Reads one multicast receiver's live policy without consulting another
+    /// socket that happens to have the same network tuple.
+    pub fn read_multicast_endpoint<C>(
+        &self,
+        key: &Key,
+        endpoint: u64,
+        read_connection: impl FnOnce(&T) -> Option<C>,
+    ) -> Option<C> {
+        if unlikely(endpoint == 0) {
+            return None;
+        }
+        // Newer generations are at the end; check the inexpensive endpoint
+        // identity first so old owners do not require full tuple comparisons.
+        let connection = self.bucket(key)?.iter().rev().find(|connection| {
+            connection.get_multicast_endpoint() == endpoint
+                && !connection.has_ended()
+                && connection.remote_equals(key)
+        })?;
+        read_connection(connection)
+    }
+
+    /// Updates all live generations of a tuple. Control-plane UpdateV4/V6 has
+    /// no endpoint field, so a tuple-scoped update must not target an arbitrary
+    /// one of several multicast receivers.
+    pub fn for_each_live_match(&mut self, key: &Key, mut update: impl FnMut(&mut T)) {
+        if let Some(bucket) = self.bucket_mut(key) {
+            for connection in bucket.iter_mut() {
+                if connection.remote_equals(key) && !connection.has_ended() {
+                    update(connection);
+                }
+            }
+        }
     }
 
     /// Returns the live UDP PID with these addresses and the lowest remote port.

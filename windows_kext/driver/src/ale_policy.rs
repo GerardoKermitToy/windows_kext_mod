@@ -10,6 +10,13 @@ pub(crate) fn should_skip_raw_receive(raw_endpoint: bool, inbound: bool) -> bool
     raw_endpoint && inbound
 }
 
+/// A replay may reach every subscriber, but only the exact live generation
+/// that requested its verdict may receive it. Never match an absent identity.
+#[inline]
+pub(crate) fn multicast_replay_matches(target: u64, receiver: Option<u64>) -> bool {
+    target != 0 && receiver == Some(target)
+}
+
 /// Policy result after combining the network and transport injection handles.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AleInjectionAction {
@@ -216,14 +223,23 @@ pub(crate) fn self_injected_packet_needs_accept_authorization(
 mod tests {
     use super::{
         can_reuse_ended_tcp_policy, classify_ale_injection, classify_packet_injection,
-        inbound_udp_fallback_pid, self_injected_endpoint_identifies_socket,
-        self_injected_packet_needs_accept_authorization, should_capture_ale_packet,
-        should_permit_ale_tcp_reset, should_skip_cross_direction_ale_clone,
-        should_skip_injected_outbound_flow, should_skip_raw_receive, AleInjectionAction,
-        InjectionStatus, PacketInjectionAction,
+        inbound_udp_fallback_pid, multicast_replay_matches,
+        self_injected_endpoint_identifies_socket, self_injected_packet_needs_accept_authorization,
+        should_capture_ale_packet, should_permit_ale_tcp_reset,
+        should_skip_cross_direction_ale_clone, should_skip_injected_outbound_flow,
+        should_skip_raw_receive, AleInjectionAction, InjectionStatus, PacketInjectionAction,
     };
     use crate::connection::Direction;
     use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Address, Ipv6Address};
+
+    #[test]
+    fn multicast_replay_requires_the_exact_live_generation() {
+        assert!(multicast_replay_matches(10, Some(10)));
+        assert!(!multicast_replay_matches(10, Some(11)));
+        assert!(!multicast_replay_matches(10, None));
+        assert!(!multicast_replay_matches(0, None));
+        assert!(!multicast_replay_matches(0, Some(0)));
+    }
 
     #[test]
     fn raw_receive_copies_never_enter_native_connection_lifecycle() {
