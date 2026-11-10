@@ -631,7 +631,7 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
     let cached = if let Some(endpoint) = multicast_endpoint {
         device
             .connection_cache
-            .read_multicast_receiver(&key, endpoint)
+            .read_active_multicast_receiver(&key, endpoint)
             .map(|(verdict, instance_id, tracked)| (verdict, instance_id, true, tracked))
     } else if unlikely(ale_data.is_ipv6) {
         device.connection_cache.read_connection_v6(
@@ -1553,15 +1553,28 @@ fn end_untracked_local_endpoint_v6(
     }
 }
 
-pub(crate) fn expire_inactive_untracked_connections(device: &Device) {
-    let (ended_v4, ended_v6) = device.connection_cache.end_inactive_untracked_connections();
+pub(crate) fn expire_inactive_connections(device: &Device) {
+    // Enqueue multicast END under the same family-map write guard that ends the
+    // exact generation. A replacement cannot publish CONN before the old END.
+    // Complete pending packets outside locks.
+    let now = wdk::utils::get_monotonic_timestamp_ms();
+    let (ended_v4, ended_v6) = device.connection_cache.end_inactive_connections(
+        now,
+        |connection| emit_connection_end_v4(device, connection.clone(), 0),
+        |connection| emit_connection_end_v6(device, connection.clone(), 0),
+    );
     retire_pending_connections(device, &ended_v4);
     retire_pending_connections(device, &ended_v6);
+    // The multicast events were already enqueued while holding the map guard.
     for conn in ended_v4 {
-        emit_connection_end_v4(device, conn, 0);
+        if conn.get_multicast_endpoint() == 0 {
+            emit_connection_end_v4(device, conn, 0);
+        }
     }
     for conn in ended_v6 {
-        emit_connection_end_v6(device, conn, 0);
+        if conn.get_multicast_endpoint() == 0 {
+            emit_connection_end_v6(device, conn, 0);
+        }
     }
 }
 

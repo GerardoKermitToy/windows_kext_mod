@@ -442,6 +442,11 @@ where
 }
 
 const UNTRACKED_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const MULTICAST_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+// A multicast receive was observed since the previous cleanup. The family-map
+// read guard protects this marker against cleanup's exclusive write guard. A
+// receive sets it only when unset; concurrent readers may store it more than once.
+const MULTICAST_ACTIVITY_SEEN: u64 = u64::MAX;
 
 fn should_expire_untracked<T: Connection>(connection: &T, cutoff: u64) -> bool {
     !connection.has_ended()
@@ -651,6 +656,7 @@ impl<T: Connection + Clone> ConnectionMap<T> {
         &self,
         key: &Key,
         endpoint: u64,
+        mark_activity: bool,
         read_connection: impl FnOnce(&T) -> Option<C>,
     ) -> Option<C> {
         if unlikely(endpoint == 0) {
@@ -663,6 +669,9 @@ impl<T: Connection + Clone> ConnectionMap<T> {
                 && !connection.has_ended()
                 && connection.remote_equals(key)
         })?;
+        if mark_activity && connection.get_last_accessed_time() != MULTICAST_ACTIVITY_SEEN {
+            connection.set_last_accessed_time(MULTICAST_ACTIVITY_SEEN);
+        }
         read_connection(connection)
     }
 
@@ -902,36 +911,48 @@ impl<T: Connection + Clone> ConnectionMap<T> {
         None
     }
 
-    /// Ends idle-expirable fallback entries not observed for one minute.
-    ///
-    /// Native endpoint and flow callbacks remain authoritative for tracked state.
-    /// Ordinary inbound ALE state is not idle-expired: an authorized flow might not
-    /// revisit ALE and must continue to find cached policy. Heuristic inbound
-    /// packet-layer entries may expire until associated with a real endpoint.
+    /// Exercises the production idle sweep with the test clock.
+    #[cfg(test)]
     pub fn end_inactive_untracked_connections(&mut self) -> Vec<T> {
-        let now = get_monotonic_timestamp_ms();
-        let cutoff = now.saturating_sub(UNTRACKED_IDLE_TIMEOUT.as_millis() as u64);
-        let count = self
-            .0
-            .values()
-            .map(|connections| {
-                connections
-                    .values()
-                    .flat_map(ConnectionBucket::iter)
-                    .filter(|connection| should_expire_untracked(*connection, cutoff))
-                    .count()
-            })
-            .sum();
-        let mut ended = Vec::with_capacity(count);
+        self.end_inactive_connections(get_monotonic_timestamp_ms(), |_| {})
+    }
 
+    /// Ends idle fallbacks and multicast receiver generations in one sweep.
+    /// Tracked multicast is included because WFP's global ALE flow does not
+    /// independently expire each remote peer. Unicast keeps its native lifecycle.
+    ///
+    /// A seen marker is converted to the sweep timestamp instead of expiring it.
+    /// This deliberately rounds activity up to a cleanup pass and never requires
+    /// a clock query on the per-packet path. `on_multicast_end` runs while the map
+    /// is write locked, so END can be queued before a replacement publishes.
+    pub fn end_inactive_connections(
+        &mut self,
+        now: u64,
+        mut on_multicast_end: impl FnMut(&T),
+    ) -> Vec<T> {
+        let multicast_cutoff = now.saturating_sub(MULTICAST_IDLE_TIMEOUT.as_millis() as u64);
+        let untracked_cutoff = now.saturating_sub(UNTRACKED_IDLE_TIMEOUT.as_millis() as u64);
+        let mut ended = Vec::new();
         for connections in self.0.values_mut() {
-            for conn in connections
+            for connection in connections
                 .values_mut()
                 .flat_map(ConnectionBucket::iter_mut)
             {
-                if should_expire_untracked(conn, cutoff) {
-                    conn.end(now);
-                    ended.push(conn.clone());
+                if connection.has_ended() {
+                    continue;
+                }
+                if connection.get_multicast_endpoint() != 0 {
+                    let last = connection.get_last_accessed_time();
+                    if last == MULTICAST_ACTIVITY_SEEN {
+                        connection.set_last_accessed_time(now);
+                    } else if last < multicast_cutoff {
+                        connection.end(now);
+                        on_multicast_end(connection);
+                        ended.push(connection.clone());
+                    }
+                } else if should_expire_untracked(connection, untracked_cutoff) {
+                    connection.end(now);
+                    ended.push(connection.clone());
                 }
             }
         }

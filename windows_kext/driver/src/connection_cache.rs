@@ -285,32 +285,56 @@ impl ConnectionCache {
         }
     }
 
-    /// Looks up the policy and generation for one receiving socket only.
+    /// Looks up one receiving socket without treating bookkeeping as traffic.
     pub fn read_multicast_receiver(
         &self,
         key: &Key,
         endpoint: u64,
     ) -> Option<(Verdict, u64, bool)> {
+        self.read_multicast_receiver_inner(key, endpoint, false)
+    }
+
+    /// Looks up a receiving socket and marks a real packet as activity.
+    pub fn read_active_multicast_receiver(
+        &self,
+        key: &Key,
+        endpoint: u64,
+    ) -> Option<(Verdict, u64, bool)> {
+        self.read_multicast_receiver_inner(key, endpoint, true)
+    }
+
+    fn read_multicast_receiver_inner(
+        &self,
+        key: &Key,
+        endpoint: u64,
+        mark_activity: bool,
+    ) -> Option<(Verdict, u64, bool)> {
         if unlikely(key.is_ipv6()) {
-            self.connections_v6
-                .read_lock()
-                .read_multicast_endpoint(key, endpoint, |connection| {
+            self.connections_v6.read_lock().read_multicast_endpoint(
+                key,
+                endpoint,
+                mark_activity,
+                |connection| {
                     Some((
                         connection.verdict,
                         connection.get_instance_id(),
                         connection.has_native_lifecycle(),
                     ))
-                })
+                },
+            )
         } else {
-            self.connections_v4
-                .read_lock()
-                .read_multicast_endpoint(key, endpoint, |connection| {
+            self.connections_v4.read_lock().read_multicast_endpoint(
+                key,
+                endpoint,
+                mark_activity,
+                |connection| {
                     Some((
                         connection.verdict,
                         connection.get_instance_id(),
                         connection.has_native_lifecycle(),
                     ))
-                })
+                },
+            )
         }
     }
 
@@ -710,6 +734,7 @@ impl ConnectionCache {
     }
 
     /// Ends idle-expirable fallback entries without native endpoint or flow identity.
+    #[cfg(test)]
     pub fn end_inactive_untracked_connections(&self) -> (Vec<ConnectionV4>, Vec<ConnectionV6>) {
         let v4 = {
             let mut connections = self.connections_v4.write_lock();
@@ -719,6 +744,25 @@ impl ConnectionCache {
             let mut connections = self.connections_v6.write_lock();
             connections.end_inactive_untracked_connections()
         };
+        (v4, v6)
+    }
+
+    /// Ends idle fallbacks and multicast peers under the family-map write guard.
+    /// Callbacks enqueue multicast END; packet completion happens outside locks.
+    pub fn end_inactive_connections(
+        &self,
+        now: u64,
+        on_v4_end: impl FnMut(&ConnectionV4),
+        on_v6_end: impl FnMut(&ConnectionV6),
+    ) -> (Vec<ConnectionV4>, Vec<ConnectionV6>) {
+        let v4 = self
+            .connections_v4
+            .write_lock()
+            .end_inactive_connections(now, on_v4_end);
+        let v6 = self
+            .connections_v6
+            .write_lock()
+            .end_inactive_connections(now, on_v6_end);
         (v4, v6)
     }
 
@@ -923,6 +967,151 @@ mod tests {
                 Some((Verdict::PermanentDrop, _, _))
             ));
         }
+    }
+
+    #[test]
+    fn inactive_multicast_expires_per_receiver_without_touching_unicast() {
+        let tuple = Key {
+            protocol: IpProtocol::Udp,
+            local_address: IpAddress::Ipv4(Ipv4Address::new(239, 255, 42, 101)),
+            local_port: 5353,
+            remote_address: IpAddress::Ipv4(Ipv4Address::new(192, 0, 2, 1)),
+            remote_port: 40_000,
+        };
+        let tuple_v6 = Key {
+            local_address: IpAddress::Ipv6(Ipv6Address::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb)),
+            remote_address: IpAddress::Ipv6(Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)),
+            ..tuple
+        };
+        let unicast = Key {
+            local_address: IpAddress::Ipv4(Ipv4Address::new(192, 0, 2, 2)),
+            ..tuple
+        };
+        let cache = ConnectionCache::new();
+        let active = cache
+            .register_multicast_receiver(&tuple, 10, 100, 0)
+            .unwrap();
+        let idle = cache
+            .register_multicast_receiver(&tuple, 20, 200, 0)
+            .unwrap();
+        let idle_v6 = cache
+            .register_multicast_receiver(&tuple_v6, 30, 300, 0)
+            .unwrap();
+        let ordinary = cache
+            .register_connection(&unicast, 400, Direction::Inbound)
+            .unwrap();
+        for (key, instance) in [
+            (tuple, active.instance_id),
+            (tuple, idle.instance_id),
+            (tuple_v6, idle_v6.instance_id),
+        ] {
+            assert!(cache.mark_connection_instance_tracked(&key, instance));
+        }
+        cache.update_connection_instance(tuple, active.instance_id, Verdict::PermanentAccept);
+        cache.update_connection_instance(tuple, idle.instance_id, Verdict::PermanentBlock);
+
+        // Passive flow bookkeeping must not keep an idle receiver alive.
+        assert!(cache.read_multicast_receiver(&tuple, 20).is_some());
+        // Real packet activity is sampled under the map's read guard.
+        assert!(cache.read_active_multicast_receiver(&tuple, 10).is_some());
+        let mut notifications_v4 = Vec::new();
+        let mut notifications_v6 = Vec::new();
+        let (ended_v4, ended_v6) = cache.end_inactive_connections(
+            60_001,
+            |conn| notifications_v4.push(conn.get_instance_id()),
+            |conn| notifications_v6.push(conn.get_instance_id()),
+        );
+        assert_eq!(notifications_v4, vec![idle.instance_id]);
+        assert_eq!(notifications_v6, vec![idle_v6.instance_id]);
+        assert_eq!(ended_v4[0].get_instance_id(), idle.instance_id);
+        assert_eq!(ended_v6[0].get_instance_id(), idle_v6.instance_id);
+        assert!(
+            matches!(cache.read_multicast_receiver(&tuple, 10), Some((Verdict::PermanentAccept, id, _)) if id == active.instance_id)
+        );
+        assert!(cache.read_multicast_receiver(&tuple, 20).is_none());
+        assert!(cache
+            .with_live_connection_instance(&unicast, ordinary.instance_id, Some)
+            .is_some());
+
+        // Once observed activity also goes quiet, it expires exactly once.
+        let (none_v4, none_v6) = cache.end_inactive_connections(
+            120_001,
+            |_| panic!("not idle yet"),
+            |_| panic!("already ended"),
+        );
+        assert!(none_v4.is_empty() && none_v6.is_empty());
+        let (ended_v4, _) = cache.end_inactive_connections(120_002, |_| {}, |_| {});
+        assert_eq!(ended_v4.len(), 1);
+        assert_eq!(ended_v4[0].get_instance_id(), active.instance_id);
+        assert!(cache
+            .end_inactive_connections(
+                180_003,
+                |_| panic!("duplicate END"),
+                |_| panic!("duplicate END")
+            )
+            .0
+            .is_empty());
+        let replacement = cache
+            .register_multicast_receiver(&tuple, 10, 100, 0)
+            .unwrap();
+        assert_ne!(replacement.instance_id, active.instance_id);
+        assert!(replacement.inserted);
+    }
+
+    #[test]
+    fn multicast_idle_end_is_queued_before_replacement_can_register() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let tuple = Key {
+            protocol: IpProtocol::Udp,
+            local_address: IpAddress::Ipv4(Ipv4Address::new(239, 255, 42, 101)),
+            local_port: 5353,
+            remote_address: IpAddress::Ipv4(Ipv4Address::new(192, 0, 2, 1)),
+            remote_port: 40_000,
+        };
+        let cache = ConnectionCache::new();
+        let original = cache
+            .register_multicast_receiver(&tuple, 10, 100, 0)
+            .unwrap();
+        let (end_tx, end_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (registered_tx, registered_rx) = mpsc::channel();
+
+        std::thread::scope(|scope| {
+            let cache = &cache;
+            scope.spawn(move || {
+                let (ended, _) = cache.end_inactive_connections(
+                    60_001,
+                    |connection| {
+                        end_tx.send(connection.get_instance_id()).unwrap();
+                        release_rx.recv().unwrap();
+                    },
+                    |_| {},
+                );
+                assert_eq!(ended.len(), 1);
+            });
+            assert_eq!(
+                end_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+                original.instance_id
+            );
+            scope.spawn(move || {
+                started_tx.send(()).unwrap();
+                let replacement = cache
+                    .register_multicast_receiver(&tuple, 10, 100, 0)
+                    .unwrap();
+                registered_tx.send(replacement).unwrap();
+            });
+            started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(registered_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err());
+            release_tx.send(()).unwrap();
+            let replacement = registered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(replacement.inserted);
+            assert_ne!(replacement.instance_id, original.instance_id);
+        });
     }
 
     #[test]
