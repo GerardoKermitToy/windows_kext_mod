@@ -182,7 +182,10 @@ impl InjectionPath {
 /// WFP may invoke this function at any IRQL up to `DISPATCH_LEVEL`. The callback
 /// must use only nonpaged code/data, must not block, and must remain callable until
 /// [`Injector::destroy`] has returned after draining all injection completions.
-pub type InjectionFailureCallback = unsafe fn(InjectionPath, NTSTATUS);
+/// Packet bytes, when present, are borrowed from the owned network clone and
+/// are valid only for the duration of the callback. Transport completions do not
+/// necessarily contain an IP header and pass `None`.
+pub type InjectionFailureCallback = unsafe fn(InjectionPath, NTSTATUS, Option<&[u8]>);
 
 #[derive(Clone, Copy)]
 struct InjectionCompletion {
@@ -191,7 +194,7 @@ struct InjectionCompletion {
 }
 
 impl InjectionCompletion {
-    fn report_if_failed(self, status: NTSTATUS) {
+    fn report_if_failed(self, status: NTSTATUS, packet: Option<&[u8]>) {
         // Match NT_SUCCESS: zero and positive informational statuses are not
         // failures. Immediate negative statuses never reach this completion path.
         if likely(status >= 0) {
@@ -200,7 +203,7 @@ impl InjectionCompletion {
         if let Some(callback) = self.failure_callback {
             // SAFETY: InjectionFailureCallback's contract requires the function to
             // remain callable through handle destruction and support DISPATCH_LEVEL.
-            unsafe { callback(self.path, status) };
+            unsafe { callback(self.path, status, packet) };
         }
     }
 }
@@ -925,9 +928,8 @@ impl Injector {
             return PacketInjectionOrigin::Unknown;
         }
 
-        let state = unsafe {
-            FwpsQueryPacketInjectionState0(inject_handle, nbl, core::ptr::null_mut())
-        };
+        let state =
+            unsafe { FwpsQueryPacketInjectionState0(inject_handle, nbl, core::ptr::null_mut()) };
         packet_injection_origin(state)
     }
 
@@ -1109,14 +1111,23 @@ unsafe extern "system" fn free_packet(
     if let (Some(completion), Some(status)) = (completion, status) {
         // Most completions succeed and need no atomic read. Do not hide errors
         // from other filters, or even this status unless our ALE clone owns it.
-        let recaptured = status == STATUS_PROTOCOL_UNREACHABLE
+        let recaptured = unlikely(status == STATUS_PROTOCOL_UNREACHABLE)
             && unsafe {
                 (*(context as *const NetworkInjectionContext))
                     .recaptured
                     .load(Ordering::Acquire)
             };
-        if !is_recaptured_network_completion(completion.path, status, recaptured) {
-            completion.report_if_failed(status);
+        if unlikely(
+            status < 0 && !is_recaptured_network_completion(completion.path, status, recaptured),
+        ) {
+            // The context still owns the cloned bytes. Borrow them only during the
+            // callback so a failure can be correlated with its original IP header.
+            let packet = unsafe {
+                (*(context as *const NetworkInjectionContext))
+                    .net_buffer_list
+                    .get_data()
+            };
+            completion.report_if_failed(status, packet);
         }
     }
 
@@ -1146,7 +1157,7 @@ unsafe extern "system" fn free_transport_packet(
         Some(unsafe { (*(context as *mut TransportPacketList)).completion })
     };
     if let (Some(completion), Some(status)) = (completion, status) {
-        completion.report_if_failed(status);
+        completion.report_if_failed(status, None);
     }
 
     if !context.is_null() {
@@ -1180,10 +1191,12 @@ mod tests {
     static FAILURE_CALLBACK_COUNT: AtomicUsize = AtomicUsize::new(0);
     static FAILURE_CALLBACK_PATH: AtomicU8 = AtomicU8::new(0);
     static FAILURE_CALLBACK_STATUS: AtomicI32 = AtomicI32::new(0);
+    static FAILURE_CALLBACK_PACKET: AtomicUsize = AtomicUsize::new(0);
 
-    unsafe fn capture_injection_failure(path: InjectionPath, status: i32) {
+    unsafe fn capture_injection_failure(path: InjectionPath, status: i32, packet: Option<&[u8]>) {
         FAILURE_CALLBACK_PATH.store(path as u8, Ordering::Release);
         FAILURE_CALLBACK_STATUS.store(status, Ordering::Release);
+        FAILURE_CALLBACK_PACKET.store(packet.map_or(0, |bytes| bytes.len()), Ordering::Release);
         FAILURE_CALLBACK_COUNT.fetch_add(1, Ordering::AcqRel);
     }
 
@@ -1194,17 +1207,19 @@ mod tests {
         FAILURE_CALLBACK_COUNT.store(0, Ordering::Release);
         FAILURE_CALLBACK_PATH.store(0, Ordering::Release);
         FAILURE_CALLBACK_STATUS.store(0, Ordering::Release);
+        FAILURE_CALLBACK_PACKET.store(0, Ordering::Release);
         let completion = InjectionCompletion {
             path: InjectionPath::TransportReceive,
             failure_callback: Some(capture_injection_failure),
         };
 
-        completion.report_if_failed(0);
-        completion.report_if_failed(1);
+        completion.report_if_failed(0, Some(&[1, 2, 3]));
+        completion.report_if_failed(1, None);
         assert_eq!(FAILURE_CALLBACK_COUNT.load(Ordering::Acquire), 0);
 
-        completion.report_if_failed(STATUS_DATA_NOT_ACCEPTED);
+        completion.report_if_failed(STATUS_DATA_NOT_ACCEPTED, Some(&[1, 2, 3]));
         assert_eq!(FAILURE_CALLBACK_COUNT.load(Ordering::Acquire), 1);
+        assert_eq!(FAILURE_CALLBACK_PACKET.load(Ordering::Acquire), 3);
         assert_eq!(
             FAILURE_CALLBACK_PATH.load(Ordering::Acquire),
             InjectionPath::TransportReceive as u8
@@ -1225,7 +1240,10 @@ mod tests {
             FWPS_PACKET_INJECTION_STATE::FWPS_PACKET_INJECTED_BY_OTHER,
             FWPS_PACKET_INJECTION_STATE::FWPS_PACKET_INJECTION_STATE_MAX,
         ] {
-            assert!(!has_live_network_injection_context(state, core::ptr::null_mut()));
+            assert!(!has_live_network_injection_context(
+                state,
+                core::ptr::null_mut()
+            ));
             assert_eq!(
                 has_live_network_injection_context(state, context),
                 state == FWPS_PACKET_INJECTION_STATE::FWPS_PACKET_INJECTED_BY_SELF,
@@ -1284,15 +1302,11 @@ mod tests {
     #[test]
     fn native_injection_states_preserve_packet_origin() {
         assert_eq!(
-            packet_injection_origin(
-                FWPS_PACKET_INJECTION_STATE::FWPS_PACKET_NOT_INJECTED
-            ),
+            packet_injection_origin(FWPS_PACKET_INJECTION_STATE::FWPS_PACKET_NOT_INJECTED),
             PacketInjectionOrigin::NotInjected
         );
         assert_eq!(
-            packet_injection_origin(
-                FWPS_PACKET_INJECTION_STATE::FWPS_PACKET_INJECTED_BY_SELF
-            ),
+            packet_injection_origin(FWPS_PACKET_INJECTION_STATE::FWPS_PACKET_INJECTED_BY_SELF),
             PacketInjectionOrigin::InjectedBySelf
         );
         assert_eq!(
@@ -1302,15 +1316,11 @@ mod tests {
             PacketInjectionOrigin::InjectedBySelf
         );
         assert_eq!(
-            packet_injection_origin(
-                FWPS_PACKET_INJECTION_STATE::FWPS_PACKET_INJECTED_BY_OTHER
-            ),
+            packet_injection_origin(FWPS_PACKET_INJECTION_STATE::FWPS_PACKET_INJECTED_BY_OTHER),
             PacketInjectionOrigin::InjectedByOther
         );
         assert_eq!(
-            packet_injection_origin(
-                FWPS_PACKET_INJECTION_STATE::FWPS_PACKET_INJECTION_STATE_MAX
-            ),
+            packet_injection_origin(FWPS_PACKET_INJECTION_STATE::FWPS_PACKET_INJECTION_STATE_MAX),
             PacketInjectionOrigin::Unknown
         );
     }

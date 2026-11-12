@@ -229,6 +229,25 @@ impl NetBufferList {
         unsafe { NetBufferListIter::new(self.nbl) }
     }
 
+    /// Returns whether this NBL chain consists of exactly one packet.
+    ///
+    /// The wrapper's construction contract keeps the NBL and its first NET_BUFFER
+    /// live during this check. A classify action applies to the entire NBL chain,
+    /// so a packet-specific permit must not be based on only its first member.
+    pub fn is_single_packet(&self) -> bool {
+        unsafe {
+            let Some(nbl) = self.nbl.as_ref() else {
+                return false;
+            };
+            nbl.Header.next.is_null()
+                && nbl
+                    .Header
+                    .first_net_buffer
+                    .as_ref()
+                    .is_some_and(|buffer| buffer.Next.is_null())
+        }
+    }
+
     pub fn read_bytes(&self, buffer: &mut [u8]) -> Result<(), ()> {
         unsafe {
             let Some(nbl) = self.nbl.as_ref() else {
@@ -761,7 +780,34 @@ impl Drop for NetworkAllocator {
 
 #[cfg(test)]
 mod tests {
-    use super::PacketPrefix;
+    use super::{NetBufferList, PacketPrefix};
+    use crate::ffi::{NET_BUFFER, NET_BUFFER_LIST};
+
+    #[test]
+    fn single_packet_requires_one_nbl_and_one_net_buffer() {
+        // These stack-owned, zeroed native-layout records are only inspected;
+        // no NDIS operations or ownership transfer occur in this test.
+        let mut first: NET_BUFFER = unsafe { core::mem::zeroed() };
+        let mut second: NET_BUFFER = unsafe { core::mem::zeroed() };
+        let mut list: NET_BUFFER_LIST = unsafe { core::mem::zeroed() };
+        let mut next_list: NET_BUFFER_LIST = unsafe { core::mem::zeroed() };
+        let null =
+            core::mem::ManuallyDrop::new(unsafe { NetBufferList::new(core::ptr::null_mut()) });
+        assert!(!null.is_single_packet());
+        let wrapper = core::mem::ManuallyDrop::new(unsafe { NetBufferList::new(&mut list) });
+        assert!(!wrapper.is_single_packet());
+        list.Header.first_net_buffer = &mut first;
+        assert!(!list.Header.first_net_buffer.is_null());
+        assert!(wrapper.is_single_packet());
+        first.Next = &mut second;
+        assert!(!first.Next.is_null());
+        assert!(!wrapper.is_single_packet());
+        first.Next = core::ptr::null_mut();
+        assert!(first.Next.is_null());
+        list.Header.next = &mut next_list;
+        assert!(!list.Header.next.is_null());
+        assert!(!wrapper.is_single_packet());
+    }
 
     #[test]
     fn reader_state_borrows_scratch_storage_without_embedding_it() {

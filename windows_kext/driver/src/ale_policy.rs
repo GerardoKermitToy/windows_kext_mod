@@ -10,6 +10,50 @@ pub(crate) fn should_skip_raw_receive(raw_endpoint: bool, inbound: bool) -> bool
     raw_endpoint && inbound
 }
 
+/// Restricts the notification-only policy to loopback-interface UDP multicast.
+/// Windows loopback uses interface index 1; IPv4 loopback is 127.0.0.0/8.
+#[inline]
+pub(crate) fn is_local_loopback_multicast_udp(
+    loopback: bool,
+    interface_index: u32,
+    protocol: IpProtocol,
+    source: IpAddress,
+    destination: IpAddress,
+) -> bool {
+    loopback
+        && interface_index == 1
+        && protocol == IpProtocol::Udp
+        && has_loopback_multicast_addresses(source, destination)
+}
+
+/// Defer the WFP interface-field read until protocol and addresses can match.
+#[inline]
+pub(crate) fn is_local_loopback_multicast_udp_with_interface(
+    loopback: bool,
+    protocol: IpProtocol,
+    source: IpAddress,
+    destination: IpAddress,
+    interface_index: impl FnOnce() -> u32,
+) -> bool {
+    loopback
+        && protocol == IpProtocol::Udp
+        && has_loopback_multicast_addresses(source, destination)
+        && interface_index() == 1
+}
+
+#[inline]
+fn has_loopback_multicast_addresses(source: IpAddress, destination: IpAddress) -> bool {
+    match (source, destination) {
+        (IpAddress::Ipv4(source), IpAddress::Ipv4(destination)) => {
+            source.is_loopback() && destination.is_multicast()
+        }
+        (IpAddress::Ipv6(source), IpAddress::Ipv6(destination)) => {
+            source.is_loopback() && destination.is_multicast()
+        }
+        _ => false,
+    }
+}
+
 /// A replay may reach every subscriber, but only the exact live generation
 /// that requested its verdict may receive it. Never match an absent identity.
 #[inline]
@@ -223,7 +267,8 @@ pub(crate) fn self_injected_packet_needs_accept_authorization(
 mod tests {
     use super::{
         can_reuse_ended_tcp_policy, classify_ale_injection, classify_packet_injection,
-        inbound_udp_fallback_pid, multicast_replay_matches,
+        inbound_udp_fallback_pid, is_local_loopback_multicast_udp,
+        is_local_loopback_multicast_udp_with_interface, multicast_replay_matches,
         self_injected_endpoint_identifies_socket, self_injected_packet_needs_accept_authorization,
         should_capture_ale_packet, should_permit_ale_tcp_reset,
         should_skip_cross_direction_ale_clone, should_skip_injected_outbound_flow,
@@ -231,6 +276,71 @@ mod tests {
     };
     use crate::connection::Direction;
     use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Address, Ipv6Address};
+
+    #[test]
+    fn loopback_multicast_exception_requires_interface_address_and_udp() {
+        let loopback4 = IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1));
+        let other_loopback4 = IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 2));
+        let lan4 = IpAddress::Ipv4(Ipv4Address::new(192, 0, 2, 10));
+        let multicast4 = IpAddress::Ipv4(Ipv4Address::new(239, 255, 23, 91));
+        let unicast4 = IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 3));
+        let loopback6 = IpAddress::Ipv6(Ipv6Address::new(0, 0, 0, 0, 0, 0, 0, 1));
+        let other6 = IpAddress::Ipv6(Ipv6Address::new(0, 0, 0, 0, 0, 0, 0, 2));
+        let multicast6 = IpAddress::Ipv6(Ipv6Address::new(0xff02, 0, 0, 0, 0, 0, 0, 0x114));
+        let udp = IpProtocol::Udp;
+        for (flag, interface, protocol, source, destination, expected) in [
+            (true, 1, udp, loopback4, multicast4, true),
+            (true, 1, udp, other_loopback4, multicast4, true),
+            (true, 1, udp, loopback6, multicast6, true),
+            (false, 1, udp, loopback4, multicast4, false),
+            (true, 0, udp, loopback4, multicast4, false),
+            (true, 2, udp, loopback4, multicast4, false),
+            (true, 2, udp, loopback6, multicast6, false),
+            (true, 1, IpProtocol::Tcp, loopback4, multicast4, false),
+            (true, 1, IpProtocol::Icmp, loopback4, multicast4, false),
+            (true, 1, udp, lan4, multicast4, false),
+            (true, 1, udp, loopback4, unicast4, false),
+            (true, 1, udp, other6, multicast6, false),
+            (true, 1, udp, loopback4, multicast6, false),
+            (true, 1, udp, multicast4, loopback4, false),
+        ] {
+            assert_eq!(
+                is_local_loopback_multicast_udp(flag, interface, protocol, source, destination),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn loopback_multicast_interface_read_is_deferred() {
+        let loopback = IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1));
+        let unicast = IpAddress::Ipv4(Ipv4Address::new(192, 0, 2, 1));
+        let multicast = IpAddress::Ipv4(Ipv4Address::new(239, 1, 2, 3));
+        let ipv6_multicast = IpAddress::Ipv6(Ipv6Address::new(0xff02, 0, 0, 0, 0, 0, 0, 1));
+        for (flag, protocol, source, destination, index, expected_reads, expected) in [
+            (false, IpProtocol::Udp, loopback, multicast, 1, 0, false),
+            (true, IpProtocol::Tcp, loopback, multicast, 1, 0, false),
+            (true, IpProtocol::Udp, unicast, multicast, 1, 0, false),
+            (true, IpProtocol::Udp, loopback, unicast, 1, 0, false),
+            (true, IpProtocol::Udp, loopback, ipv6_multicast, 1, 0, false),
+            (true, IpProtocol::Udp, loopback, multicast, 18, 1, false),
+            (true, IpProtocol::Udp, loopback, multicast, 1, 1, true),
+        ] {
+            let mut reads = 0;
+            let matched = is_local_loopback_multicast_udp_with_interface(
+                flag,
+                protocol,
+                source,
+                destination,
+                || {
+                    reads += 1;
+                    index
+                },
+            );
+            assert_eq!(reads, expected_reads);
+            assert_eq!(matched, expected);
+        }
+    }
 
     #[test]
     fn multicast_replay_requires_the_exact_live_generation() {

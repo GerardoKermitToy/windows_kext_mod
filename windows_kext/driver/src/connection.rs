@@ -117,6 +117,9 @@ pub struct ConnectionExtra {
     /// Nonzero only for inbound UDP multicast, where one tuple can be received
     /// by several independent sockets with different policies and lifetimes.
     pub(crate) multicast_endpoint: u64,
+    /// Only notification-only sender generations may use a packet-layer permit
+    /// for the loopback UDP multicast exception.
+    pub(crate) observational_multicast_sender: bool,
 }
 
 pub trait Connection {
@@ -260,6 +263,7 @@ impl ConnectionV4 {
                 native_lifecycle,
                 idle_expiration: matches!(direction, Direction::Outbound),
                 multicast_endpoint: 0,
+                observational_multicast_sender: false,
             },
         })
     }
@@ -449,6 +453,7 @@ impl ConnectionV6 {
                 native_lifecycle,
                 idle_expiration: matches!(direction, Direction::Outbound),
                 multicast_endpoint: 0,
+                observational_multicast_sender: false,
             },
         })
     }

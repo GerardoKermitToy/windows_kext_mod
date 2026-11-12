@@ -1,5 +1,5 @@
 use core::mem;
-use likely_stable::likely;
+use likely_stable::{likely, unlikely};
 
 use alloc::{
     collections::{btree_map::Entry as MapEntry, BTreeMap, VecDeque},
@@ -167,7 +167,7 @@ const INITIAL_CAPACITY: usize = 1000;
 /// initial reserve rather than shrinking a cache that is expected to be reused.
 fn release_excess_capacity<T>(values: &mut VecDeque<T>) {
     let capacity = values.capacity();
-    if capacity > INITIAL_CAPACITY && values.len() < capacity / 4 {
+    if unlikely(capacity > INITIAL_CAPACITY && values.len() < capacity / 4) {
         values.shrink_to(INITIAL_CAPACITY);
     }
 }
@@ -232,8 +232,21 @@ impl IdCache {
         queued
     }
 
+    /// Reserves a nonzero event ID without retaining a packet or verdict state.
+    /// Replies are recognized as already completed and cannot affect another request.
+    pub fn issue_notification_id(&mut self) -> Option<u64> {
+        let _guard = self.lock.write_lock();
+        let id = self.next_id;
+        if unlikely(id == 0) {
+            return None;
+        }
+        self.next_id = id.checked_add(1)?;
+        Some(id)
+    }
+
     /// Recognizes late verdicts for requests already retired by endpoint release
-    /// without retaining per-request tombstones. IDs are monotonically assigned.
+    /// and for notification-only events, without retaining per-request tombstones.
+    /// IDs are monotonically assigned.
     pub fn was_issued_id(&self, id: u64) -> bool {
         let _guard = self.lock.read_lock();
         id != 0 && id < self.next_id
@@ -494,7 +507,7 @@ fn push_packet(
         context.process_id,
         context.metadata,
         context.direction,
-        &packet,
+        get_payload(&packet).unwrap_or(&[]),
         context.ale_layer,
     )?;
     values.push_back(Entry {
@@ -523,13 +536,13 @@ fn get_payload(packet: &Packet) -> Option<&[u8]> {
 }
 
 #[cfg(not(test))]
-fn build_info(
+pub(crate) fn build_info(
     key: &Key,
     packet_id: u64,
     process_id: u64,
     metadata: ConnectionMetadata,
     direction: Direction,
-    packet: &Packet,
+    payload: &[u8],
     ale_layer: bool,
 ) -> Option<Info> {
     let (local_port, remote_port) =
@@ -544,11 +557,6 @@ fn build_info(
     } else {
         3 // Network layer
     };
-
-    let mut payload = &[][..];
-    if let Some(p) = get_payload(packet) {
-        payload = p;
-    }
 
     match (key.local_address, key.remote_address) {
         (IpAddress::Ipv6(local_ip), IpAddress::Ipv6(remote_ip)) if key.is_ipv6() => {
@@ -595,9 +603,7 @@ fn build_info(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        add_pending_request, Entry, IdCache, Packet, PendingPacket, INITIAL_CAPACITY,
-    };
+    use super::{add_pending_request, Entry, IdCache, Packet, PendingPacket, INITIAL_CAPACITY};
     use crate::connection_map::Key;
     use alloc::vec;
     use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Address};
@@ -633,6 +639,38 @@ mod tests {
             id,
         });
         add_pending_request(&mut cache.pending_by_instance, connection_instance_id, id);
+    }
+
+    #[test]
+    fn notification_ids_are_nonzero_issued_and_never_pending() {
+        let mut cache = IdCache::new();
+        let first = cache.issue_notification_id().unwrap();
+        let second = cache.issue_notification_id().unwrap();
+        assert_eq!((first, second), (1, 2));
+        assert!(cache.was_issued_id(first));
+        assert!(cache.was_issued_id(second));
+        assert!(cache.pop_id(first).is_none());
+        assert!(cache.pop_id(second).is_none());
+        assert_eq!(cache.get_entries_count(), 0);
+        assert_eq!(cache.next_id, 3);
+        cache.next_id = u64::MAX;
+        assert!(cache.issue_notification_id().is_none());
+        assert_eq!(cache.next_id, u64::MAX);
+    }
+
+    #[test]
+    fn notification_ids_do_not_consume_interleaved_pending_requests() {
+        let mut cache = IdCache::new();
+        let first_notification = cache.issue_notification_id().unwrap();
+        queue(&mut cache, 2, Some(10), false);
+        cache.next_id = 3;
+        let second_notification = cache.issue_notification_id().unwrap();
+        assert!(cache.pop_id(first_notification).is_none());
+        assert!(cache.pop_id(second_notification).is_none());
+        assert_eq!(cache.get_entries_count(), 1);
+        assert!(cache.pop_id(2).is_some());
+        assert!(cache.was_issued_id(first_notification));
+        assert!(cache.was_issued_id(second_notification));
     }
 
     #[test]

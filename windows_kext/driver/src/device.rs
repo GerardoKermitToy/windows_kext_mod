@@ -169,12 +169,57 @@ pub struct Device {
 ///
 /// `Injector` calls this only while the driver image and its static log ring remain
 /// live, at an IRQL no higher than `DISPATCH_LEVEL`.
-unsafe fn report_injection_failure(path: InjectionPath, status: NTSTATUS) {
-    err!(
-        "asynchronous WFP {} injection failed: NTSTATUS({:#010x})",
-        path.as_str(),
-        status as u32
-    );
+unsafe fn report_injection_failure(path: InjectionPath, status: NTSTATUS, packet: Option<&[u8]>) {
+    if let Some(header) = packet.filter(|data| data.len() >= 20 && data[0] >> 4 == 4) {
+        let source =
+            smoltcp::wire::Ipv4Address::new(header[12], header[13], header[14], header[15]);
+        let destination =
+            smoltcp::wire::Ipv4Address::new(header[16], header[17], header[18], header[19]);
+        let id = u16::from_be_bytes([header[4], header[5]]);
+        err!(
+            "asynchronous WFP {} injection failed: NTSTATUS({:#010x}) IPv4 id={} proto={} {} -> {}",
+            path.as_str(),
+            status as u32,
+            id,
+            header[9],
+            source,
+            destination
+        );
+    } else if let Some(header) = packet.filter(|data| data.len() >= 40 && data[0] >> 4 == 6) {
+        let ipv6 = smoltcp::wire::Ipv6Packet::new_unchecked(header);
+        let headers = crate::ipv6_packet::walk_ipv6_headers(header, false);
+        // This bounded fingerprint correlates controlled tests with their event
+        // payloads; it is not a globally unique or security-sensitive packet ID.
+        let fingerprint = header
+            .iter()
+            .take(128)
+            .fold(0xcbf29ce484222325_u64, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+            });
+        let icmp_type = if headers.resolved && headers.protocol == smoltcp::wire::IpProtocol::Icmpv6
+        {
+            header.get(headers.transport_offset).copied()
+        } else {
+            None
+        };
+        err!(
+            "asynchronous WFP {} injection failed: NTSTATUS({:#010x}) IPv6 proto={} type={:?} {} -> {} len={} fingerprint={:016x}",
+            path.as_str(),
+            status as u32,
+            u8::from(headers.protocol),
+            icmp_type,
+            ipv6.src_addr(),
+            ipv6.dst_addr(),
+            header.len(),
+            fingerprint
+        );
+    } else {
+        err!(
+            "asynchronous WFP {} injection failed: NTSTATUS({:#010x})",
+            path.as_str(),
+            status as u32
+        );
+    }
 }
 
 impl Device {
@@ -241,24 +286,34 @@ impl Device {
 
     pub(crate) fn refresh_local_addresses(&self) -> Result<(), NTSTATUS> {
         let addresses = address_monitor::local_address_ranges()?;
-        self.app_interfaces.lock().map_err(|_| STATUS_INVALID_DEVICE_STATE)?
+        self.app_interfaces
+            .lock()
+            .map_err(|_| STATUS_INVALID_DEVICE_STATE)?
             .update_addresses(addresses)
     }
 
     pub(crate) fn set_app_interface(&self, payload: &[u8]) -> Result<(), NTSTATUS> {
-        let command = protocol::command::parse_set_app_interface(payload)
-            .ok_or(STATUS_INVALID_PARAMETER)?;
-        self.app_interfaces.lock().map_err(|_| STATUS_INVALID_DEVICE_STATE)?
+        let command =
+            protocol::command::parse_set_app_interface(payload).ok_or(STATUS_INVALID_PARAMETER)?;
+        self.app_interfaces
+            .lock()
+            .map_err(|_| STATUS_INVALID_DEVICE_STATE)?
             .set(command.app_id, command.luid)
     }
 
     pub(crate) fn stop_app_interface_policies(&self) {
         loop {
-            let result = self.app_interfaces.lock().map_err(|_| STATUS_INVALID_DEVICE_STATE)
+            let result = self
+                .app_interfaces
+                .lock()
+                .map_err(|_| STATUS_INVALID_DEVICE_STATE)
                 .and_then(|mut policies| policies.close());
             match result {
                 Ok(()) => return,
-                Err(status) => err!("failed to close app interface policies: NTSTATUS({:#010x})", status as u32),
+                Err(status) => err!(
+                    "failed to close app interface policies: NTSTATUS({:#010x})",
+                    status as u32
+                ),
             }
             wdk::utils::sleep_ms(1);
         }
@@ -463,7 +518,9 @@ impl Device {
                 }
             };
 
-            if let Err(status) = self.apply_command(command, payload, write_request.get_file_object()) {
+            if let Err(status) =
+                self.apply_command(command, payload, write_request.get_file_object())
+            {
                 return Err(CommandWriteError::new(status, offset));
             }
             offset += 1 + payload.len();
@@ -1042,10 +1099,11 @@ impl Device {
         ale_layer: bool,
     ) -> Option<PendingPacket> {
         let (key, mut packet) = value;
-        if key.protocol == IpProtocol::Udp
-            && key.local_address.is_multicast()
-            && matches!(direction, crate::connection::Direction::Inbound)
-        {
+        if unlikely(
+            key.protocol == IpProtocol::Udp
+                && key.local_address.is_multicast()
+                && matches!(direction, crate::connection::Direction::Inbound),
+        ) {
             if let (Some(instance_id), Packet::AleLayer(defer)) =
                 (connection_instance_id, &mut packet)
             {

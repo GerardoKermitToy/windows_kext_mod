@@ -1,5 +1,6 @@
 use core::fmt;
 
+use likely_stable::unlikely;
 use smoltcp::wire::{
     IpAddress, IpProtocol, Ipv6Address, Ipv6ExtHeader, Ipv6Packet, TcpPacket, UdpPacket,
     IPV6_HEADER_LEN,
@@ -102,7 +103,7 @@ pub(crate) fn walk_ipv6_headers_reader(
     loop {
         match protocol {
             IpProtocol::Ipv6Frag => {
-                if extension_count >= MAX_IPV6_EXT_HEADERS {
+                if unlikely(extension_count >= MAX_IPV6_EXT_HEADERS) {
                     break;
                 }
                 extension_count += 1;
@@ -126,7 +127,7 @@ pub(crate) fn walk_ipv6_headers_reader(
                 }
             }
             IpProtocol::HopByHop | IpProtocol::Ipv6Route | IpProtocol::Ipv6Opts => {
-                if extension_count >= MAX_IPV6_EXT_HEADERS {
+                if unlikely(extension_count >= MAX_IPV6_EXT_HEADERS) {
                     break;
                 }
                 extension_count += 1;
@@ -224,17 +225,17 @@ fn transport_context(packet: &[u8]) -> Result<TransportContext, Ipv6TransportErr
     // in the Hop-by-Hop Jumbo Payload option. smoltcp exposes only the base
     // 16-bit field here, so treating the trailing bytes as a normal transport
     // segment would calculate the wrong pseudo-header length.
-    if ip_packet.payload_len() == 0 && packet.len() > IPV6_HEADER_LEN {
+    if unlikely(ip_packet.payload_len() == 0 && packet.len() > IPV6_HEADER_LEN) {
         return Err(Ipv6TransportError::InvalidPacket);
     }
     let headers = walk_ipv6_headers(&packet[..total_len], false);
-    if !headers.resolved || headers.transport_offset > total_len {
+    if unlikely(!headers.resolved || headers.transport_offset > total_len) {
         return Err(Ipv6TransportError::UnresolvedHeaders);
     }
-    if headers.is_fragment {
+    if unlikely(headers.is_fragment) {
         return Err(Ipv6TransportError::FragmentedPacket);
     }
-    if headers.active_routing_header {
+    if unlikely(headers.active_routing_header) {
         return Err(Ipv6TransportError::ActiveRoutingHeader);
     }
 

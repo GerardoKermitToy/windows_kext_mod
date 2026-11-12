@@ -5,16 +5,19 @@ use smoltcp::wire::{IPV4_HEADER_LEN, IPV6_HEADER_LEN};
 use wdk::filter_engine::callout_data::CalloutData;
 use wdk::filter_engine::layer;
 use wdk::filter_engine::net_buffer::{NetBufferList, NetBufferListClones, NetBufferListIter};
-use wdk::filter_engine::packet::InjectInfo;
+use wdk::filter_engine::packet::{InjectInfo, PacketInjectionOrigin};
 
 use crate::ale_policy::{
-    classify_packet_injection, inbound_udp_fallback_pid, PacketInjectionAction,
+    classify_packet_injection, inbound_udp_fallback_pid,
+    is_local_loopback_multicast_udp_with_interface, PacketInjectionAction,
 };
 use crate::connection::{Connection, ConnectionV4, ConnectionV6, Direction, Verdict};
 use crate::connection_cache::ConnectionCache;
 use crate::connection_map::Key;
 use crate::device::{Device, Packet};
 use crate::id_cache::ConnectionMetadata;
+use crate::igmp_policy::is_loopback_igmp;
+use crate::loopback_icmpv6_policy::is_loopback_icmpv6_multicast;
 use crate::packet_metadata::{IcmpError, PacketInspector, PacketMetadataError};
 use crate::packet_util::{packet_reader, recalc_header_checksums};
 
@@ -149,7 +152,7 @@ fn ip_packet_layer(
     // A higher-priority provider may already have absorbed the packet (for
     // example, NAT forwarding). Never clone or reinject an indication whose
     // action is no longer ours to change.
-    if !data.can_set_action() {
+    if unlikely(!data.can_set_action()) {
         return;
     }
 
@@ -179,6 +182,7 @@ fn ip_packet_layer(
             .injector
             .network_packet_injection_origin(layer_data as _, ipv6)
     };
+    let mut transport_injection_origin = None;
     let injection_action = classify_packet_injection(
         network_injection_origin.is_self_injected(),
         network_injection_origin.is_injected_by_other(),
@@ -191,6 +195,7 @@ fn ip_packet_layer(
                     .injector
                     .transport_packet_injection_origin(layer_data as _)
             };
+            transport_injection_origin = Some(origin);
             (origin.is_self_injected(), origin.is_injected_by_other())
         },
     );
@@ -208,6 +213,9 @@ fn ip_packet_layer(
     };
     let reassembled = data.is_reassembled(fields.flags);
     let mut routing_info = None;
+    // The WFP interface field is indication-wide. Read it only for a qualifying
+    // exception candidate, notification, or pending packet, and reuse it.
+    let mut interface_index_cache = None;
     let mut other_injector_process_id = None;
 
     let mut first = true;
@@ -251,7 +259,71 @@ fn ip_packet_layer(
                 return;
             }
         };
+        // A classify action covers the complete NBL chain, not just the first
+        // packet. These exceptions apply only to a single native packet. The
+        // IPv6 path is limited to ::1 -> ff00::/8 but is independent of ICMPv6
+        // message type and body. Unknown or foreign injection is never bypassed.
+        // Check injection origin only for candidate control protocols; the
+        // policy helpers defer the interface-field read until all other tests pass.
+        let loopback_control = first
+            && !inbound
+            && match (ipv6, key.protocol) {
+                (false, smoltcp::wire::IpProtocol::Igmp)
+                | (true, smoltcp::wire::IpProtocol::Icmpv6) => {
+                    let native_indication = network_injection_origin
+                        == PacketInjectionOrigin::NotInjected
+                        && transport_injection_origin == Some(PacketInjectionOrigin::NotInjected);
+                    let read_interface = || {
+                        *interface_index_cache
+                            .get_or_insert_with(|| data.get_value_u32(fields.interface_index))
+                    };
+                    if ipv6 {
+                        is_loopback_icmpv6_multicast(
+                            true,
+                            true,
+                            read_interface,
+                            key.protocol,
+                            key.local_address,
+                            key.remote_address,
+                            native_indication,
+                        )
+                    } else {
+                        is_loopback_igmp(
+                            true,
+                            false,
+                            read_interface,
+                            key.protocol,
+                            native_indication,
+                        )
+                    }
+                }
+                _ => false,
+            };
         first = false;
+
+        // A loopback multicast send may be indicated twice at the outbound IP
+        // layer, including once without WFP's loopback flag. Absorbing and
+        // reinjecting either indication duplicates local delivery. A 127/8 or
+        // ::1 source restricts this to the loopback-source exception handled by
+        // the inbound notification-only path.
+        if unlikely(
+            !inbound
+                && !injected_by_other
+                && is_local_loopback_multicast_udp_with_interface(
+                    true,
+                    key.protocol,
+                    key.local_address,
+                    key.remote_address,
+                    || {
+                        *interface_index_cache
+                            .get_or_insert_with(|| data.get_value_u32(fields.interface_index))
+                    },
+                )
+                && is_observational_multicast_sender(&device.connection_cache, &key, ipv6),
+        ) {
+            data.action_permit();
+            continue;
+        }
 
         // A multicast datagram has not yet been delivered to any particular
         // socket here. Its tuple may have multiple receiving endpoints with
@@ -441,6 +513,42 @@ fn ip_packet_layer(
             }
         }
 
+        // Publish only after the normal ICMP attribution/normalization above,
+        // so notification-only Echo packets retain their ordinary PID/TID and
+        // direction semantics. This never creates a connection generation.
+        if unlikely(loopback_control && nbl.is_single_packet()) {
+            let length = nbl.get_data_length() as usize;
+            let min_length = if ipv6 { 40 } else { 20 };
+            let max_length = if ipv6 { 65_575 } else { 65_535 };
+            if likely((min_length..=max_length).contains(&length)) {
+                let mut packet = alloc::vec![0_u8; length];
+                if likely(
+                    nbl.read_bytes(&mut packet).is_ok()
+                        // Match ordinary pending-event checksum treatment on this
+                        // copy; never modify the original WFP indication.
+                        && recalc_header_checksums(&mut packet, ipv6).is_ok()
+                        && publish_loopback_control_notification(
+                            device,
+                            &data,
+                            &fields,
+                            interface_index_cache,
+                            &key,
+                            packet,
+                            process_id,
+                            thread_id,
+                            if unlikely(icmp_metadata.is_local_error) {
+                                Direction::Inbound
+                            } else {
+                                effective_direction
+                            },
+                        ),
+                ) {
+                    data.action_permit();
+                    return;
+                }
+            }
+        }
+
         if likely(transport_protocol) {
             if let Some(conn_info) = connection_info {
                 // A new inbound connection must reach ALE_AUTH_RECV_ACCEPT so it
@@ -566,6 +674,7 @@ fn ip_packet_layer(
             &data,
             &fields,
             &mut routing_info,
+            &mut interface_index_cache,
             effective_direction,
             ipv6,
             key.is_loopback(),
@@ -608,6 +717,36 @@ fn ip_packet_layer(
     }
 }
 
+/// Queue every qualifying control indication as an independent packet event.
+/// No connection generation or pending packet is created: its ID accepts and
+/// ignores a userspace verdict, and no connection END is emitted for it.
+fn publish_loopback_control_notification(
+    device: &Device,
+    data: &CalloutData,
+    fields: &PacketLayerFields,
+    interface_index: Option<u32>,
+    key: &Key,
+    packet: alloc::vec::Vec<u8>,
+    process_id: u64,
+    thread_id: u64,
+    direction: Direction,
+) -> bool {
+    let Some(id) = device.packet_cache.write_lock().issue_notification_id() else {
+        crate::err!("unable to allocate loopback control notification ID");
+        return false;
+    };
+    let metadata = ConnectionMetadata {
+        thread_id,
+        compartment_id: data.get_compartment_id().unwrap_or(0),
+        condition_flags: data.get_value_u32(fields.flags),
+        interface_index: interface_index
+            .unwrap_or_else(|| data.get_value_u32(fields.interface_index)),
+        sub_interface_index: data.get_value_u32(fields.sub_interface_index),
+    };
+    crate::id_cache::build_info(key, id, process_id, metadata, direction, &packet, false)
+        .is_some_and(|info| device.event_queue.push(info).is_ok())
+}
+
 struct PacketRoutingInfo {
     compartment_id: Option<u32>,
     interface_index: u32,
@@ -619,6 +758,7 @@ fn packet_inject_info(
     data: &CalloutData,
     fields: &PacketLayerFields,
     routing_info: &mut Option<PacketRoutingInfo>,
+    interface_index: &mut Option<u32>,
     direction: Direction,
     ipv6: bool,
     loopback: bool,
@@ -627,7 +767,8 @@ fn packet_inject_info(
     // Permit/block/drop paths need none of them; cloned NBLs share one snapshot.
     let routing_info = routing_info.get_or_insert_with(|| PacketRoutingInfo {
         compartment_id: data.get_compartment_id(),
-        interface_index: data.get_value_u32(fields.interface_index),
+        interface_index: *interface_index
+            .get_or_insert_with(|| data.get_value_u32(fields.interface_index)),
         sub_interface_index: data.get_value_u32(fields.sub_interface_index),
     });
     InjectInfo {
@@ -674,6 +815,28 @@ fn recalculate_clone_checksum(clone: &mut NetBufferList, ipv6: bool) -> Result<(
     // not copy the original checksum-offload metadata, so a pending clone needs
     // complete software checksums.
     recalc_header_checksums(data, ipv6)
+}
+
+fn is_observational_multicast_sender(cache: &ConnectionCache, key: &Key, ipv6: bool) -> bool {
+    if unlikely(ipv6) {
+        cache
+            .read_connection_v6(key, |conn| {
+                Some(
+                    matches!(conn.get_direction(), Direction::Outbound)
+                        && conn.extra.observational_multicast_sender,
+                )
+            })
+            .unwrap_or(false)
+    } else {
+        cache
+            .read_connection_v4(key, |conn| {
+                Some(
+                    matches!(conn.get_direction(), Direction::Outbound)
+                        && conn.extra.observational_multicast_sender,
+                )
+            })
+            .unwrap_or(false)
+    }
 }
 
 fn get_connection_info(

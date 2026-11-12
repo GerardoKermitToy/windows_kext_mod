@@ -33,9 +33,11 @@ mod event_queue;
 #[cfg(not(test))]
 mod icmp_echo_cache;
 mod id_cache;
+mod igmp_policy;
 mod ipv6_packet;
 #[cfg(not(test))]
 pub mod logger;
+mod loopback_icmpv6_policy;
 #[cfg(not(test))]
 mod packet_callouts;
 mod packet_metadata;

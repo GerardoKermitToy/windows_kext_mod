@@ -1,6 +1,6 @@
 use crate::ale_policy::{
-    can_reuse_ended_tcp_policy, classify_ale_injection, multicast_replay_matches,
-    self_injected_endpoint_identifies_socket, should_capture_ale_packet,
+    can_reuse_ended_tcp_policy, classify_ale_injection, is_local_loopback_multicast_udp,
+    multicast_replay_matches, self_injected_endpoint_identifies_socket, should_capture_ale_packet,
     should_permit_ale_tcp_reset, should_skip_cross_direction_ale_clone,
     should_skip_injected_outbound_flow, should_skip_raw_receive, AleInjectionAction,
     InjectionStatus,
@@ -559,6 +559,114 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
         AleInjectionAction::Process => {}
     }
 
+    // A local loopback multicast datagram cannot currently be replayed reliably
+    // after ALE receive authorization. Permit the original indication instead:
+    // retain per-socket lifecycle and publish an observational CONN, but never
+    // pend the packet or let its eventual verdict alter delivery. This is a soft
+    // permit, so other WFP filters still apply.
+    if let Some(endpoint) = multicast_endpoint.filter(|_| {
+        !injection_status.is_injected_by_other()
+            && is_local_loopback_multicast_udp(
+                ale_data.loopback,
+                ale_data.interface_index,
+                ale_data.protocol,
+                key.remote_address,
+                key.local_address,
+            )
+    }) {
+        let cached = device
+            .connection_cache
+            .read_active_multicast_receiver(&key, endpoint);
+        if let Some((_, instance_id, tracked)) = cached {
+            if !tracked {
+                track_endpoint_instance(
+                    device,
+                    endpoint_handle,
+                    parent_endpoint_handle,
+                    key,
+                    instance_id,
+                    reauthorize_outbound,
+                );
+            }
+        } else {
+            match device.connection_cache.register_multicast_receiver(
+                &key,
+                endpoint,
+                ale_data.process_id,
+                ale_data.get_thread_id(device),
+            ) {
+                Ok(registration) => {
+                    track_endpoint_instance(
+                        device,
+                        endpoint_handle,
+                        parent_endpoint_handle,
+                        key,
+                        registration.instance_id,
+                        reauthorize_outbound,
+                    );
+                    if registration.inserted {
+                        publish_loopback_multicast_notification(
+                            device,
+                            &data,
+                            &ale_data,
+                            &key,
+                            registration.instance_id,
+                        );
+                    }
+                }
+                Err(err) => crate::err!("failed to register loopback multicast receiver: {}", err),
+            }
+        }
+        data.action_permit();
+        return;
+    }
+
+    // The outbound IP indication for this loopback multicast path must also
+    // pass without reinjection. Report the sender once and preserve its normal
+    // endpoint lifecycle, but do not bind the notification ID to a verdict.
+    if unlikely(
+        matches!(ale_data.connection_direction, Direction::Outbound)
+            && matches!(ale_data.packet_direction, Direction::Outbound)
+            && is_local_loopback_multicast_udp(
+                true,
+                ale_data.interface_index,
+                ale_data.protocol,
+                key.local_address,
+                key.remote_address,
+            ),
+    ) {
+        match device
+            .connection_cache
+            .register_observational_multicast_sender(
+                &key,
+                ale_data.process_id,
+                ale_data.get_thread_id(device),
+            ) {
+            Ok(registration) => {
+                track_endpoint_instance(
+                    device,
+                    endpoint_handle,
+                    parent_endpoint_handle,
+                    key,
+                    registration.instance_id,
+                    reauthorize_outbound,
+                );
+                if registration.inserted {
+                    publish_loopback_multicast_notification(
+                        device,
+                        &data,
+                        &ale_data,
+                        &key,
+                        registration.instance_id,
+                    );
+                }
+            }
+            Err(err) => crate::err!("failed to register loopback multicast sender: {}", err),
+        }
+        data.action_permit();
+        return;
+    }
+
     // Keep the WFP endpoint identity now, but associate it only after this
     // authorization has selected a concrete live connection-cache generation.
     // Reauthorization of an already cached TCP connection may omit this metadata;
@@ -921,6 +1029,74 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
         // will be re-injected after Portmaster returns a verdict.
         data.block_and_absorb();
     }
+}
+
+/// Publishes one observational connection event per sender or receiver generation.
+/// Hold the connection-map read guard while queueing so END cannot precede CONN.
+/// The ID is reserved in the normal sequence but has no pending packet; any
+/// verdict for it is therefore recognized and ignored by the existing verdict path.
+fn publish_loopback_multicast_notification(
+    device: &Device,
+    data: &CalloutData,
+    ale_data: &AleLayerData,
+    key: &Key,
+    instance_id: u64,
+) {
+    // At ALE_RECV_ACCEPT WFP indicates the UDP payload. Copy the transport
+    // header and bytes for the ordinary connection event without cloning an NBL
+    // or retaining WFP's storage after classify. Initial outbound authorization
+    // may have no packet data. Failure leaves an empty payload but does not
+    // change the permit; the wrapper restores any WFP data offset we changed.
+    let mut payload = Vec::new();
+    let layer_data = data.get_layer_data();
+    if !layer_data.is_null() {
+        // SAFETY: WFP owns the NBL for the duration of this classify callback.
+        let mut nbl = unsafe { NetBufferList::new(layer_data as _) };
+        let readable = if matches!(ale_data.packet_direction, Direction::Inbound) {
+            data.get_transport_header_size()
+                .filter(|size| *size >= 8)
+                .is_some_and(|size| nbl.retreat(size, true).is_ok())
+        } else {
+            true
+        };
+        if readable {
+            // UDP's ordinary maximum size bounds the temporary allocation;
+            // read only the first NET_BUFFER if the indication was batched.
+            let length = core::cmp::min(nbl.get_data_length() as usize, 65_535);
+            payload.resize(length, 0);
+            match nbl.read_bytes_up_to(&mut payload, 0) {
+                Ok(copied) => payload.truncate(copied),
+                Err(()) => payload.clear(),
+            }
+        }
+    }
+
+    let _ = device
+        .connection_cache
+        .with_live_connection_instance_matching(
+            key,
+            instance_id,
+            payload,
+            |_, payload, thread_id| {
+                let Some(id) = device.packet_cache.write_lock().issue_notification_id() else {
+                    crate::err!("unable to allocate loopback multicast notification ID");
+                    return;
+                };
+                let mut metadata = ale_data.connection_metadata(data);
+                metadata.thread_id = thread_id;
+                if let Some(info) = crate::id_cache::build_info(
+                    key,
+                    id,
+                    ale_data.process_id,
+                    metadata,
+                    ale_data.packet_direction,
+                    &payload,
+                    true,
+                ) {
+                    let _ = device.event_queue.push(info);
+                }
+            },
+        );
 }
 
 /// Returns no pending packet when a TCP reset was permitted using the existing
@@ -1565,7 +1741,7 @@ pub(crate) fn expire_inactive_connections(device: &Device) {
     );
     retire_pending_connections(device, &ended_v4);
     retire_pending_connections(device, &ended_v6);
-    // The multicast events were already enqueued while holding the map guard.
+    // Multicast receiver END events were already enqueued while holding the map guard.
     for conn in ended_v4 {
         if conn.get_multicast_endpoint() == 0 {
             emit_connection_end_v4(device, conn, 0);

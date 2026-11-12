@@ -32,6 +32,26 @@ repository root:
 ctest --test-dir kext_client/build -C Release --output-on-failure
 ```
 
+### Loopback multicast and control notifications
+
+For the driver's narrow loopback UDP multicast, IGMP and ICMPv6 exceptions, a
+connection event has a normal nonzero ID but no packet is waiting for its
+verdict. The client can send a verdict as usual; the driver recognizes and
+ignores it. The current wire record has no flag distinguishing these
+notifications from ordinary verdict requests. UDP receiver END follows socket
+closure or an idle sweep. Each qualifying IGMP or ICMPv6 WFP indication is
+notified; one raw send may generate multiple indications. These control-packet
+notifications do not create a connection generation and do not produce END.
+The zero ports in their records are placeholders, not protocol ports.
+
+These are Portmaster policy exceptions, not hard system-wide permits. The
+ICMPv6 exception is limited to native single-packet outbound indications on
+interface 1 from `::1` to any IPv6 multicast address (`ff00::/8`), independent
+of ICMPv6 type. IPv6 unicast and physical-interface ICMPv6 retain normal
+verdict processing. See the
+[regression notes](../windows_kext/test/MULTICAST_LOOPBACK.md) for the exact
+scope, limitations and policy implications.
+
 ## Monitor command-line interface selection
 
 Use `--app PATH` with exactly one interface selector:

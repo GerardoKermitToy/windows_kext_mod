@@ -213,9 +213,9 @@ impl<R: PacketData> PacketInspector<R> {
             header.protocol = headers.protocol;
             header.transport_offset = headers.transport_offset as u16;
             header.is_fragment = headers.is_fragment;
-            header.error = if self.permit_fragments && headers.is_fragment {
+            header.error = if unlikely(self.permit_fragments && headers.is_fragment) {
                 Some(PacketMetadataError::FragmentRequiresReassembly)
-            } else if !headers.resolved {
+            } else if unlikely(!headers.resolved) {
                 Some(PacketMetadataError::UnresolvedIpv6Headers)
             } else {
                 None

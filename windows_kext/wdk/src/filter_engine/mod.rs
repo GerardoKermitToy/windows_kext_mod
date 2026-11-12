@@ -1,5 +1,5 @@
 use core::ffi::c_void;
-use likely_stable::unlikely;
+use likely_stable::{likely, unlikely};
 
 use crate::alloc::borrow::ToOwned;
 use crate::driver::Driver;
@@ -419,8 +419,10 @@ unsafe extern "system" fn catch_all_callout(
 
     // SAFETY: active callback admission guarantees that Device still owns every
     // registered Callout box. WFP copied this box address into `filter.context`,
-    // and keeps the corresponding filter live for this invocation.
-    if let Some(callout) = unsafe { callout.as_ref() } {
+    // and keeps the corresponding filter live for this invocation. The null
+    // context guard preserves the existing defensive early exit.
+    if likely(!callout.is_null()) {
+        let callout = unsafe { &*callout };
         // A zero-length slice still requires a non-null aligned pointer in Rust.
         // Use an empty slice for that representation; WFP's pointer is used
         // unchanged whenever it describes at least one value.

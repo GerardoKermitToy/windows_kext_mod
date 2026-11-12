@@ -107,7 +107,7 @@ impl ConnectionCache {
         process_id: u64,
         direction: Direction,
     ) -> Result<ConnectionRegistration, String> {
-        self.register_connection_with_lifecycle(key, process_id, direction, true, 0, 0)
+        self.register_connection_with_lifecycle(key, process_id, direction, true, 0, 0, false)
     }
 
     /// Registers a fallback connection for which WFP exposed no endpoint identity.
@@ -120,7 +120,7 @@ impl ConnectionCache {
         process_id: u64,
         direction: Direction,
     ) -> Result<ConnectionRegistration, String> {
-        self.register_connection_with_lifecycle(key, process_id, direction, false, 0, 0)
+        self.register_connection_with_lifecycle(key, process_id, direction, false, 0, 0, false)
     }
 
     /// Registers a new exact inbound UDP tuple using only the donor's PID.
@@ -176,6 +176,35 @@ impl ConnectionCache {
             key.protocol != IpProtocol::Udp,
             thread_id,
             0,
+            false,
+        )
+    }
+
+    /// Registers a notification-only loopback multicast sender. A pre-existing
+    /// ordinary connection wins unchanged and does not acquire the bypass marker.
+    pub fn register_observational_multicast_sender(
+        &self,
+        key: &Key,
+        process_id: u64,
+        thread_id: u64,
+    ) -> Result<ConnectionRegistration, String> {
+        if !crate::ale_policy::is_local_loopback_multicast_udp(
+            true,
+            1,
+            key.protocol,
+            key.local_address,
+            key.remote_address,
+        ) {
+            return Err("invalid observational multicast sender".into());
+        }
+        self.register_connection_with_lifecycle(
+            key,
+            process_id,
+            Direction::Outbound,
+            false,
+            thread_id,
+            0,
+            true,
         )
     }
 
@@ -198,6 +227,7 @@ impl ConnectionCache {
             false,
             thread_id,
             endpoint,
+            false,
         )
     }
 
@@ -209,6 +239,7 @@ impl ConnectionCache {
         native_lifecycle: bool,
         thread_id: u64,
         multicast_endpoint: u64,
+        observational_multicast_sender: bool,
     ) -> Result<ConnectionRegistration, String> {
         if unlikely(key.is_ipv6()) {
             let mut connection = if native_lifecycle {
@@ -218,6 +249,7 @@ impl ConnectionCache {
             };
             connection.thread_id = thread_id;
             connection.extra.multicast_endpoint = multicast_endpoint;
+            connection.extra.observational_multicast_sender = observational_multicast_sender;
             Ok(self.register_connection_v6(connection))
         } else {
             let mut connection = if native_lifecycle {
@@ -227,6 +259,7 @@ impl ConnectionCache {
             };
             connection.thread_id = thread_id;
             connection.extra.multicast_endpoint = multicast_endpoint;
+            connection.extra.observational_multicast_sender = observational_multicast_sender;
             Ok(self.register_connection_v4(connection))
         }
     }
@@ -882,6 +915,69 @@ mod tests {
             cache.read_connection_v6(tuple, |conn| Some((conn.process_id, conn.thread_id)))
         } else {
             cache.read_connection_v4(tuple, |conn| Some((conn.process_id, conn.thread_id)))
+        }
+    }
+
+    #[test]
+    fn observational_multicast_sender_marker_never_relabels_existing_connections() {
+        let v4 = Key {
+            protocol: IpProtocol::Udp,
+            local_address: IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 2)),
+            local_port: 40_000,
+            remote_address: IpAddress::Ipv4(Ipv4Address::new(239, 255, 23, 91)),
+            remote_port: 5353,
+        };
+        let v6 = Key {
+            local_address: IpAddress::Ipv6(Ipv6Address::LOOPBACK),
+            remote_address: IpAddress::Ipv6(Ipv6Address::new(0xff02, 0, 0, 0, 0, 0, 0, 0x114)),
+            ..v4
+        };
+        for tuple in [v4, v6] {
+            let ordinary = ConnectionCache::new();
+            let first = ordinary
+                .register_ale_connection(&tuple, 100, 10, Direction::Outbound)
+                .unwrap();
+            ordinary.update_connection_instance(tuple, first.instance_id, Verdict::PermanentBlock);
+            let existing = ordinary
+                .register_observational_multicast_sender(&tuple, 100, 10)
+                .unwrap();
+            assert!(first.inserted);
+            assert!(!existing.inserted);
+            assert_eq!(first.instance_id, existing.instance_id);
+            let marker = if tuple.is_ipv6() {
+                ordinary
+                    .read_connection_v6(&tuple, |c| Some(c.extra.observational_multicast_sender))
+            } else {
+                ordinary
+                    .read_connection_v4(&tuple, |c| Some(c.extra.observational_multicast_sender))
+            };
+            assert_eq!(marker, Some(false));
+            let blocked = if tuple.is_ipv6() {
+                ordinary.read_connection_v6(&tuple, |c| {
+                    Some(matches!(c.verdict, Verdict::PermanentBlock))
+                })
+            } else {
+                ordinary.read_connection_v4(&tuple, |c| {
+                    Some(matches!(c.verdict, Verdict::PermanentBlock))
+                })
+            };
+            assert_eq!(blocked, Some(true));
+
+            let observational = ConnectionCache::new();
+            assert!(
+                observational
+                    .register_observational_multicast_sender(&tuple, 100, 10)
+                    .unwrap()
+                    .inserted
+            );
+            let marker = if tuple.is_ipv6() {
+                observational
+                    .read_connection_v6(&tuple, |c| Some(c.extra.observational_multicast_sender))
+            } else {
+                observational
+                    .read_connection_v4(&tuple, |c| Some(c.extra.observational_multicast_sender))
+            };
+            assert_eq!(marker, Some(true));
         }
     }
 
