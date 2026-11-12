@@ -30,6 +30,18 @@ if(!$?) {
     Exit $LASTEXITCODE
 }
 
+# windows-sys must resolve against kernel import libraries, never user-mode DLLs.
+$imports = & dumpbin.exe /imports portmaster-kext.sys
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "Could not inspect driver imports."
+    Exit $LASTEXITCODE
+}
+$unexpected = @($imports | Select-String -Pattern '^\s+\S+\.dll\s*$')
+if ($unexpected.Count -gt 0) {
+    Write-Error "Driver imports user-mode DLLs: $($unexpected -join ', ')"
+    Exit 1
+}
+
 signtool sign /fd sha256 /td SHA256 /ac .\localhost-root-ca.der /f .\localhost-km.pfx /p 1 /n "Localhost Kernel Mode Driver Certificate" /tr http://timestamp.digicert.com portmaster-kext.sys
 
 

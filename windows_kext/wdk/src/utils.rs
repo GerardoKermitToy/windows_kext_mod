@@ -51,7 +51,7 @@ pub fn sleep_ms(milliseconds: u64) {
     let ticks = milliseconds.saturating_mul(10_000).min(i64::MAX as u64) as i64;
     let interval = -ticks;
     unsafe {
-        let _ = KeDelayExecutionThread(0, 0, &interval);
+        let _ = KeDelayExecutionThread(0, false, &interval);
     }
 }
 

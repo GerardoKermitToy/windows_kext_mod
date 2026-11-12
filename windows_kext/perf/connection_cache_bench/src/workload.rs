@@ -147,7 +147,7 @@ fn tuple<T: Family>(index: usize, shape: Shape) -> Key {
     let (local_address, remote_address) = if T::NAME == "v4" {
         (
             IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 1 + (index % 4) as u8)),
-            IpAddress::Ipv4(Ipv4Address::from_bytes(&remote.to_be_bytes())),
+            IpAddress::Ipv4(Ipv4Address::from_octets(remote.to_be_bytes())),
         )
     } else {
         let mut remote = [0u8; 16];
@@ -164,7 +164,7 @@ fn tuple<T: Family>(index: usize, shape: Shape) -> Key {
                 0,
                 1 + (index % 4) as u16,
             )),
-            IpAddress::Ipv6(Ipv6Address::from_bytes(&remote)),
+            IpAddress::Ipv6(Ipv6Address::from_octets(remote)),
         )
     };
     Key {
@@ -179,12 +179,28 @@ fn tuple<T: Family>(index: usize, shape: Shape) -> Key {
 fn miss(mut key: Key, kind: usize, index: usize) -> Key {
     match kind {
         0 => match &mut key.remote_address {
-            IpAddress::Ipv4(address) => address.0[0] = 203,
-            IpAddress::Ipv6(address) => address.0[3] = 0xb9,
+            IpAddress::Ipv4(address) => {
+                let mut octets = address.octets();
+                octets[0] = 203;
+                *address = Ipv4Address::from_octets(octets);
+            }
+            IpAddress::Ipv6(address) => {
+                let mut octets = address.octets();
+                octets[3] = 0xb9;
+                *address = Ipv6Address::from_octets(octets);
+            }
         },
         1 => match &mut key.local_address {
-            IpAddress::Ipv4(address) => address.0[1] = 254,
-            IpAddress::Ipv6(address) => address.0[3] = 0xba,
+            IpAddress::Ipv4(address) => {
+                let mut octets = address.octets();
+                octets[1] = 254;
+                *address = Ipv4Address::from_octets(octets);
+            }
+            IpAddress::Ipv6(address) => {
+                let mut octets = address.octets();
+                octets[3] = 0xba;
+                *address = Ipv6Address::from_octets(octets);
+            }
         },
         2 => key.local_port = 60_000 + (index % 4096) as u16,
         _ => unreachable!(),

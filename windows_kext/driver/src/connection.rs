@@ -22,7 +22,7 @@ fn next_connection_instance_id() -> u64 {
 
 #[inline]
 fn ipv6_address_key(address: Ipv6Address) -> (u64, u64) {
-    let bytes = address.0;
+    let bytes = address.octets();
     (
         u64::from_be_bytes([
             bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
@@ -326,13 +326,13 @@ impl Connection for ConnectionV4 {
 
     #[inline]
     fn get_remote_address_key(&self) -> Self::RemoteAddressKey {
-        u32::from_be_bytes(self.remote_address.0)
+        u32::from_be_bytes(self.remote_address.octets())
     }
 
     #[inline]
     fn remote_address_key(key: &Key) -> Option<Self::RemoteAddressKey> {
         match key.remote_address {
-            IpAddress::Ipv4(address) => Some(u32::from_be_bytes(address.0)),
+            IpAddress::Ipv4(address) => Some(u32::from_be_bytes(address.octets())),
             IpAddress::Ipv6(_) => None,
         }
     }

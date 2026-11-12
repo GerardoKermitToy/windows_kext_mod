@@ -13,15 +13,18 @@ likely_stable = { version = "0.1.3", default-features = false }
 ntstatus = { version = "0.1.2", default-features = false }
 
 [dependencies.widestring]
-version = "1.0.2"
+version = "1.2.1"
 default-features = false 
 features = ["alloc"]
 
-# WARNING: Do not update. The version was choosen for a reason. See wdk/README.md for more detiels.
+# Keep this in sync with driver; changes require a kernel ABI review.
 [dependencies.windows-sys]
-git = "https://github.com/microsoft/windows-rs"
-rev = "dffa8b03dc4987c278d82e88015ffe96aa8ac317"
+version = "=0.61.2"
 features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_SystemServices", "Win32_Foundation", "Win32_Security", "Win32_System_IO", "Win32_System_Kernel", "Win32_System_Power", "Win32_System_WindowsProgramming", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_NetworkManagement_WindowsFilteringPlatform", "Win32_System_Rpc"]
+
+# The standalone WDK build needs the same kernel-only FFI declarations as driver.
+[patch.crates-io]
+windows-link = { path = "../kernel-windows-link" }
 
 [profile.release]
 debug = 2

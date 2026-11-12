@@ -4,9 +4,9 @@ use core::ffi::c_void;
 
 use windows_sys::{
     core::{GUID, PCWSTR},
-    Wdk::Foundation::{DRIVER_OBJECT, IRP, MDL},
+    Wdk::{Foundation::{DRIVER_OBJECT, IRP, MDL}, System::SystemServices::EX_RUNDOWN_REF},
     Win32::{
-        Foundation::{BOOLEAN, HANDLE, NTSTATUS, UNICODE_STRING},
+        Foundation::{HANDLE, NTSTATUS, UNICODE_STRING},
         NetworkManagement::WindowsFilteringPlatform::{
             FWPM_CALLOUT0, FWPM_FILTER0, FWPM_FILTER_CONDITION0, FWPM_PROVIDER_CONTEXT3, FWPM_SESSION0, FWPM_SUBLAYER0, FWP_IP_VERSION,
             FWP_CONDITION_VALUE0, FWP_MATCH_TYPE, FWP_VALUE0,
@@ -20,6 +20,11 @@ use windows_sys::{
 use crate::filter_engine::{
     classify::ClassifyOut, layer::IncomingValues, metadata::FwpsIncomingMetadataValues,
 };
+
+// Native BOOLEAN is an unsigned byte, not a Rust bool: callbacks and return
+// values from C may contain nonzero values other than 1.
+#[allow(non_camel_case_types)]
+pub(crate) type BOOLEAN = u8;
 
 pub(crate) type FwpsCalloutClassifyFn = unsafe extern "system" fn(
     inFixedValues: *const IncomingValues,
@@ -358,7 +363,11 @@ const _: () = {
 // #[link(name = "ndis", kind = "static")]
 #[link(name = "c_helper", kind = "static")]
 extern "system" {
-    // The pinned windows-sys declaration links this WDK routine to ntdll.dll;
+    // windows-sys uses Rust bool for BOOLEAN returns. Preserve the native byte
+    // so any nonzero value can be checked without creating an invalid bool.
+    pub fn ExAcquireRundownProtection(rundown: *mut EX_RUNDOWN_REF) -> u8;
+
+    // The windows-sys declaration links this WDK routine to ntdll.dll;
     // kernel code must resolve the ntoskrnl export through our native imports.
     pub(crate) fn RtlDowncaseUnicodeChar(source: u16) -> u16;
 

@@ -17,7 +17,7 @@ pub(crate) fn is_loopback_icmpv6_multicast(
     outbound
         && ipv6
         && protocol == IpProtocol::Icmpv6
-        && source == IpAddress::Ipv6(Ipv6Address::LOOPBACK)
+        && source == IpAddress::Ipv6(Ipv6Address::LOCALHOST)
         && matches!(destination, IpAddress::Ipv6(address) if address.is_multicast())
         && not_injected
         && interface_index() == 1
@@ -30,7 +30,7 @@ mod tests {
 
     #[test]
     fn qualifies_ipv6_multicast_destinations_only() {
-        let source = IpAddress::Ipv6(Ipv6Address::LOOPBACK);
+        let source = IpAddress::Ipv6(Ipv6Address::LOCALHOST);
         let test = |destination| {
             is_loopback_icmpv6_multicast(
                 true,
@@ -71,7 +71,7 @@ mod tests {
 
     #[test]
     fn interface_is_read_only_after_other_conditions_match() {
-        let source = IpAddress::Ipv6(Ipv6Address::LOOPBACK);
+        let source = IpAddress::Ipv6(Ipv6Address::LOCALHOST);
         let other_source = IpAddress::Ipv6(Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1));
         let multicast = IpAddress::Ipv6(Ipv6Address::new(0xff02, 0, 0, 0, 0, 0, 0, 1));
         for (outbound, ipv6, protocol, src, dst, native, expected_reads) in [
@@ -111,7 +111,7 @@ mod tests {
 
     #[test]
     fn only_native_outbound_icmpv6_from_loopback_qualifies() {
-        let source = IpAddress::Ipv6(Ipv6Address::LOOPBACK);
+        let source = IpAddress::Ipv6(Ipv6Address::LOCALHOST);
         let target = IpAddress::Ipv6(Ipv6Address::new(0xff02, 0, 0, 0, 0, 0, 0, 1));
         let other_source = IpAddress::Ipv6(Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1));
         let test = |outbound, ipv6, interface, protocol, src, dst, native| {

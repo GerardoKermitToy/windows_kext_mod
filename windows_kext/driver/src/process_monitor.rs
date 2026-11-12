@@ -218,7 +218,7 @@ fn set_process_notification(remove: bool) -> NTSTATUS {
         PsSetCreateProcessNotifyRoutineEx2(
             PsCreateProcessNotifySubsystems,
             process_notify as *const () as *const c_void,
-            u8::from(remove),
+            remove,
         )
     }
 }

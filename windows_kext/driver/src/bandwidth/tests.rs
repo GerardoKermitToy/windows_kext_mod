@@ -9,7 +9,7 @@ fn key_v4(id: u32) -> Key<Ipv4Address> {
     Key {
         local_ip: Ipv4Address::new(10, 0, 0, 1),
         local_port: 49152 + (id % 16384) as u16,
-        remote_ip: Ipv4Address(id.to_be_bytes()),
+        remote_ip: Ipv4Address::from_octets(id.to_be_bytes()),
         remote_port: 443,
     }
 }
@@ -19,9 +19,9 @@ fn key_v6(id: u32) -> Key<Ipv6Address> {
     remote_ip[..4].copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8]);
     remote_ip[12..].copy_from_slice(&id.to_be_bytes());
     Key {
-        local_ip: Ipv6Address::LOOPBACK,
+        local_ip: Ipv6Address::LOCALHOST,
         local_port: 49152 + (id % 16384) as u16,
-        remote_ip: Ipv6Address(remote_ip),
+        remote_ip: Ipv6Address::from_octets(remote_ip),
         remote_port: 443,
     }
 }
@@ -65,13 +65,13 @@ fn decode<Address: Ord>(
 
 fn decode_v4(info: Info, protocol: u8) -> Totals<Ipv4Address> {
     decode(info, 5, protocol, 4, |ip| {
-        Ipv4Address(ip.try_into().unwrap())
+        Ipv4Address::from_octets(ip.try_into().unwrap())
     })
 }
 
 fn decode_v6(info: Info, protocol: u8) -> Totals<Ipv6Address> {
     decode(info, 6, protocol, 16, |ip| {
-        Ipv6Address(ip.try_into().unwrap())
+        Ipv6Address::from_octets(ip.try_into().unwrap())
     })
 }
 
@@ -225,7 +225,7 @@ fn every_tuple_field_participates_in_identity() {
             ..base6
         },
         Key {
-            remote_ip: Ipv6Address::LOOPBACK,
+            remote_ip: Ipv6Address::LOCALHOST,
             ..base6
         },
         Key {

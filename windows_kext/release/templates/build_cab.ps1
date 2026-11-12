@@ -26,8 +26,20 @@ link.exe /OUT:{{sys_file}} `
 "C:\Program Files (x86)\Windows Kits\10\lib\wdf\kmdf\x64\1.15\WdfDriverEntry.lib" `
 "{{lib_file}}" "version.res" `
 /RELEASE /VERSION:"10.0" /DEBUG /MACHINE:X64 /ENTRY:"FxDriverEntry" /OPT:REF /INCREMENTAL:NO /SUBSYSTEM:NATIVE",6.01" /OPT:ICF /ERRORREPORT:PROMPT /MERGE:"_TEXT=.text;_PAGE=PAGE" /NOLOGO /NODEFAULTLIB /SECTION:"INIT,d" 
-if(!$?) { 
-    Exit $LASTEXITCODE 
+if(!$?) {
+    Exit $LASTEXITCODE
+}
+
+# Refuse an image that accidentally links kernel symbols to user-mode DLLs.
+$imports = & dumpbin.exe /imports {{sys_file}}
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "Could not inspect driver imports."
+    Exit $LASTEXITCODE
+}
+$unexpected = @($imports | Select-String -Pattern '^\s+\S+\.dll\s*$')
+if ($unexpected.Count -gt 0) {
+    Write-Error "Driver imports user-mode DLLs: $($unexpected -join ', ')"
+    Exit 1
 }
 
 # Move the driver and debug symbolds into the cab directory.

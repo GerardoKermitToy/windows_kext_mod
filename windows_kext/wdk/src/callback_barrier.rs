@@ -14,9 +14,9 @@ use core::{
 use likely_stable::{likely, unlikely};
 
 #[cfg(not(test))]
-use windows_sys::Wdk::System::SystemServices::{
-    ExAcquireRundownProtection as acquire_rundown, ExReleaseRundownProtection as release_rundown,
-};
+use crate::ffi::ExAcquireRundownProtection as acquire_rundown;
+#[cfg(not(test))]
+use windows_sys::Wdk::System::SystemServices::ExReleaseRundownProtection as release_rundown;
 use windows_sys::Wdk::System::SystemServices::{
     ExInitializeRundownProtection, ExReInitializeRundownProtection, ExRundownCompleted,
     ExWaitForRundownProtectionRelease, EX_RUNDOWN_REF, EX_RUNDOWN_REF_0,

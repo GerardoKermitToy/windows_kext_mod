@@ -355,8 +355,7 @@ that both command paths fail after shutdown. This probe is built with the client
 but is not part of the offline CTest suite. Extra
 IPv4/IPv6 UDP controls keep the same sockets exchanging 275-byte payloads across
 monitor exit and driver unload. These are feature checks, not the complete
-standard runtime suite: the legacy `IgnoreSpecialPorts=1` regression condition
-cannot be exercised by the current redirect-free driver, which has no such setting.
+standard runtime suite.
 
 ## Inbound UDP PID fallback
 
@@ -378,8 +377,7 @@ while it is running does not change its behavior. See
 
 `--verdict` accepts `accept`, `permanent-accept`, `block`, `drop`,
 `permanent-block`, and `permanent-drop`. Traffic redirection is not supported.
-Ports 53, 717, and 719 use the same exact-tuple lookup and filtering as other ports;
-there is no special-port registry setting.
+Ports 53, 717, and 719 use the same exact-tuple lookup and filtering as other ports.
 
 ## Connection metadata
 

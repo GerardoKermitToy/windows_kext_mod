@@ -341,8 +341,7 @@ def run_udp_unload_case(args, directory, ipv6):
     output = text(records) + text(directory / 'console.log')
     assert not re.search(r'\[LOG\s+(?:WARN|ERROR|CRIT)|\[WARN\]|verdict FAILED', output), output[-2000:]
     result = {'success': True, 'ipv6': ipv6, 'exchanges': sent, 'post_exit_exchanges': post_exit,
-              'payload_bytes': 275, 'interval_ms': 100,
-              'legacy_IgnoreSpecialPorts': 'not available: redirect/special-port support removed; this is an extra control, not the legacy-flag regression'}
+              'payload_bytes': 275, 'interval_ms': 100}
     (directory / 'result.json').write_text(json.dumps(result, indent=2), encoding='utf-8')
     return result
 

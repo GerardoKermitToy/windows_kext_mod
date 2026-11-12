@@ -1026,7 +1026,7 @@ mod tests {
             protocol: IpProtocol::Udp,
             local_address: IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 1)),
             local_port: 50_000,
-            remote_address: IpAddress::Ipv4(Ipv4Address::from_bytes(&remote_address)),
+            remote_address: IpAddress::Ipv4(Ipv4Address::from_octets(remote_address)),
             remote_port,
         }
     }
@@ -1036,7 +1036,7 @@ mod tests {
             protocol: IpProtocol::Udp,
             local_address: IpAddress::Ipv6(Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
             local_port: 50_000,
-            remote_address: IpAddress::Ipv6(Ipv6Address::from_bytes(&remote_address)),
+            remote_address: IpAddress::Ipv6(Ipv6Address::from_octets(remote_address)),
             remote_port,
         }
     }
@@ -1801,7 +1801,7 @@ mod tests {
                 (index >> 16) as u16,
                 index as u16,
             );
-            live_v6(&key_v6(address.0, 443), u64::from(index) + 1)
+            live_v6(&key_v6(address.octets(), 443), u64::from(index) + 1)
         });
     }
 
@@ -1840,7 +1840,7 @@ mod tests {
 
     #[test]
     fn retained_generations_grow_without_a_count_limit_v6() {
-        let tuple = key_v6(Ipv6Address::LOOPBACK.0, 443);
+        let tuple = key_v6(Ipv6Address::LOCALHOST.octets(), 443);
         verify_retained_generation_growth(|pid| live_v6(&tuple, pid));
     }
 
@@ -1878,7 +1878,7 @@ mod tests {
 
     #[test]
     fn udp_donor_order_is_independent_of_hash_iteration_v6() {
-        verify_udp_donor_order(|port, pid| live_v6(&key_v6(Ipv6Address::LOOPBACK.0, port), pid));
+        verify_udp_donor_order(|port, pid| live_v6(&key_v6(Ipv6Address::LOCALHOST.octets(), port), pid));
     }
 
     fn verify_exact_port_lookup<T: Connection + Clone>(connection: T, other_address: IpAddress) {
@@ -1956,11 +1956,11 @@ mod tests {
             for port in [53, 717, 719, 443] {
                 let tuple = Key {
                     protocol,
-                    ..key_v6(Ipv6Address::new(0x2001, 0xdb8, 1, 0, 0, 0, 0, 1).0, port)
+                    ..key_v6(Ipv6Address::new(0x2001, 0xdb8, 1, 0, 0, 0, 0, 1).octets(), port)
                 };
                 verify_exact_port_lookup(
                     live_v6(&tuple, 42),
-                    IpAddress::Ipv6(Ipv6Address::LOOPBACK),
+                    IpAddress::Ipv6(Ipv6Address::LOCALHOST),
                 );
             }
         }

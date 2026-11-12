@@ -371,13 +371,13 @@ impl<R: PacketData> PacketInspector<R> {
         // address ranges without separate IP packet accessor call frames.
         if unlikely(ipv6) {
             (
-                IpAddress::Ipv6(Ipv6Address::from_bytes(&packet[8..24])),
-                IpAddress::Ipv6(Ipv6Address::from_bytes(&packet[24..40])),
+                IpAddress::Ipv6(Ipv6Address::from_octets(packet[8..24].try_into().unwrap())),
+                IpAddress::Ipv6(Ipv6Address::from_octets(packet[24..40].try_into().unwrap())),
             )
         } else {
             (
-                IpAddress::Ipv4(Ipv4Address::from_bytes(&packet[12..16])),
-                IpAddress::Ipv4(Ipv4Address::from_bytes(&packet[16..20])),
+                IpAddress::Ipv4(Ipv4Address::from_octets(packet[12..16].try_into().unwrap())),
+                IpAddress::Ipv4(Ipv4Address::from_octets(packet[16..20].try_into().unwrap())),
             )
         }
     }
@@ -727,8 +727,8 @@ mod tests {
             packet[0] = 0x60;
             packet[4..6].copy_from_slice(&120u16.to_be_bytes());
             packet[6] = u8::from(protocol);
-            packet[8..24].copy_from_slice(&Ipv6Address::LOOPBACK.0);
-            packet[24..40].copy_from_slice(&Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2).0);
+            packet[8..24].copy_from_slice(&Ipv6Address::LOCALHOST.octets());
+            packet[24..40].copy_from_slice(&Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2).octets());
             IPV6_HEADER_LEN
         } else {
             packet[0] = 0x45;
@@ -938,8 +938,8 @@ mod tests {
                     {
                         // The reference unnecessarily required four unused port bytes.
                         let protocol = IpProtocol::from(packet[9]);
-                        let source = IpAddress::Ipv4(Ipv4Address::from_bytes(&packet[12..16]));
-                        let destination = IpAddress::Ipv4(Ipv4Address::from_bytes(&packet[16..20]));
+                        let source = IpAddress::Ipv4(Ipv4Address::from_octets(packet[12..16].try_into().unwrap()));
+                        let destination = IpAddress::Ipv4(Ipv4Address::from_octets(packet[16..20].try_into().unwrap()));
                         assert!(actual.key == build_key(direction, protocol, source, 0, destination, 0));
                         assert!(!actual.is_tcp_reset);
                         assert!(!actual.is_local_icmp_error);
@@ -1231,8 +1231,8 @@ mod tests {
                             permit_fragments,
                         );
                         let key = inspector.key().unwrap();
-                        let source = IpAddress::Ipv4(Ipv4Address::from_bytes(&packet[12..16]));
-                        let destination = IpAddress::Ipv4(Ipv4Address::from_bytes(&packet[16..20]));
+                        let source = IpAddress::Ipv4(Ipv4Address::from_octets(packet[12..16].try_into().unwrap()));
+                        let destination = IpAddress::Ipv4(Ipv4Address::from_octets(packet[16..20].try_into().unwrap()));
                         assert!(key == build_key(direction, protocol, source, 0, destination, 0));
                         assert!(!inspector.is_tcp_reset());
                         assert_eq!(inspector.reader.requests, [length]);
@@ -1867,7 +1867,7 @@ mod tests {
         for address in [
             IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1)),
             IpAddress::Ipv4(Ipv4Address::new(192, 0, 2, 1)),
-            IpAddress::Ipv6(Ipv6Address::LOOPBACK),
+            IpAddress::Ipv6(Ipv6Address::LOCALHOST),
         ] {
             let key = Key {
                 protocol: match address {
@@ -2111,7 +2111,7 @@ mod tests {
         for protocol in [IpProtocol::Tcp, IpProtocol::Udp] {
             for kind in 1..=4 {
                 let mut packet = ipv6_error_quote(protocol);
-                packet[8..24].copy_from_slice(&local.0);
+                packet[8..24].copy_from_slice(&local.octets());
                 packet[40] = kind;
                 let metadata = inspect_packet(&packet, true, Direction::Outbound)
                     .metadata
@@ -2245,14 +2245,14 @@ mod tests {
         packet[0] = 0x60;
         packet[4..6].copy_from_slice(&56u16.to_be_bytes());
         packet[6] = u8::from(IpProtocol::Icmpv6);
-        packet[8..24].copy_from_slice(&router.0);
-        packet[24..40].copy_from_slice(&local.0);
+        packet[8..24].copy_from_slice(&router.octets());
+        packet[24..40].copy_from_slice(&local.octets());
         packet[40] = 1;
         packet[48] = 0x60;
         packet[52..54].copy_from_slice(&20u16.to_be_bytes());
         packet[54] = u8::from(protocol);
-        packet[56..72].copy_from_slice(&local.0);
-        packet[72..88].copy_from_slice(&remote.0);
+        packet[56..72].copy_from_slice(&local.octets());
+        packet[72..88].copy_from_slice(&remote.octets());
         packet[88..90].copy_from_slice(&50_000u16.to_be_bytes());
         packet[90..92].copy_from_slice(&443u16.to_be_bytes());
         packet
@@ -2376,9 +2376,9 @@ mod tests {
         packet[0] = 0x60;
         packet[4..6].copy_from_slice(&28u16.to_be_bytes());
         packet[6] = u8::from(IpProtocol::Ipv6Opts);
-        packet[8..24].copy_from_slice(&Ipv6Address::LOOPBACK.0);
+        packet[8..24].copy_from_slice(&Ipv6Address::LOCALHOST.octets());
         let remote = Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2);
-        packet[24..40].copy_from_slice(&remote.0);
+        packet[24..40].copy_from_slice(&remote.octets());
         packet[40] = u8::from(IpProtocol::Tcp);
         packet[41] = 0;
         packet[TRANSPORT_OFFSET..TRANSPORT_OFFSET + 2].copy_from_slice(&50_001u16.to_be_bytes());

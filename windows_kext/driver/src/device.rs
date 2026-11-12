@@ -687,12 +687,12 @@ impl Device {
                     self.connection_cache.update_connection(
                         Key {
                             protocol: IpProtocol::from(update.protocol),
-                            local_address: IpAddress::Ipv4(Ipv4Address::from_bytes(
-                                &update.local_address,
+                            local_address: IpAddress::Ipv4(Ipv4Address::from_octets(
+                                update.local_address,
                             )),
                             local_port: update.local_port,
-                            remote_address: IpAddress::Ipv4(Ipv4Address::from_bytes(
-                                &update.remote_address,
+                            remote_address: IpAddress::Ipv4(Ipv4Address::from_octets(
+                                update.remote_address,
                             )),
                             remote_port: update.remote_port,
                         },
@@ -720,12 +720,12 @@ impl Device {
                     self.connection_cache.update_connection(
                         Key {
                             protocol: IpProtocol::from(update.protocol),
-                            local_address: IpAddress::Ipv6(Ipv6Address::from_bytes(
-                                &update.local_address,
+                            local_address: IpAddress::Ipv6(Ipv6Address::from_octets(
+                                update.local_address,
                             )),
                             local_port: update.local_port,
-                            remote_address: IpAddress::Ipv6(Ipv6Address::from_bytes(
-                                &update.remote_address,
+                            remote_address: IpAddress::Ipv6(Ipv6Address::from_octets(
+                                update.remote_address,
                             )),
                             remote_port: update.remote_port,
                         },

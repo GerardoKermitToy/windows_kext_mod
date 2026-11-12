@@ -882,7 +882,7 @@ mod tests {
             protocol: IpProtocol::Tcp,
             local_address: IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 1)),
             local_port: 50_000,
-            remote_address: IpAddress::Ipv4(Ipv4Address::from_bytes(&remote_address)),
+            remote_address: IpAddress::Ipv4(Ipv4Address::from_octets(remote_address)),
             remote_port,
         }
     }
@@ -890,8 +890,8 @@ mod tests {
     fn connect_thread_keys() -> [Key; 4] {
         let v4 = key([192, 0, 2, 10], 443);
         let v6 = Key {
-            local_address: IpAddress::Ipv6(Ipv6Address::LOOPBACK),
-            remote_address: IpAddress::Ipv6(Ipv6Address::from_bytes(&[
+            local_address: IpAddress::Ipv6(Ipv6Address::LOCALHOST),
+            remote_address: IpAddress::Ipv6(Ipv6Address::from_octets([
                 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
             ])),
             ..v4
@@ -928,7 +928,7 @@ mod tests {
             remote_port: 5353,
         };
         let v6 = Key {
-            local_address: IpAddress::Ipv6(Ipv6Address::LOOPBACK),
+            local_address: IpAddress::Ipv6(Ipv6Address::LOCALHOST),
             remote_address: IpAddress::Ipv6(Ipv6Address::new(0xff02, 0, 0, 0, 0, 0, 0, 0x114)),
             ..v4
         };
@@ -1361,7 +1361,7 @@ mod tests {
                                     0x2001, 0xdb8, 1, 0, 0, 0, 0, id as u16,
                                 ))
                             } else {
-                                IpAddress::Ipv4(Ipv4Address::from_bytes(&id.to_be_bytes()))
+                                IpAddress::Ipv4(Ipv4Address::from_octets(id.to_be_bytes()))
                             };
                             let registration = cache
                                 .register_connection(&tuple, u64::from(id), Direction::Outbound)

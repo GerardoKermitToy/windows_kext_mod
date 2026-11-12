@@ -7,7 +7,7 @@ use alloc::{boxed::Box, format, string::String, vec::Vec};
 use core::{
     cell::UnsafeCell,
     ffi::c_void,
-    mem, ptr, slice,
+    mem, ptr,
     sync::atomic::{AtomicBool, Ordering},
 };
 use wdk::{filter_engine::address_ranges::AddressRanges, passive_mutex::PassiveMutex};
@@ -81,7 +81,7 @@ impl AddressMonitor {
     pub(crate) fn new() -> Result<Self, String> {
         let event = Box::new(UnsafeCell::new(unsafe { mem::zeroed() }));
         // SAFETY: This nonpaged dispatcher object is initialized at its final address.
-        unsafe { KeInitializeEvent(event.get(), SynchronizationEvent, 0) };
+        unsafe { KeInitializeEvent(event.get(), SynchronizationEvent, false) };
         Ok(Self {
             event,
             stopping: AtomicBool::new(false),
@@ -169,7 +169,7 @@ impl AddressMonitor {
             }
         }
         unsafe {
-            KeSetEvent(self.event.get(), 0, 0);
+            KeSetEvent(self.event.get(), 0, false);
         }
         while !handles.thread.is_null() {
             let status = unsafe { ZwWaitForSingleObject(handles.thread, 0, ptr::null()) };
@@ -202,7 +202,7 @@ unsafe extern "system" fn address_changed(
 ) {
     // SAFETY: Cancellation drains callbacks before the resident event is freed.
     unsafe {
-        KeSetEvent(context.cast_mut().cast(), 0, 0);
+        KeSetEvent(context.cast_mut().cast(), 0, false);
     }
 }
 
@@ -218,7 +218,7 @@ unsafe extern "system" fn worker(context: *mut c_void) {
                 monitor.event.get().cast(),
                 Executive,
                 0,
-                0,
+                false,
                 if retry_ms == 0 { ptr::null() } else { &timeout },
             )
         };
@@ -269,22 +269,28 @@ pub(crate) fn local_address_ranges() -> Result<AddressRanges, NTSTATUS> {
     // Use the table field's actual offset and ROW stride, including any WDK padding.
     let count = unsafe { (*table.0).NumEntries as usize };
     let first = unsafe { ptr::addr_of!((*table.0).Table).cast::<MIB_UNICASTIPADDRESS_ROW>() };
-    let rows = unsafe { slice::from_raw_parts(first, count) };
+    // windows-sys models the native BOOLEAN SkipAsSource field as Rust bool.
+    // Keep each row as a raw pointer so an arbitrary nonzero native byte cannot
+    // create an invalid Rust bool when forming a reference to the whole row.
     let mut ipv4 = Vec::new();
     let mut ipv6 = Vec::new();
     ipv4.try_reserve(count)
         .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
     ipv6.try_reserve(count)
         .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
-    for row in rows {
-        let family = unsafe { row.Address.si_family };
+    for index in 0..count {
+        // SAFETY: GetUnicastIpAddressTable returned count contiguous rows and
+        // the allocation remains live until Table is dropped. Read only the
+        // address union; do not materialize a reference to the enclosing row.
+        let address = unsafe { ptr::addr_of!((*first.add(index)).Address) };
+        let family = unsafe { ptr::addr_of!((*address).si_family).read() };
         if family == AF_INET {
             // SOCKADDR stores network bytes; WFP's UINT32 uses host order.
-            ipv4.push(u32::from_be(unsafe {
-                row.Address.Ipv4.sin_addr.S_un.S_addr
-            }));
+            let value = unsafe { ptr::addr_of!((*address).Ipv4.sin_addr.S_un.S_addr).read() };
+            ipv4.push(u32::from_be(value));
         } else if family == AF_INET6 {
-            ipv6.push(unsafe { row.Address.Ipv6.sin6_addr.u.Byte });
+            let value = unsafe { ptr::addr_of!((*address).Ipv6.sin6_addr.u.Byte).read() };
+            ipv6.push(value);
         }
     }
     AddressRanges::new(&ipv4, &ipv6)

@@ -517,7 +517,7 @@ mod tests {
     #[test]
     fn resource_release_consumes_unestablished_ipv4_and_ipv6_aliases_once() {
         let mut ipv6 = key();
-        ipv6.local_address = IpAddress::Ipv6(Ipv6Address::LOOPBACK);
+        ipv6.local_address = IpAddress::Ipv6(Ipv6Address::LOCALHOST);
         ipv6.remote_address = IpAddress::Ipv6(Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
 
         for tuple in [key(), ipv6] {
@@ -781,7 +781,7 @@ mod tests {
         ipv4.local_address = IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1));
         ipv4.remote_address = ipv4.local_address;
         let mut ipv6 = ipv4;
-        ipv6.local_address = IpAddress::Ipv6(Ipv6Address::LOOPBACK);
+        ipv6.local_address = IpAddress::Ipv6(Ipv6Address::LOCALHOST);
         ipv6.remote_address = ipv6.local_address;
 
         for tuple in [ipv4, ipv6] {

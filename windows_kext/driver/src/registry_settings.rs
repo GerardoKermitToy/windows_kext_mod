@@ -59,12 +59,10 @@ mod kernel {
         },
         Win32::{
             Foundation::{
-                NTSTATUS, STATUS_INVALID_DEVICE_STATE, STATUS_INVALID_PARAMETER, UNICODE_STRING,
+                NTSTATUS, OBJ_CASE_INSENSITIVE, OBJ_KERNEL_HANDLE, STATUS_INVALID_DEVICE_STATE,
+                STATUS_INVALID_PARAMETER, UNICODE_STRING,
             },
-            System::{
-                Kernel::{OBJ_CASE_INSENSITIVE, OBJ_KERNEL_HANDLE},
-                Registry::KEY_QUERY_VALUE,
-            },
+            System::Registry::KEY_QUERY_VALUE,
         },
     };
 

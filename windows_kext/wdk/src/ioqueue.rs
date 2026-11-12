@@ -270,8 +270,8 @@ mod kernel {
                 MaybeUninit::<[KEVENT; 2]>::zeroed().assume_init()
             }));
             unsafe {
-                KeInitializeEvent(events.get().cast::<KEVENT>(), NotificationEvent, 0);
-                KeInitializeEvent(events.get().cast::<KEVENT>().add(1), NotificationEvent, 0);
+                KeInitializeEvent(events.get().cast::<KEVENT>(), NotificationEvent, false);
+                KeInitializeEvent(events.get().cast::<KEVENT>().add(1), NotificationEvent, false);
             }
             Self { events }
         }
@@ -287,7 +287,7 @@ mod kernel {
 
         pub(super) fn set_ready(&self) {
             // Wait=FALSE is required while the queue's spin lock is held.
-            unsafe { KeSetEvent(self.ready(), 0, 0) };
+            unsafe { KeSetEvent(self.ready(), 0, false) };
         }
 
         pub(super) fn clear_ready(&self) {
@@ -295,7 +295,7 @@ mod kernel {
         }
 
         pub(super) fn set_cancelled(&self) {
-            unsafe { KeSetEvent(self.cancelled(), 0, 0) };
+            unsafe { KeSetEvent(self.cancelled(), 0, false) };
         }
 
         pub(super) fn clear_cancelled(&self) {
@@ -326,12 +326,12 @@ mod kernel {
                         WaitAny,
                         Executive,
                         0,
-                        0,
+                        false,
                         timeout,
                         ptr::null_mut(),
                     )
                 } else {
-                    KeWaitForSingleObject(self.ready().cast(), Executive, 0, 0, timeout)
+                    KeWaitForSingleObject(self.ready().cast(), Executive, 0, false, timeout)
                 }
             };
             match status {

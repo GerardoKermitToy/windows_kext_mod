@@ -32,14 +32,14 @@ pub fn stream_layer_tcp_v4(mut data: CalloutData) {
     };
 
     let key = bandwidth::Key {
-        local_ip: Ipv4Address::from_bytes(
-            &data
+        local_ip: Ipv4Address::from_octets(
+            data
                 .get_value_u32(Fields::IpLocalAddress as usize)
                 .to_be_bytes(),
         ),
         local_port: data.get_value_u16(Fields::IpLocalPort as usize),
-        remote_ip: Ipv4Address::from_bytes(
-            &data
+        remote_ip: Ipv4Address::from_octets(
+            data
                 .get_value_u32(Fields::IpRemoteAddress as usize)
                 .to_be_bytes(),
         ),
@@ -61,12 +61,12 @@ pub fn stream_layer_tcp_v6(mut data: CalloutData) {
     };
 
     let key = bandwidth::Key {
-        local_ip: Ipv6Address::from_bytes(
-            data.get_value_byte_array16(Fields::IpLocalAddress as usize),
+        local_ip: Ipv6Address::from_octets(
+            *data.get_value_byte_array16(Fields::IpLocalAddress as usize),
         ),
         local_port: data.get_value_u16(Fields::IpLocalPort as usize),
-        remote_ip: Ipv6Address::from_bytes(
-            data.get_value_byte_array16(Fields::IpRemoteAddress as usize),
+        remote_ip: Ipv6Address::from_octets(
+            *data.get_value_byte_array16(Fields::IpRemoteAddress as usize),
         ),
         remote_port: data.get_value_u16(Fields::IpRemotePort as usize),
     };
@@ -167,14 +167,14 @@ pub fn stream_layer_udp_v4(data: CalloutData) {
     }
 
     let key = bandwidth::Key {
-        local_ip: Ipv4Address::from_bytes(
-            &data
+        local_ip: Ipv4Address::from_octets(
+            data
                 .get_value_u32(Fields::IpLocalAddress as usize)
                 .to_be_bytes(),
         ),
         local_port: data.get_value_u16(Fields::IpLocalPort as usize),
-        remote_ip: Ipv4Address::from_bytes(
-            &data
+        remote_ip: Ipv4Address::from_octets(
+            data
                 .get_value_u32(Fields::IpRemoteAddress as usize)
                 .to_be_bytes(),
         ),
@@ -218,12 +218,12 @@ pub fn stream_layer_udp_v6(data: CalloutData) {
     }
 
     let key = bandwidth::Key {
-        local_ip: Ipv6Address::from_bytes(
-            data.get_value_byte_array16(Fields::IpLocalAddress as usize),
+        local_ip: Ipv6Address::from_octets(
+            *data.get_value_byte_array16(Fields::IpLocalAddress as usize),
         ),
         local_port: data.get_value_u16(Fields::IpLocalPort as usize),
-        remote_ip: Ipv6Address::from_bytes(
-            data.get_value_byte_array16(Fields::IpRemoteAddress as usize),
+        remote_ip: Ipv6Address::from_octets(
+            *data.get_value_byte_array16(Fields::IpRemoteAddress as usize),
         ),
         remote_port: data.get_value_u16(Fields::IpRemotePort as usize),
     };

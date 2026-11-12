@@ -16,15 +16,13 @@ use windows_sys::{
     Wdk::{
         Foundation::KDPC,
         System::SystemServices::{
-            ExAcquireRundownProtection, ExInitializeRundownProtection, ExReleaseRundownProtection,
+            ExInitializeRundownProtection, ExReleaseRundownProtection,
             ExRundownCompleted, ExWaitForRundownProtectionRelease, EX_RUNDOWN_REF,
             EX_RUNDOWN_REF_0,
         },
     },
     Win32::{
-        Foundation::{
-            BOOLEAN, INVALID_HANDLE_VALUE, NTSTATUS, STATUS_PROTOCOL_UNREACHABLE, STATUS_SUCCESS,
-        },
+        Foundation::{INVALID_HANDLE_VALUE, NTSTATUS, STATUS_PROTOCOL_UNREACHABLE, STATUS_SUCCESS},
         Networking::WinSock::{AF_INET, AF_INET6, AF_UNSPEC, SCOPE_ID, SCOPE_ID_0},
         System::Kernel::{COMPARTMENT_ID, UNSPECIFIED_COMPARTMENT_ID},
     },
@@ -32,11 +30,11 @@ use windows_sys::{
 
 use crate::{
     ffi::{
-        FwpsInjectNetworkReceiveAsync0, FwpsInjectNetworkSendAsync0,
+        ExAcquireRundownProtection, FwpsInjectNetworkReceiveAsync0, FwpsInjectNetworkSendAsync0,
         FwpsInjectTransportReceiveAsync0, FwpsInjectTransportSendAsync1,
         FwpsInjectionHandleCreate0, FwpsInjectionHandleDestroy0, FwpsQueryPacketInjectionState0,
         FWPS_INJECTION_TYPE_NETWORK, FWPS_INJECTION_TYPE_TRANSPORT, FWPS_PACKET_INJECTION_STATE,
-        FWPS_TRANSPORT_SEND_PARAMS1, NET_BUFFER_LIST,
+        FWPS_TRANSPORT_SEND_PARAMS1, NET_BUFFER_LIST, BOOLEAN,
     },
     utils::check_ntstatus,
 };

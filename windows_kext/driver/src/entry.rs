@@ -11,11 +11,11 @@ use num_traits::FromPrimitive;
 use wdk::irp_helpers::{
     CleanupRequest, CloseRequest, CreateRequest, DeviceControlRequest, ReadRequest, WriteRequest,
 };
-use wdk::{err, info, interface, rw_spin_lock::RwSpinLock};
+use wdk::{err, ffi::ExAcquireRundownProtection, info, interface, rw_spin_lock::RwSpinLock};
 use windows_sys::Wdk::{
     Foundation::IRP,
     System::SystemServices::{
-        ExAcquireRundownProtection, ExInitializeRundownProtection, ExReInitializeRundownProtection,
+        ExInitializeRundownProtection, ExReInitializeRundownProtection,
         ExReleaseRundownProtection, ExRundownCompleted, ExWaitForRundownProtectionRelease,
         EX_RUNDOWN_REF, EX_RUNDOWN_REF_0,
     },

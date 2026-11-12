@@ -700,8 +700,8 @@ impl NetworkAllocator {
             let mdl = IoAllocateMdl(
                 packet_data.as_mut_ptr() as _,
                 packet_data.len() as u32,
-                0,
-                0,
+                false,
+                false,
                 core::ptr::null_mut(),
             );
             if unlikely(mdl.is_null()) {

@@ -1,9 +1,13 @@
-use std::{fs::File, io::Write, process::Command};
+use std::{
+    fs::File,
+    io::{Seek, Write},
+    process::Command,
+};
 
 use chrono::Local;
 use handlebars::Handlebars;
 use serde_json::json;
-use zip::{write::FileOptions, ZipWriter};
+use zip::{write::SimpleFileOptions, ZipWriter};
 
 static VERSION: [u8; 4] = include!("../../kextinterface/version.txt");
 static LIB_PATH: &'static str = "./build/x86_64-pc-windows-msvc/release/driver.lib";
@@ -24,7 +28,8 @@ fn main() {
     let mut zip = zip::ZipWriter::new(file);
 
     // Write files to zip
-    zip.add_directory("cab", FileOptions::default()).unwrap();
+    zip.add_directory("cab", SimpleFileOptions::default())
+        .unwrap();
 
     // Write driver.lib
     write_lib_file_zip(&mut zip);
@@ -115,14 +120,49 @@ fn get_build_cab_script_content() -> String {
         .unwrap()
 }
 
-fn write_to_zip(zip: &mut ZipWriter<File>, filename: &str, content: String) {
-    zip.start_file(filename, FileOptions::default()).unwrap();
-    zip.write(&content.into_bytes()).unwrap();
+fn write_to_zip<W: Write + Seek>(zip: &mut ZipWriter<W>, filename: &str, content: String) {
+    zip.start_file(filename, SimpleFileOptions::default())
+        .unwrap();
+    zip.write_all(content.as_bytes()).unwrap();
 }
 
 fn write_lib_file_zip(zip: &mut ZipWriter<File>) {
-    zip.start_file("driver.lib", FileOptions::default())
+    zip.start_file("driver.lib", SimpleFileOptions::default())
         .unwrap();
     let mut driver_file = File::open(LIB_PATH).unwrap();
     std::io::copy(&mut driver_file, zip).unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Cursor, Read};
+    use zip::{CompressionMethod, ZipArchive};
+
+    #[test]
+    fn release_templates_round_trip_through_stored_zip_entries() {
+        let documents = [
+            ("PortmasterKext.ddf", get_ddf_content()),
+            ("build_cab.ps1", get_build_cab_script_content()),
+            ("version.rc", get_metadata_file_content()),
+            ("cab/PortmasterKext64.inf", get_inf_content()),
+        ];
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        writer
+            .add_directory("cab", SimpleFileOptions::default())
+            .unwrap();
+        for (name, content) in &documents {
+            assert!(!content.contains("{{"), "unrendered template in {name}");
+            write_to_zip(&mut writer, name, content.clone());
+        }
+        let mut archive = ZipArchive::new(writer.finish().unwrap()).unwrap();
+        assert_eq!(archive.len(), documents.len() + 1);
+        for (name, expected) in documents {
+            let mut entry = archive.by_name(name).unwrap();
+            assert_eq!(entry.compression(), CompressionMethod::Stored);
+            let mut actual = String::new();
+            entry.read_to_string(&mut actual).unwrap();
+            assert_eq!(actual, expected);
+        }
+    }
 }

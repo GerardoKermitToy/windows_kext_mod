@@ -171,9 +171,9 @@ impl Bandwidth {
             return None;
         }
         let values = snapshot.map(|(key, value)| BandwidthValueV4 {
-            local_ip: key.local_ip.0,
+            local_ip: key.local_ip.octets(),
             local_port: key.local_port,
-            remote_ip: key.remote_ip.0,
+            remote_ip: key.remote_ip.octets(),
             remote_port: key.remote_port,
             transmitted_bytes: value.transmitted_bytes,
             received_bytes: value.received_bytes,
@@ -190,9 +190,9 @@ impl Bandwidth {
             return None;
         }
         let values = snapshot.map(|(key, value)| BandwidthValueV6 {
-            local_ip: key.local_ip.0,
+            local_ip: key.local_ip.octets(),
             local_port: key.local_port,
-            remote_ip: key.remote_ip.0,
+            remote_ip: key.remote_ip.octets(),
             remote_port: key.remote_port,
             transmitted_bytes: value.transmitted_bytes,
             received_bytes: value.received_bytes,

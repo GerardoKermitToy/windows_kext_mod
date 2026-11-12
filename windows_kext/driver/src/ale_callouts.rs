@@ -147,8 +147,8 @@ fn get_packet_direction(data: &CalloutData, connection_direction: Direction) -> 
 }
 
 fn get_ipv4_address(data: &CalloutData, index: usize) -> IpAddress {
-    IpAddress::Ipv4(Ipv4Address::from_bytes(
-        &data.get_value_u32(index).to_be_bytes(),
+    IpAddress::Ipv4(Ipv4Address::from_octets(
+        data.get_value_u32(index).to_be_bytes(),
     ))
 }
 
@@ -158,7 +158,7 @@ fn get_ipv4_address_if_present(data: &CalloutData, index: usize) -> Option<IpAdd
 }
 
 fn get_ipv6_address(data: &CalloutData, index: usize) -> IpAddress {
-    IpAddress::Ipv6(Ipv6Address::from_bytes(data.get_value_byte_array16(index)))
+    IpAddress::Ipv6(Ipv6Address::from_octets(*data.get_value_byte_array16(index)))
 }
 
 fn get_ipv6_address_if_present(data: &CalloutData, index: usize) -> Option<IpAddress> {
@@ -1234,9 +1234,17 @@ fn create_packet_list(
         inbound = true;
     }
 
-    let address: &[u8] = match &ale_data.remote_ip {
-        IpAddress::Ipv4(address) => &address.0,
-        IpAddress::Ipv6(address) => &address.0,
+    let ipv4_bytes;
+    let ipv6_bytes;
+    let address: &[u8] = match ale_data.remote_ip {
+        IpAddress::Ipv4(address) => {
+            ipv4_bytes = address.octets();
+            &ipv4_bytes
+        }
+        IpAddress::Ipv6(address) => {
+            ipv6_bytes = address.octets();
+            &ipv6_bytes
+        }
     };
     let clone = nbl
         .clone(&device.network_allocator)
@@ -1286,8 +1294,8 @@ pub(crate) fn emit_connection_end_v4(device: &Device, conn: ConnectionV4, proces
         },
         conn.get_direction() as u8,
         u8::from(conn.protocol),
-        conn.local_address.0,
-        conn.remote_address.0,
+        conn.local_address.octets(),
+        conn.remote_address.octets(),
         conn.local_port,
         conn.remote_port,
     );
@@ -1303,8 +1311,8 @@ pub(crate) fn emit_connection_end_v6(device: &Device, conn: ConnectionV6, proces
         },
         conn.get_direction() as u8,
         u8::from(conn.protocol),
-        conn.local_address.0,
-        conn.remote_address.0,
+        conn.local_address.octets(),
+        conn.remote_address.octets(),
         conn.local_port,
         conn.remote_port,
     );

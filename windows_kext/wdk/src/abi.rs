@@ -4,11 +4,12 @@
 #[cfg(target_pointer_width = "64")]
 const _: () = {
     use core::mem::{align_of, size_of};
+    use crate::ffi::BOOLEAN;
     use windows_sys::{
         core::GUID,
         Wdk::Foundation::{IRP, MDL},
         Win32::{
-            Foundation::{BOOLEAN, HANDLE, NTSTATUS, UNICODE_STRING},
+            Foundation::{HANDLE, NTSTATUS, UNICODE_STRING},
             NetworkManagement::{IpHelper::IP_ADDRESS_PREFIX, WindowsFilteringPlatform::FWP_DIRECTION},
             Networking::WinSock::{ADDRESS_FAMILY, SCOPE_ID},
             System::{Kernel::{COMPARTMENT_ID, LIST_ENTRY}, IO::IO_STATUS_BLOCK},
