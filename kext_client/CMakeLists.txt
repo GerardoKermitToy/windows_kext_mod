@@ -20,7 +20,13 @@ target_include_directories(pmkext PUBLIC include)
 target_link_libraries(pmkext PUBLIC advapi32 ws2_32 fwpuclnt)
 
 if(MSVC)
-    target_compile_options(pmkext PRIVATE /W4 /permissive-)
+    # Debug/RelWithDebInfo use /Zi by default; other configurations need /Z7.
+    # In either case, include the static library's symbols in the monitor PDB.
+    target_compile_options(pmkext PRIVATE
+        /W4 /permissive-
+        "$<$<OR:$<CONFIG:Debug>,$<CONFIG:RelWithDebInfo>>:/Zi>"
+        "$<$<NOT:$<OR:$<CONFIG:Debug>,$<CONFIG:RelWithDebInfo>>>:/Z7>"
+    )
     target_compile_definitions(pmkext PUBLIC
         UNICODE
         _UNICODE
@@ -84,6 +90,21 @@ target_link_libraries(kext_monitor PRIVATE pmkext iphlpapi nsi_import)
 
 # wmain requires the Unicode entry point.
 if(MSVC)
+    target_compile_options(kext_monitor PRIVATE
+        "$<$<OR:$<CONFIG:Debug>,$<CONFIG:RelWithDebInfo>>:/Zi>"
+        "$<$<NOT:$<OR:$<CONFIG:Debug>,$<CONFIG:RelWithDebInfo>>>:/Z7>"
+    )
+    # A response file prevents cmd.exe from expanding %_PDB% before link.exe.
+    set(MONITOR_PDBALTPATH_RSP "${CMAKE_CURRENT_BINARY_DIR}/kext_monitor_pdbaltpath.rsp")
+    file(GENERATE OUTPUT "${MONITOR_PDBALTPATH_RSP}" CONTENT "/PDBALTPATH:%_PDB%\n")
+    set_property(TARGET kext_monitor APPEND PROPERTY LINK_DEPENDS "${MONITOR_PDBALTPATH_RSP}")
+    target_link_options(kext_monitor PRIVATE
+        /DEBUG:FULL
+        "@${MONITOR_PDBALTPATH_RSP}"
+        "$<$<OR:$<CONFIG:Release>,$<CONFIG:MinSizeRel>>:/OPT:REF>"
+        "$<$<OR:$<CONFIG:Release>,$<CONFIG:MinSizeRel>>:/OPT:ICF>"
+        "$<$<OR:$<CONFIG:Release>,$<CONFIG:MinSizeRel>>:/INCREMENTAL:NO>"
+    )
     set_target_properties(kext_monitor PROPERTIES
         LINK_FLAGS "/ENTRY:wmainCRTStartup"
     )
@@ -102,6 +123,15 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
+    if(MSVC AND CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+        add_test(NAME monitor_pdb_tests
+            COMMAND "${CMAKE_COMMAND}" "-DDUMP_TOOL=${CMAKE_LINKER}"
+                    "-DIMAGE=$<TARGET_FILE:kext_monitor>"
+                    "-DPDB=$<TARGET_PDB_FILE:kext_monitor>"
+                    -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/pdb_debug_info.cmake")
+        set_tests_properties(monitor_pdb_tests PROPERTIES TIMEOUT 10)
+    endif()
+
     add_executable(route_policy_tests tests/route_policy_tests.cpp src/RoutePolicies.cpp)
     target_include_directories(route_policy_tests PRIVATE src)
     target_link_libraries(route_policy_tests PRIVATE pmkext nsi_import)

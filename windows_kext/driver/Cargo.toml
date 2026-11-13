@@ -36,3 +36,4 @@ windows-link = { path = "../kernel-windows-link" }
 
 [profile.release]
 debug = 2
+lto = "fat"

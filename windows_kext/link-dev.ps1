@@ -25,7 +25,7 @@ link.exe /OUT:portmaster-kext.sys `
 "C:\Program Files (x86)\Windows Kits\10\lib\wdf\kmdf\x64\1.15\WdfLdr.lib" `
 "C:\Program Files (x86)\Windows Kits\10\lib\wdf\kmdf\x64\1.15\WdfDriverEntry.lib" `
 "driver\target\x86_64-pc-windows-msvc\release\driver.lib" @resourceInputs `
-/RELEASE /INTEGRITYCHECK /VERSION:"10.0" /DEBUG /MACHINE:X64 /ENTRY:"FxDriverEntry" /OPT:REF /INCREMENTAL:NO /SUBSYSTEM:NATIVE",6.01" /OPT:ICF /ERRORREPORT:PROMPT /MERGE:"_TEXT=.text;_PAGE=PAGE" /NOLOGO /NODEFAULTLIB /SECTION:"INIT,d"
+/RELEASE /INTEGRITYCHECK /VERSION:"10.0" /DEBUG:FULL '/PDBALTPATH:%_PDB%' /MACHINE:X64 /ENTRY:"FxDriverEntry" /OPT:REF /INCREMENTAL:NO /SUBSYSTEM:NATIVE",6.01" /OPT:ICF /ERRORREPORT:PROMPT /MERGE:"_TEXT=.text;_PAGE=PAGE" /NOLOGO /NODEFAULTLIB /SECTION:"INIT,d"
 if(!$?) {
     Exit $LASTEXITCODE
 }
