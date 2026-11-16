@@ -149,15 +149,13 @@ fn ip_packet_layer(
     direction: Direction,
     fields: PacketLayerFields,
 ) {
-    // A higher-priority provider may already have absorbed the packet (for
-    // example, NAT forwarding). Never clone or reinject an indication whose
-    // action is no longer ours to change.
-    if unlikely(!data.can_set_action()) {
+    // Preserve a higher-priority hard block before parsing, cloning or taking
+    // packet ownership. A hard permit may still be vetoed by our policy.
+    if unlikely(!data.can_block()) {
         return;
     }
 
-    // Fail closed until a later path explicitly permits the indication. Do not
-    // make this provisional action hard: the callback still needs to replace it.
+    // Fail closed unless a later path chooses an explicit final decision.
     data.set_default_block_and_absorb();
 
     let layer_data = data.get_layer_data();

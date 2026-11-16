@@ -18,7 +18,7 @@ use windows_sys::Win32::Foundation::{NTSTATUS, STATUS_SUCCESS};
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
     FWPM_CALLOUT0, FWPM_CALLOUT_FLAG_USES_PROVIDER_CONTEXT,
     FWPM_CONDITION_IP_PROTOCOL, FWPM_DISPLAY_DATA0, FWPM_FILTER0, FWPM_FILTER_CONDITION0,
-    FWPM_SESSION0, FWPM_SESSION_FLAG_DYNAMIC, FWPM_SUBLAYER0, FWP_MATCH_EQUAL, FWP_UINT8,
+    FWPM_SESSION0, FWPM_SESSION_FLAG_DYNAMIC, FWPM_SUBLAYER0, FWP_EMPTY, FWP_MATCH_EQUAL, FWP_UINT8,
 };
 use windows_sys::Win32::System::Rpc::RPC_C_AUTHN_WINNT;
 use windows_sys::{
@@ -299,8 +299,8 @@ pub(crate) fn register_filter(
         filter.displayData.description = description.as_ptr() as _;
         filter.action.r#type = action; // Use the caller-supplied callout action type (terminating or inspection).
         filter.subLayerKey = GUID::from_u128(sublayer_guid);
-        filter.weight.r#type = FWP_UINT8;
-        filter.weight.Anonymous.uint8 = 15; // The weight of this filter within its sublayer
+        // Let BFE calculate the effective weight for every filter.
+        filter.weight.r#type = FWP_EMPTY;
 
         // Ordinary permits remain overridable. Block helpers clear
         // FWPS_RIGHT_ACTION_WRITE explicitly, and the narrow Portmaster-owner

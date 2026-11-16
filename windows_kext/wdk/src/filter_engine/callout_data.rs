@@ -8,7 +8,7 @@ use crate::{
 };
 
 use super::{
-    classify::ClassifyOut,
+    classify::{ActionRights, ClassifyOut},
     layer::{Layer, Value, ValueType},
     metadata::{FwpsIncomingMetadataValues, PacketDirection},
     packet::TransportPacketList,
@@ -160,6 +160,17 @@ pub(super) struct CalloutDataParts<'a> {
     pub layer_data: *mut c_void,
 }
 
+/// Only the final decision is written to WFP. In particular a hard permit must
+/// not become a provisional veto and then be illegally changed back to permit.
+#[derive(Clone, Copy)]
+enum ClassifyAction {
+    Unchanged,
+    Permit,
+    Continue,
+    None,
+    Block { absorb: bool },
+}
+
 /// Borrowed access to one WFP classify indication.
 ///
 /// Only the validated classify trampoline can construct this type. Its native
@@ -176,7 +187,9 @@ pub struct CalloutData<'a> {
     classify_out: &'a mut ClassifyOut,
     classify_context: *const c_void,
     layer_data: *mut c_void,
-    provisional_block: bool,
+    action_rights: ActionRights,
+    action: ClassifyAction,
+    clear_action_right: bool,
 }
 
 impl<'a> CalloutData<'a> {
@@ -189,10 +202,12 @@ impl<'a> CalloutData<'a> {
             flow_context: parts.flow_context,
             values: parts.values,
             metadata: parts.metadata,
+            action_rights: parts.classify_out.action_rights(),
             classify_out: parts.classify_out,
             classify_context: parts.classify_context,
             layer_data: parts.layer_data,
-            provisional_block: false,
+            action: ClassifyAction::Unchanged,
+            clear_action_right: false,
         }
     }
 
@@ -383,16 +398,24 @@ impl<'a> CalloutData<'a> {
             return Err("WFP returned a zero classify handle".to_string());
         }
 
+        // FwpsPendClassify consumes the actual WFP output, not our staged
+        // decision. Flush once before handing it to the engine.
+        self.apply_action();
         // SAFETY: the acquired handle belongs to this current classification;
         // filter_id and classify_out came from the same validated callback.
         let status = unsafe { FwpsPendClassify0(handle, self.filter_id, 0, self.classify_out) };
         if let Err(err) = check_ntstatus(status) {
+            // A native in/out call may have changed the arbitration state.
+            self.action_rights = self.classify_out.action_rights();
             // SAFETY: pending failed, so this remains the sole acquired handle
             // reference and must be released without a completion call.
             unsafe { FwpsReleaseClassifyHandle0(handle) };
             return Err(alloc::format!("failed to pend classification: {}", err));
         }
 
+        // The engine now owns the pended output. Preserve its post-call snapshot
+        // for completion and prevent any later setter/Drop from rewriting it.
+        self.action_rights = ActionRights::ReadOnly;
         Ok(ClassifyPend {
             handle,
             classify_out: *self.classify_out,
@@ -421,60 +444,92 @@ impl<'a> CalloutData<'a> {
         ClassifyDefer::reauthorization(packet_list)
     }
 
+    /// Incoming write permission, decoded once when this indication was admitted.
     pub fn can_set_action(&self) -> bool {
-        self.classify_out.can_set_action()
+        self.action_rights == ActionRights::Writable
+    }
+
+    /// Policy may run for a writable action or to veto a hard permit. Never take
+    /// packet ownership (clone/pend/reinject) from an incoming hard block.
+    pub fn can_block(&self) -> bool {
+        self.action_rights != ActionRights::ReadOnly
     }
 
     pub fn action_permit(&mut self) {
-        self.provisional_block = false;
-        self.classify_out.action_permit();
-        self.classify_out.clear_absorb_flag();
+        self.action = ClassifyAction::Permit;
+        self.clear_action_right = false;
     }
 
     pub fn action_continue(&mut self) {
-        self.provisional_block = false;
-        self.classify_out.action_continue();
-        self.classify_out.clear_absorb_flag();
+        self.action = ClassifyAction::Continue;
+        self.clear_action_right = false;
     }
 
-    // Block action and clear the write flag.
-    // This will block the packet and prevent next filter in the chain to change the action.
+    /// Choose a final hard block with normal WFP auditing.
     pub fn action_block_hard(&mut self) {
-        self.provisional_block = false;
-        self.classify_out.action_block();
-        self.classify_out.clear_absorb_flag();
-        // Next filter in the chain will not change the action.
-        self.classify_out.clear_write_flag();
+        self.action = ClassifyAction::Block { absorb: false };
+        self.clear_action_right = true;
     }
 
     pub fn action_none(&mut self) {
-        self.provisional_block = false;
-        self.classify_out.set_none();
-        self.classify_out.clear_absorb_flag();
+        self.action = ClassifyAction::None;
+        self.clear_action_right = false;
     }
 
-    /// Sets a fail-closed provisional action while the callback is still choosing
-    /// whether this indication should be permitted. Unlike `block_and_absorb`, it
-    /// does not clear the action-write right, so a later `action_permit` remains a
-    /// valid decision for this same callback.
+    /// Choose the fail-closed fallback without writing a provisional action to
+    /// WFP. A later explicit decision replaces it before the single final write.
     pub fn set_default_block_and_absorb(&mut self) {
-        self.provisional_block = true;
-        self.classify_out.action_block();
-        self.classify_out.set_absorb();
+        self.block_and_absorb();
     }
 
-    /// Blocks and absorbs the indication as a final decision. The write right must
-    /// be cleared for clone/drop/reinject and for every other hard block, otherwise
-    /// a lower-priority filter can replace this action with permit.
+    /// Choose a final hard block that silently absorbs the indication.
     pub fn block_and_absorb(&mut self) {
-        self.provisional_block = false;
-        self.classify_out.action_block();
-        self.classify_out.set_absorb();
-        self.classify_out.clear_write_flag();
+        self.action = ClassifyAction::Block { absorb: true };
+        self.clear_action_right = true;
     }
+
+    /// Make our final action hard. A hard permit still allows callout vetoes.
     pub fn clear_write_flag(&mut self) {
-        self.provisional_block = false;
-        self.classify_out.clear_write_flag();
+        self.clear_action_right = true;
+    }
+
+    /// Apply once on return, or immediately before a native classify-pend call.
+    /// All setters above only choose a decision, so they need no rights checks.
+    fn apply_action(&mut self) {
+        let action = core::mem::replace(&mut self.action, ClassifyAction::Unchanged);
+        let clear_right = core::mem::take(&mut self.clear_action_right);
+        match self.action_rights {
+            ActionRights::ReadOnly => return,
+            ActionRights::VetoOnly if !matches!(action, ClassifyAction::Block { .. }) => return,
+            _ => {}
+        }
+
+        match action {
+            ClassifyAction::Unchanged => {}
+            ClassifyAction::Permit => {
+                self.classify_out.action_permit();
+                self.classify_out.clear_absorb_flag();
+            }
+            ClassifyAction::Continue => {
+                self.classify_out.action_continue();
+                self.classify_out.clear_absorb_flag();
+            }
+            ClassifyAction::None => {
+                self.classify_out.set_none();
+                self.classify_out.clear_absorb_flag();
+            }
+            ClassifyAction::Block { absorb } => {
+                self.classify_out.action_block();
+                if absorb {
+                    self.classify_out.set_absorb();
+                } else {
+                    self.classify_out.clear_absorb_flag();
+                }
+            }
+        }
+        if clear_right {
+            self.classify_out.clear_write_flag();
+        }
     }
 
     pub fn is_reauthorize(&self, flags_index: usize) -> bool {
@@ -494,18 +549,15 @@ impl<'a> CalloutData<'a> {
 
 impl Drop for CalloutData<'_> {
     fn drop(&mut self) {
-        // If the handler selected a provisional fail-closed action and did not
-        // replace it with an explicit final action, make that block hard before
-        // returning so a lower-priority filter cannot turn it into permit.
-        if self.provisional_block {
-            self.classify_out.clear_write_flag();
-        }
+        self.apply_action();
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CalloutData, CalloutDataParts, ClassifyOut, FwpsIncomingMetadataValues, Layer};
+    use super::{
+        CalloutData, CalloutDataParts, ClassifyAction, ClassifyOut, FwpsIncomingMetadataValues, Layer,
+    };
 
     fn empty_metadata() -> FwpsIncomingMetadataValues {
         // The native metadata mirror consists only of integer fields, C unions and
@@ -571,7 +623,7 @@ mod tests {
     }
 
     #[test]
-    fn final_non_absorb_block_is_hard_immediately() {
+    fn final_non_absorb_block_is_hard_on_return() {
         let metadata = empty_metadata();
         let mut classify_out = ClassifyOut::test_writable();
         {
@@ -585,7 +637,7 @@ mod tests {
     }
 
     #[test]
-    fn final_absorb_block_is_hard_immediately() {
+    fn final_absorb_block_is_hard_on_return() {
         let metadata = empty_metadata();
         let mut classify_out = ClassifyOut::test_writable();
         {
@@ -625,5 +677,161 @@ mod tests {
         assert!(classify_out.test_is_permit());
         assert!(!classify_out.test_absorbs());
         assert!(classify_out.can_set_action());
+    }
+
+    const DECISIONS: [ClassifyAction; 6] = [
+        ClassifyAction::Unchanged,
+        ClassifyAction::Permit,
+        ClassifyAction::Continue,
+        ClassifyAction::None,
+        ClassifyAction::Block { absorb: false },
+        ClassifyAction::Block { absorb: true },
+    ];
+
+    fn choose_action(data: &mut CalloutData<'_>, action: ClassifyAction) {
+        match action {
+            ClassifyAction::Unchanged => {}
+            ClassifyAction::Permit => data.action_permit(),
+            ClassifyAction::Continue => data.action_continue(),
+            ClassifyAction::None => data.action_none(),
+            ClassifyAction::Block { absorb: false } => data.action_block_hard(),
+            ClassifyAction::Block { absorb: true } => data.block_and_absorb(),
+        }
+    }
+
+    #[test]
+    fn hard_block_is_unchanged_for_every_policy_decision() {
+        let metadata = empty_metadata();
+        for absorb in [false, true] {
+            for decision in DECISIONS {
+                let mut output = ClassifyOut::test_writable();
+                output.action_block();
+                if absorb {
+                    output.set_absorb();
+                }
+                output.clear_write_flag();
+                let original = output;
+                {
+                    let mut data = callout_data(&mut output, &metadata);
+                    assert!(!data.can_block());
+                    choose_action(&mut data, decision);
+                    data.clear_write_flag();
+                }
+                assert_eq!(output, original);
+            }
+        }
+    }
+
+    #[test]
+    fn hard_permit_ignores_nonblocking_decisions_and_preserves_all_fields() {
+        let metadata = empty_metadata();
+        for decision in DECISIONS[..4].iter().copied() {
+            let mut output = ClassifyOut::test_writable();
+            output.action_permit();
+            output.clear_write_flag();
+            let original = output;
+            {
+                let mut data = callout_data(&mut output, &metadata);
+                assert!(data.can_block());
+                assert!(!data.can_set_action());
+                if !matches!(decision, ClassifyAction::Unchanged) {
+                    data.set_default_block_and_absorb();
+                }
+                choose_action(&mut data, decision);
+                data.clear_write_flag();
+                // No provisional veto has been written during policy evaluation.
+                assert_eq!(*data.classify_out, original);
+            }
+            assert_eq!(output, original);
+        }
+    }
+
+    #[test]
+    fn hard_permit_can_be_vetoed_with_or_without_absorb() {
+        let metadata = empty_metadata();
+        for absorb in [false, true] {
+            let mut output = ClassifyOut::test_writable();
+            output.action_permit();
+            output.clear_write_flag();
+            {
+                let mut data = callout_data(&mut output, &metadata);
+                choose_action(&mut data, ClassifyAction::Block { absorb });
+                assert!(data.classify_out.test_is_permit());
+            }
+            assert!(output.test_is_block());
+            assert_eq!(output.test_absorbs(), absorb);
+            assert!(!output.can_set_action());
+        }
+    }
+
+    #[test]
+    fn unresolved_default_vetoes_hard_permit_on_return() {
+        let metadata = empty_metadata();
+        let mut output = ClassifyOut::test_writable();
+        output.action_permit();
+        output.clear_write_flag();
+        {
+            let mut data = callout_data(&mut output, &metadata);
+            data.set_default_block_and_absorb();
+            assert!(data.classify_out.test_is_permit());
+        }
+        assert!(output.test_is_block());
+        assert!(output.test_absorbs());
+        assert!(!output.can_set_action());
+    }
+
+    #[test]
+    fn policy_setters_only_stage_the_final_writable_decision() {
+        let metadata = empty_metadata();
+        let mut output = ClassifyOut::test_writable();
+        let original = output;
+        {
+            let mut data = callout_data(&mut output, &metadata);
+            data.set_default_block_and_absorb();
+            assert_eq!(*data.classify_out, original);
+            data.action_permit();
+            assert_eq!(*data.classify_out, original);
+        }
+        assert!(output.test_is_permit());
+        assert!(!output.test_absorbs());
+        assert!(output.can_set_action());
+    }
+
+    #[test]
+    fn explicit_flush_consumes_the_decision_before_native_output_changes() {
+        let metadata = empty_metadata();
+        let mut output = ClassifyOut::test_writable();
+        let native_output;
+        {
+            let mut data = callout_data(&mut output, &metadata);
+            data.action_permit();
+            data.clear_write_flag();
+            data.apply_action();
+            assert!(data.classify_out.test_is_permit());
+            assert!(!data.classify_out.can_set_action());
+
+            // Model the in/out mutation made by FwpsPendClassify. Drop must not
+            // replay either the old action or its clear-right request.
+            data.classify_out.action_block();
+            data.classify_out.set_absorb();
+            native_output = *data.classify_out;
+        }
+        assert_eq!(output, native_output);
+    }
+
+    #[test]
+    fn nonwritable_nonpermit_action_is_not_a_veto_target() {
+        let metadata = empty_metadata();
+        for decision in DECISIONS {
+            let mut output = ClassifyOut::test_writable();
+            output.clear_write_flag();
+            let original = output;
+            {
+                let mut data = callout_data(&mut output, &metadata);
+                assert!(!data.can_block());
+                choose_action(&mut data, decision);
+            }
+            assert_eq!(output, original);
+        }
     }
 }

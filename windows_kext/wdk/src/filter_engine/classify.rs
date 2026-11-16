@@ -38,8 +38,17 @@ const FWP_CONDITION_FLAG_IS_CONNECTION_REDIRECTED: u32 = 0x00100000;
 
 const FWPS_RIGHT_ACTION_WRITE: u32 = 0x00000001;
 
+/// Decode the incoming arbitration state once, before choosing our own action.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) enum ActionRights {
+    Writable,
+    VetoOnly,
+    ReadOnly,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[cfg_attr(test, derive(Debug, Eq, PartialEq))]
 pub struct ClassifyOut {
     action_type: u32,
     _out_context: u64, // System use
@@ -111,9 +120,21 @@ impl ClassifyOut {
         self.clear_absorb_flag();
     }
 
-    // Checks if write action flag is set. Indicates if the callout can change the action.
+    /// Ordinary actions require ACTION_WRITE. Without it only a veto of an
+    /// incoming hard permit is allowed; an incoming hard block is immutable.
+    pub(super) fn action_rights(&self) -> ActionRights {
+        if self.can_set_action() {
+            ActionRights::Writable
+        } else if self.action_type == FWP_ACTION_PERMIT {
+            ActionRights::VetoOnly
+        } else {
+            ActionRights::ReadOnly
+        }
+    }
+
+    /// Whether arbitrary writes to actionType are allowed (not including veto).
     pub fn can_set_action(&self) -> bool {
-        self.rights & FWPS_RIGHT_ACTION_WRITE > 0
+        self.rights & FWPS_RIGHT_ACTION_WRITE != 0
     }
 
     /// Set block action. The caller must clear the write right before returning
@@ -149,7 +170,7 @@ impl ClassifyOut {
         self.flags &= !FWPS_CLASSIFY_OUT_FLAG_ABSORB;
     }
 
-    // Clear the write flag permission. Next filter in the chain will not change the action.
+    // A hard permit can still be blocked by another callout's veto.
     pub fn clear_write_flag(&mut self) {
         self.rights &= !FWPS_RIGHT_ACTION_WRITE;
     }

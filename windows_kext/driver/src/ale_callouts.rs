@@ -379,8 +379,13 @@ fn track_endpoint_instance(
 }
 
 fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
-    // Fail closed until a later path explicitly permits the indication. Do not
-    // make this provisional action hard: the callback still needs to replace it.
+    // Never pend, clone or authorize over another provider's hard block. Hard
+    // permits remain inspectable: our final block is an allowed callout veto.
+    if unlikely(!data.can_block()) {
+        return;
+    }
+
+    // Fail closed unless a later path chooses an explicit final decision.
     data.set_default_block_and_absorb();
 
     let Some(device) = crate::entry::get_device() else {
@@ -728,8 +733,8 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
         data.action_permit();
 
         if device.is_owner_pid(ale_data.process_id as u32) {
-            // Keep other firewalls from overriding the permit on Portmaster's own
-            // traffic, matching the cached-verdict path below.
+            // Make the owner's permit hard against ordinary lower-priority
+            // filters. Other callouts can still block it with a veto.
             data.clear_write_flag();
         }
         return;
@@ -891,9 +896,8 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
                 if device.is_owner_pid(ale_data.process_id as u32)
                     && matches!(ale_data.packet_direction, Direction::Outbound)
                 {
-                    // If this is Portmaster's own outbound packet, clear the write flag
-                    // to prevent subsequent filters in the chain from overriding the permit action.
-                    // This prevents other firewall applications from blocking Portmaster's own traffic.
+                    // Make the owner's outbound permit hard against ordinary
+                    // filters; another callout can still veto it.
                     data.clear_write_flag();
                 }
             }
