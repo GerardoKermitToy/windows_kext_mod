@@ -1,3 +1,4 @@
+use likely_stable::unlikely;
 use smoltcp::wire::{IpAddress, IpProtocol};
 
 use crate::connection::Direction;
@@ -102,31 +103,30 @@ impl InjectionStatus {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum PacketInjectionAction {
+pub(crate) enum PacketInjectionAction<Origin> {
     PermitSelfInjected,
-    Process { injected_by_other: bool },
+    Process { transport_origin: Origin },
 }
 
 /// Packet layers always permit self-injection. Unlike ALE's inbound loopback
 /// authorization, they need no other-handle state once local ownership is proven.
+/// Return the queried origin for ordinary processing instead of making the caller
+/// capture an Option or repeat the query. Self-injection is the rare path.
 #[inline]
-pub(crate) fn classify_packet_injection(
+pub(crate) fn classify_packet_injection<Origin>(
     network_self_injected: bool,
-    network_injected_by_other: bool,
-    query_transport: impl FnOnce() -> (bool, bool),
-) -> PacketInjectionAction {
-    if network_self_injected {
+    query_transport: impl FnOnce() -> (bool, Origin),
+) -> PacketInjectionAction<Origin> {
+    if unlikely(network_self_injected) {
         return PacketInjectionAction::PermitSelfInjected;
     }
 
     // "Other" relative to the network handle can still be our transport clone.
-    let (transport_self_injected, transport_injected_by_other) = query_transport();
-    if transport_self_injected {
+    let (transport_self_injected, transport_origin) = query_transport();
+    if unlikely(transport_self_injected) {
         PacketInjectionAction::PermitSelfInjected
     } else {
-        PacketInjectionAction::Process {
-            injected_by_other: network_injected_by_other || transport_injected_by_other,
-        }
+        PacketInjectionAction::Process { transport_origin }
     }
 }
 
@@ -440,34 +440,28 @@ mod tests {
 
     #[test]
     fn packet_injection_short_circuits_only_proven_network_self() {
-        // NotInjected, Injected/PreviouslyInjectedBySelf, InjectedByOther, Unknown.
-        // Include all boolean combinations too so ownership always has priority.
-        for network_self in [false, true] {
-            for network_other in [false, true] {
-                for transport_self in [false, true] {
-                    for transport_other in [false, true] {
-                        let mut calls = 0;
-                        let actual = classify_packet_injection(network_self, network_other, || {
-                            calls += 1;
-                            (transport_self, transport_other)
-                        });
-                        let eager = InjectionStatus::new(
-                            network_self,
-                            transport_self,
-                            network_other,
-                            transport_other,
-                        );
-                        let expected = if eager.is_self_injected() {
-                            PacketInjectionAction::PermitSelfInjected
-                        } else {
-                            PacketInjectionAction::Process {
-                                injected_by_other: eager.is_injected_by_other(),
-                            }
-                        };
-                        assert_eq!(actual, expected);
-                        assert_eq!(calls, usize::from(!network_self));
-                    }
-                }
+        // Both native self-injection states map to the same flag. Use opaque
+        // origins here so policy tests never link kernel-only WDK functions.
+        let origins = [
+            (false, "NotInjected"),
+            (true, "InjectedBySelf"),
+            (false, "InjectedByOther"),
+            (false, "Unknown"),
+        ];
+        for (network_self, network_origin) in origins {
+            for (transport_self, transport_origin) in origins {
+                let mut calls = 0;
+                let actual = classify_packet_injection(network_self, || {
+                    calls += 1;
+                    (transport_self, transport_origin)
+                });
+                let expected = if network_self || transport_self {
+                    PacketInjectionAction::PermitSelfInjected
+                } else {
+                    PacketInjectionAction::Process { transport_origin }
+                };
+                assert_eq!(actual, expected, "network origin: {network_origin}");
+                assert_eq!(calls, usize::from(!network_self));
             }
         }
     }
@@ -475,13 +469,13 @@ mod tests {
     #[test]
     fn network_other_still_queries_the_own_transport_handle() {
         assert_eq!(
-            classify_packet_injection(false, true, || (true, false)),
+            classify_packet_injection(false, || (true, "InjectedBySelf")),
             PacketInjectionAction::PermitSelfInjected,
         );
         assert_eq!(
-            classify_packet_injection(false, false, || (false, true)),
+            classify_packet_injection(false, || (false, "InjectedByOther")),
             PacketInjectionAction::Process {
-                injected_by_other: true,
+                transport_origin: "InjectedByOther",
             },
         );
     }

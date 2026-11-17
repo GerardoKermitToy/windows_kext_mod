@@ -155,35 +155,22 @@ fn ip_packet_layer(
         return;
     }
 
-    // Fail closed unless a later path chooses an explicit final decision.
-    data.set_default_block_and_absorb();
-
     let layer_data = data.get_layer_data();
-    let inbound = matches!(direction, Direction::Inbound);
-
-    // SAFETY: `ip_packet_layer` is called only by IP-packet classify handlers.
-    // WFP owns this NBL chain for the complete callback, and every yielded wrapper
-    // remains inside it.
-    let mut nbls = unsafe { NetBufferListIter::new(layer_data as _) };
-    let Some(first_nbl) = nbls.next() else {
-        return;
-    };
-
     let Some(device) = crate::entry::get_device() else {
+        data.block_and_absorb();
         return;
     };
 
-    // Self-injected packets need no header reads, parsing or inbound retreat.
-    // SAFETY: WFP owns the live NBL for this entire synchronous query.
+    // Self-injected packets need no NBL-chain traversal, header reads or staged
+    // fallback block. The origin queries also accept null layer data safely.
+    // SAFETY: A non-null NBL is owned by WFP for this entire synchronous query.
     let network_injection_origin = unsafe {
         device
             .injector
             .network_packet_injection_origin(layer_data as _, ipv6)
     };
-    let mut transport_injection_origin = None;
-    let injection_action = classify_packet_injection(
+    let transport_injection_origin = match classify_packet_injection(
         network_injection_origin.is_self_injected(),
-        network_injection_origin.is_injected_by_other(),
         || {
             // SAFETY: The same WFP-owned NBL is still live. A transport clone can
             // be "other" relative to the network handle, so query this handle unless
@@ -193,17 +180,31 @@ fn ip_packet_layer(
                     .injector
                     .transport_packet_injection_origin(layer_data as _)
             };
-            transport_injection_origin = Some(origin);
-            (origin.is_self_injected(), origin.is_injected_by_other())
+            (origin.is_self_injected(), origin)
         },
-    );
-    let injected_by_other = match injection_action {
+    ) {
         PacketInjectionAction::PermitSelfInjected => {
             data.action_permit();
             return;
         }
-        PacketInjectionAction::Process { injected_by_other } => injected_by_other,
+        PacketInjectionAction::Process { transport_origin } => transport_origin,
     };
+
+    // Fail closed on every remaining early exit. Self-injection has already
+    // returned, so only ordinary processing needs this staged fallback.
+    data.set_default_block_and_absorb();
+
+    // SAFETY: `ip_packet_layer` is called only by IP-packet classify handlers.
+    // WFP owns this NBL chain for the complete callback, and every yielded wrapper
+    // remains inside it. A null layer-data pointer yields an empty iterator.
+    let mut nbls = unsafe { NetBufferListIter::new(layer_data as _) };
+    let Some(first_nbl) = nbls.next() else {
+        return;
+    };
+
+    let inbound = matches!(direction, Direction::Inbound);
+    let injected_by_other = network_injection_origin.is_injected_by_other()
+        || transport_injection_origin.is_injected_by_other();
     let wfp_ip_header_size = if inbound {
         data.get_ip_header_size()
     } else {
@@ -270,7 +271,7 @@ fn ip_packet_layer(
                 | (true, smoltcp::wire::IpProtocol::Icmpv6) => {
                     let native_indication = network_injection_origin
                         == PacketInjectionOrigin::NotInjected
-                        && transport_injection_origin == Some(PacketInjectionOrigin::NotInjected);
+                        && transport_injection_origin == PacketInjectionOrigin::NotInjected;
                     let read_interface = || {
                         *interface_index_cache
                             .get_or_insert_with(|| data.get_value_u32(fields.interface_index))
