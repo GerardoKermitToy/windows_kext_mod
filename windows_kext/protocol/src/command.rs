@@ -19,6 +19,8 @@ pub enum CommandType {
     CleanEndedConnections = 8,
     StartProcessMonitoring = 9,
     SetAppInterface        = 10,
+    SetAuthorizeOutboundUdpAtAle = 11,
+    SetInboundUdpPidFallback = 12,
 }
 
 // These are private wire-layout markers. They must not be exposed as borrowed
@@ -116,6 +118,7 @@ impl CommandType {
             Self::UpdateV4 => UPDATE_V4_PAYLOAD_SIZE,
             Self::UpdateV6 => UPDATE_V6_PAYLOAD_SIZE,
             Self::SetAppInterface => SET_APP_INTERFACE_HEADER_SIZE,
+            Self::SetAuthorizeOutboundUdpAtAle | Self::SetInboundUdpPidFallback => 1,
         }
     }
 }
@@ -233,6 +236,16 @@ pub fn parse_set_app_interface(bytes: &[u8]) -> Option<SetAppInterface<'_>> {
     })
 }
 
+/// Runtime boolean settings use exactly one byte: 0 disables, 1 enables.
+/// Reject other encodings rather than silently treating malformed input as true.
+pub fn parse_boolean(bytes: &[u8]) -> Option<bool> {
+    match bytes {
+        [0] => Some(false),
+        [1] => Some(true),
+        _ => None,
+    }
+}
+
 pub fn parse_verdict(bytes: &[u8]) -> Option<Verdict> {
     let bytes = exact_payload(bytes, VERDICT_PAYLOAD_SIZE)?;
     Some(Verdict {
@@ -339,6 +352,12 @@ fn test_go_command_file() {
                 CommandType::PrintMemoryStats => {}
                 CommandType::CleanEndedConnections => {}
                 CommandType::StartProcessMonitoring => {}
+                CommandType::SetAuthorizeOutboundUdpAtAle
+                | CommandType::SetInboundUdpPidFallback => {
+                    let mut payload = [0];
+                    file.read_exact(&mut payload).unwrap();
+                    assert!(parse_boolean(&payload).is_some());
+                }
                 CommandType::SetAppInterface => {
                     let mut header = [0; SET_APP_INTERFACE_HEADER_SIZE];
                     file.read_exact(&mut header).unwrap();
@@ -387,6 +406,60 @@ fn process_monitor_command_is_payload_free_and_repeatable_in_a_write_batch() {
         let (command, payload, next) = split_first_command(remaining).unwrap();
         assert_eq!(command, expected);
         assert!(payload.is_empty());
+        remaining = next;
+    }
+    assert!(remaining.is_empty());
+}
+
+#[test]
+fn udp_setting_commands_have_stable_ids_and_one_byte_payloads() {
+    for (command, id) in [
+        (CommandType::SetAuthorizeOutboundUdpAtAle, 11),
+        (CommandType::SetInboundUdpPidFallback, 12),
+    ] {
+        assert_eq!(command as u8, id);
+        assert_eq!(parse_type(&[id]), Some(command));
+        assert_eq!(command.payload_size(), 1);
+        assert!(!has_valid_payload_length(command, &[]));
+        assert!(has_valid_payload_length(command, &[0]));
+        assert!(has_valid_payload_length(command, &[1]));
+        assert!(!has_valid_payload_length(command, &[1, 0]));
+        assert_eq!(
+            split_first_command(&[id]),
+            Err(CommandParseError::TruncatedPayload {
+                command,
+                expected: 1,
+                actual: 0,
+            })
+        );
+    }
+}
+
+#[test]
+fn runtime_boolean_payload_rejects_invalid_values_and_lengths() {
+    assert_eq!(parse_boolean(&[0]), Some(false));
+    assert_eq!(parse_boolean(&[1]), Some(true));
+    for value in 2..=u8::MAX {
+        assert_eq!(parse_boolean(&[value]), None);
+    }
+    for payload in [&[][..], &[0, 0], &[1, 0], &[1, 0, 0, 0]] {
+        assert_eq!(parse_boolean(payload), None);
+    }
+}
+
+#[test]
+fn udp_settings_can_be_toggled_in_a_mixed_write_batch() {
+    let mut remaining: &[u8] = &[11, 1, 12, 0, 5, 11, 0, 12, 1];
+    for (expected, enabled) in [
+        (CommandType::SetAuthorizeOutboundUdpAtAle, Some(true)),
+        (CommandType::SetInboundUdpPidFallback, Some(false)),
+        (CommandType::GetLogs, None),
+        (CommandType::SetAuthorizeOutboundUdpAtAle, Some(false)),
+        (CommandType::SetInboundUdpPidFallback, Some(true)),
+    ] {
+        let (command, payload, next) = split_first_command(remaining).unwrap();
+        assert_eq!(command, expected);
+        assert_eq!(parse_boolean(payload), enabled);
         remaining = next;
     }
     assert!(remaining.is_empty());

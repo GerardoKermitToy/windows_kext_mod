@@ -860,6 +860,20 @@ unsafe extern "system" fn device_control(
                 return control_request.fail(status);
             }
         }
+        ControlCode::SetAuthorizeOutboundUdpAtAle => {
+            let Some(enabled) = protocol::command::parse_boolean(control_request.get_input_buffer())
+            else {
+                return control_request.fail(STATUS_INVALID_PARAMETER);
+            };
+            crate::ale_callouts::set_authorize_outbound_udp_at_ale(enabled);
+        }
+        ControlCode::SetInboundUdpPidFallback => {
+            let Some(enabled) = protocol::command::parse_boolean(control_request.get_input_buffer())
+            else {
+                return control_request.fail(STATUS_INVALID_PARAMETER);
+            };
+            crate::registry_settings::set_inbound_udp_pid_fallback_enabled(enabled);
+        }
         ControlCode::Version => {
             wdk::info!("IOCTL: {}", control_code);
             if !control_request.write_exact(&VERSION) {

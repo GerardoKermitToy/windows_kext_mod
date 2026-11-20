@@ -1,7 +1,7 @@
 use crate::ale_policy::{
     can_reuse_ended_tcp_policy, classify_ale_injection, is_local_loopback_multicast_udp,
     multicast_replay_matches, self_injected_endpoint_identifies_socket, should_capture_ale_packet,
-    should_permit_ale_tcp_reset, should_skip_cross_direction_ale_clone,
+    should_pend_ale_operation, should_permit_ale_tcp_reset, should_skip_cross_direction_ale_clone,
     should_skip_injected_outbound_flow, should_skip_raw_receive, AleInjectionAction,
     InjectionStatus,
 };
@@ -11,6 +11,7 @@ use crate::device::{Device, Packet};
 use crate::id_cache::ConnectionMetadata;
 use crate::udp_flow_cache::UdpFlowRegistration;
 use alloc::{boxed::Box, string::String, vec::Vec};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use likely_stable::{likely, unlikely};
 use smoltcp::wire::{
@@ -30,6 +31,14 @@ use wdk::filter_engine::{callout_data::CalloutData, PacketDirection as WfpPacket
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
     FWP_DIRECTION_INBOUND, FWP_DIRECTION_OUTBOUND,
 };
+
+// Runtime experiment: authorize outbound UDP at ALE instead of deferring its
+// first verdict to the IP packet layer. Registered I/O is not covered by this mode.
+static AUTHORIZE_OUTBOUND_UDP_AT_ALE: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn set_authorize_outbound_udp_at_ale(enabled: bool) {
+    AUTHORIZE_OUTBOUND_UDP_AT_ALE.store(enabled, Ordering::Relaxed);
+}
 
 // ALE Layers
 
@@ -677,7 +686,8 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
     // Reauthorization of an already cached TCP connection may omit this metadata;
     // in that case the association saved by the initial indication remains valid.
     // The handles were read above so the self-injection fast path records them too.
-    // Outbound UDP is decided at the IP packet layer, not here.
+    // Unless the temporary ALE experiment is enabled, outbound UDP is decided
+    // at the IP packet layer, not here.
     //
     // Holding a datagram at this layer corrupts the send status seen by the
     // application. Both ways of holding it are broken for Registered I/O:
@@ -699,6 +709,7 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
     // reauthorization, the current packet direction deliberately controls it.
     if matches!(ale_data.protocol, IpProtocol::Udp)
         && matches!(ale_data.packet_direction, Direction::Outbound)
+        && !AUTHORIZE_OUTBOUND_UDP_AT_ALE.load(Ordering::Relaxed)
     {
         // Start as untracked. Endpoint association below promotes the exact live
         // instance only after it has installed the identity needed by closure. If
@@ -946,13 +957,14 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
         }
 
         crate::dbg!("pending connection: {} {}", key, ale_data.packet_direction);
-        // Only first packet of a connection can be pended: reauthorize == false
-        //
-        // Outbound UDP never reaches this point - it returns above and is decided
-        // at the packet layer, because holding a datagram at this layer breaks the
-        // send status reported to the application. Inbound UDP still arrives here
-        // and is safe to pend: there is no application send operation to freeze.
-        let can_pend_connection = !ale_data.reauthorize;
+        // Only initial TCP/inbound UDP authorization can pend the operation.
+        // Outbound UDP must keep the endpoint running: absorb and retain each
+        // datagram independently until its verdict instead of freezing later sends.
+        let can_pend_connection = should_pend_ale_operation(
+            ale_data.protocol,
+            ale_data.packet_direction,
+            ale_data.reauthorize,
+        );
         let packet = match save_packet(device, &mut data, &ale_data, can_pend_connection) {
             Ok(Some(packet)) => packet,
             Ok(None) => return,

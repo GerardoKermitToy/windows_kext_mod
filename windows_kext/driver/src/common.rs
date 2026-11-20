@@ -59,6 +59,18 @@ pub enum ControlCode {
         METHOD_BUFFERED,
         FILE_READ_DATA | FILE_WRITE_DATA
     ),
+    SetAuthorizeOutboundUdpAtAle = ctl_code!(
+        SIOCTL_TYPE,
+        0x805,
+        METHOD_BUFFERED,
+        FILE_READ_DATA | FILE_WRITE_DATA
+    ),
+    SetInboundUdpPidFallback = ctl_code!(
+        SIOCTL_TYPE,
+        0x806,
+        METHOD_BUFFERED,
+        FILE_READ_DATA | FILE_WRITE_DATA
+    ),
 }
 
 impl Display for ControlCode {
@@ -68,7 +80,33 @@ impl Display for ControlCode {
             ControlCode::ShutdownRequest => _ = write!(f, "Shutdown"),
             ControlCode::StartProcessMonitoring => _ = write!(f, "StartProcessMonitoring"),
             ControlCode::SetAppInterface => _ = write!(f, "SetAppInterface"),
+            ControlCode::SetAuthorizeOutboundUdpAtAle => {
+                _ = write!(f, "SetAuthorizeOutboundUdpAtAle")
+            }
+            ControlCode::SetInboundUdpPidFallback => _ = write!(f, "SetInboundUdpPidFallback"),
         };
         return Ok(());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ControlCode;
+    use num_traits::FromPrimitive;
+
+    #[test]
+    fn udp_setting_ioctl_codes_match_the_client_wire_contract() {
+        assert_eq!(ControlCode::SetAuthorizeOutboundUdpAtAle as u32, 0x9c40e014);
+        assert_eq!(ControlCode::SetInboundUdpPidFallback as u32, 0x9c40e018);
+        assert!(matches!(
+            ControlCode::from_u32(0x9c40e014),
+            Some(ControlCode::SetAuthorizeOutboundUdpAtAle)
+        ));
+        assert!(matches!(
+            ControlCode::from_u32(0x9c40e018),
+            Some(ControlCode::SetInboundUdpPidFallback)
+        ));
+        // The removed GetThreadId slot must remain unavailable.
+        assert!(ControlCode::from_u32(0x9c40e008).is_none());
     }
 }

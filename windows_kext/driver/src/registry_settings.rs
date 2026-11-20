@@ -29,10 +29,14 @@ fn build_parameters_path(path: &[u16]) -> Option<Vec<u16>> {
 
 static INBOUND_UDP_PID_FALLBACK_ENABLED: AtomicBool = AtomicBool::new(false);
 
-/// The value is read once during DriverEntry and stays fixed until driver unload.
+/// Initial value comes from DriverEntry; device commands can override it at runtime.
 #[inline]
 pub(crate) fn inbound_udp_pid_fallback_enabled() -> bool {
     INBOUND_UDP_PID_FALLBACK_ENABLED.load(Ordering::Relaxed)
+}
+
+pub(crate) fn set_inbound_udp_pid_fallback_enabled(enabled: bool) {
+    INBOUND_UDP_PID_FALLBACK_ENABLED.store(enabled, Ordering::Relaxed);
 }
 
 fn dword_enabled(value_type: u32, data: &[u8]) -> bool {
@@ -45,10 +49,10 @@ pub(crate) use kernel::initialize;
 #[cfg(not(test))]
 mod kernel {
     use super::{
-        build_parameters_path, dword_enabled, INBOUND_UDP_PID_FALLBACK_ENABLED,
+        build_parameters_path, dword_enabled, set_inbound_udp_pid_fallback_enabled,
         INBOUND_UDP_PID_FALLBACK_VALUE,
     };
-    use core::{mem::size_of, ptr, sync::atomic::Ordering};
+    use core::{mem::size_of, ptr};
     use windows_sys::{
         Wdk::{
             Foundation::OBJECT_ATTRIBUTES,
@@ -112,7 +116,7 @@ mod kernel {
         let parameters_path = build_parameters_path(path).ok_or(STATUS_INVALID_PARAMETER)?;
 
         let enabled = read_enabled(&parameters_path, INBOUND_UDP_PID_FALLBACK_VALUE);
-        INBOUND_UDP_PID_FALLBACK_ENABLED.store(enabled, Ordering::Relaxed);
+        set_inbound_udp_pid_fallback_enabled(enabled);
         crate::info!("EnableInboundUdpCacheMissPidFallback={}", u8::from(enabled));
         Ok(())
     }
@@ -209,7 +213,11 @@ mod tests {
     }
 
     #[test]
-    fn settings_default_to_disabled() {
+    fn setting_defaults_to_disabled_and_can_be_overridden_at_runtime() {
+        assert!(!super::inbound_udp_pid_fallback_enabled());
+        super::set_inbound_udp_pid_fallback_enabled(true);
+        assert!(super::inbound_udp_pid_fallback_enabled());
+        super::set_inbound_udp_pid_fallback_enabled(false);
         assert!(!super::inbound_udp_pid_fallback_enabled());
     }
 

@@ -29,6 +29,10 @@ constexpr uint32_t kIoctlVersion = MakeCtlCode(0x800);
 constexpr uint32_t kIoctlShutdown = MakeCtlCode(0x801);
 constexpr uint32_t kIoctlStartProcessMonitoring = MakeCtlCode(0x803);
 constexpr uint32_t kIoctlSetAppInterface = MakeCtlCode(0x804);
+constexpr uint32_t kIoctlSetAuthorizeOutboundUdpAtAle = MakeCtlCode(0x805);
+constexpr uint32_t kIoctlSetInboundUdpPidFallback = MakeCtlCode(0x806);
+static_assert(kIoctlSetAuthorizeOutboundUdpAtAle == 0x9c40e014);
+static_assert(kIoctlSetInboundUdpPidFallback == 0x9c40e018);
 static_assert(kIoctlSetAppInterface == 0x9c40e010);
 static_assert(kIoctlStartProcessMonitoring == 0x9c40e00c);
 
@@ -457,6 +461,24 @@ bool Driver::SetAppInterface(const std::wstring& path, uint64_t luid, std::strin
     }
     return DeviceControl(kIoctlSetAppInterface, nullptr, 0, error, command.data() + 1,
                          static_cast<uint32_t>(command.size() - 1));
+}
+
+bool Driver::SetAuthorizeOutboundUdpAtAle(bool enabled, std::string& error, bool via_write) {
+    const uint8_t command[] = {static_cast<uint8_t>(CommandType::SetAuthorizeOutboundUdpAtAle),
+                               static_cast<uint8_t>(enabled)};
+    if (via_write) {
+        return SendCommand(command, sizeof(command), error);
+    }
+    return DeviceControl(kIoctlSetAuthorizeOutboundUdpAtAle, nullptr, 0, error, command + 1, 1);
+}
+
+bool Driver::SetInboundUdpPidFallback(bool enabled, std::string& error, bool via_write) {
+    const uint8_t command[] = {static_cast<uint8_t>(CommandType::SetInboundUdpPidFallback),
+                               static_cast<uint8_t>(enabled)};
+    if (via_write) {
+        return SendCommand(command, sizeof(command), error);
+    }
+    return DeviceControl(kIoctlSetInboundUdpPidFallback, nullptr, 0, error, command + 1, 1);
 }
 
 bool Driver::SendCommand(const uint8_t* data, size_t len, std::string& error) {

@@ -20,8 +20,19 @@ the driver. With `--no-inbound-udp-pid-fallback`, it writes `0` instead, overwri
 any previous value. A failed registry write aborts driver installation. The driver
 reads the setting once in `DriverEntry`, before packet classification starts. No
 registry callbacks or background refresh thread are used. Changing or deleting the
-value while the driver is running has no effect until it is unloaded and loaded
-again.
+value while the driver is running has no effect on its own. The in-memory value
+can now be overridden without reloading through either of these equivalent requests:
+
+- `IOCTL 0x9c40e018` (`CTL_CODE(40000, 0x806, METHOD_BUFFERED,
+  FILE_READ_DATA | FILE_WRITE_DATA)`): exactly one input byte, `0` or `1`; no output.
+- `WriteFile`: command byte `12` followed by the same one-byte boolean.
+
+The C++ API is `Driver::SetInboundUdpPidFallback(enabled, error, via_write = false)`.
+Invalid lengths or values fail with `STATUS_INVALID_PARAMETER`. Updates are atomic,
+driver-wide, and affect subsequent cache-miss classifications; they do not clear
+cached verdicts, reauthorize existing connections, or update the registry. The next
+driver load uses the registry again. See also [the outbound UDP ALE runtime
+setting](../kext_client/README.md#runtime-udp-settings).
 
 To disable it for a bounded monitor run, from the repository root:
 

@@ -43,7 +43,9 @@ enum class CommandType : uint8_t {
     PrintMemoryStats      = 7,
     CleanEndedConnections = 8,
     StartProcessMonitoring = 9,
-    SetAppInterface    = 10,
+    SetAppInterface       = 10,
+    SetAuthorizeOutboundUdpAtAle = 11,
+    SetInboundUdpPidFallback = 12,
 };
 
 // Verdict, from driver/src/connection.rs:22
@@ -255,6 +257,16 @@ public:
     // IOCTL 0x9c40e010 by default; via_write selects command 10.
     bool SetAppInterface(const std::wstring& path, uint64_t luid, std::string& error,
                          bool via_write = false);
+
+    // Runtime UDP settings. Both take exactly one byte (0/1); via_write selects
+    // the equivalent two-byte command instead of METHOD_BUFFERED IOCTL.
+    // Global until driver unload or another setter; does not update the registry,
+    // clear cached verdicts, or reauthorize existing connections.
+    // Experimental ALE mode (default false) is not compatible with Registered I/O.
+    // IOCTL 0x9c40e014 / WriteFile command 11.
+    bool SetAuthorizeOutboundUdpAtAle(bool enabled, std::string& error, bool via_write = false);
+    // IOCTL 0x9c40e018 / WriteFile command 12. Initial value comes from the registry.
+    bool SetInboundUdpPidFallback(bool enabled, std::string& error, bool via_write = false);
 
     // Commands written to the device (protocol/src/command.rs).
     bool SendVerdict(uint64_t id, Verdict verdict, std::string& error);

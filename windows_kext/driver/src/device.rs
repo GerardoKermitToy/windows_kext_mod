@@ -536,6 +536,16 @@ impl Device {
             CommandType::SetAppInterface => {
                 crate::entry::set_app_interface(self, file_object, payload)?
             }
+            CommandType::SetAuthorizeOutboundUdpAtAle => {
+                let enabled = protocol::command::parse_boolean(payload)
+                    .ok_or(STATUS_INVALID_PARAMETER)?;
+                crate::ale_callouts::set_authorize_outbound_udp_at_ale(enabled);
+            }
+            CommandType::SetInboundUdpPidFallback => {
+                let enabled = protocol::command::parse_boolean(payload)
+                    .ok_or(STATUS_INVALID_PARAMETER)?;
+                crate::registry_settings::set_inbound_udp_pid_fallback_enabled(enabled);
+            }
             CommandType::Shutdown => {
                 wdk::dbg!("Shutdown command");
                 self.shutdown();

@@ -370,8 +370,46 @@ cache misses, use `--no-inbound-udp-pid-fallback`:
 
 The flag writes `0`, overwriting any previous `1`. Without the flag, the monitor
 writes `1` again. The driver reads the setting once at load; changing the registry
-while it is running does not change its behavior. See
+while it is running does not change its behavior. `Driver::SetInboundUdpPidFallback`
+can override the in-memory value without reloading (see below). See
 [the driver setting documentation](../windows_kext/INBOUND_UDP_PID_FALLBACK.md).
+
+## Runtime UDP settings
+
+`--authorize-outbound-udp-at-ale` enables experimental outbound UDP authorization
+at ALE instead of deferring the first verdict to the IP packet layer. It sends an
+IOCTL after opening the device; failure aborts startup. Without the flag, the
+driver's default is disabled. **Registered I/O (RIO) is not supported in this mode:**
+holding outbound UDP at ALE can report send errors even when the datagram is replayed.
+
+```powershell
+.\kext_client\build\kext_monitor.exe --duration 10 --authorize-outbound-udp-at-ale .\windows_kext\portmaster-kext.sys
+```
+
+The client exposes both transports, with `via_write = false` by default:
+
+```cpp
+driver.SetAuthorizeOutboundUdpAtAle(true, error);        // IOCTL: enable
+driver.SetAuthorizeOutboundUdpAtAle(false, error, true);  // WriteFile: disable
+driver.SetInboundUdpPidFallback(true, error);            // IOCTL: enable
+driver.SetInboundUdpPidFallback(false, error, true);      // WriteFile: disable
+```
+
+| Setting | METHOD_BUFFERED IOCTL | WriteFile command |
+| --- | --- | --- |
+| `AUTHORIZE_OUTBOUND_UDP_AT_ALE` | `CTL_CODE(40000, 0x805, METHOD_BUFFERED, FILE_READ_DATA \| FILE_WRITE_DATA)` = `0x9c40e014` | `11` |
+| `INBOUND_UDP_PID_FALLBACK_ENABLED` | `CTL_CODE(40000, 0x806, METHOD_BUFFERED, FILE_READ_DATA \| FILE_WRITE_DATA)` = `0x9c40e018` | `12` |
+
+Each IOCTL takes exactly one input byte (`0` disables, `1` enables), with no output.
+WriteFile takes the command byte followed by that same one-byte value; commands
+can be concatenated with other commands in one write. Invalid lengths or values
+fail with `STATUS_INVALID_PARAMETER`; earlier commands in a batch remain applied.
+
+Both settings are driver-wide atomic flags. Updates affect later classifications,
+not packets already being classified. They do not write the registry, clear cached
+verdicts, or force reauthorization. Values last until another setter or driver
+unload; the next load resets outbound ALE mode to false and initializes the PID
+fallback from the registry as before.
 
 ## Supported verdicts
 

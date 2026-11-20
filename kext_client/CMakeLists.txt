@@ -162,6 +162,16 @@ if(BUILD_TESTING)
     add_test(NAME app_interface_loopback_tests COMMAND app_interface_runtime --loopback-child)
     set_tests_properties(app_interface_loopback_tests PROPERTIES TIMEOUT 10)
 
+    add_executable(udp_settings_tests tests/udp_settings_tests.cpp)
+    target_link_libraries(udp_settings_tests PRIVATE pmkext)
+    add_test(NAME udp_settings_tests COMMAND udp_settings_tests)
+    set_tests_properties(udp_settings_tests PROPERTIES TIMEOUT 10)
+
+    add_test(NAME udp_settings_cli_tests
+        COMMAND "${CMAKE_COMMAND}" "-DMONITOR=$<TARGET_FILE:kext_monitor>"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/udp_settings_cli_tests.cmake")
+    set_tests_properties(udp_settings_cli_tests PROPERTIES TIMEOUT 20)
+
     add_executable(verdict_tests tests/verdict_tests.cpp)
     target_link_libraries(verdict_tests PRIVATE pmkext)
     add_test(NAME verdict_tests COMMAND verdict_tests)

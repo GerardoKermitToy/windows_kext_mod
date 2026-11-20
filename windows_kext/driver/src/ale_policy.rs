@@ -190,6 +190,20 @@ pub(crate) fn should_skip_injected_outbound_flow(
     outbound && (network_injected || transport_injected)
 }
 
+/// Pend only initial TCP or inbound UDP authorization. Pending an outbound UDP
+/// operation freezes its endpoint and can discard later sends before they reach
+/// classify. Absorb each captured datagram instead and replay it after the verdict.
+#[inline]
+pub(crate) fn should_pend_ale_operation(
+    protocol: IpProtocol,
+    packet_direction: Direction,
+    reauthorize: bool,
+) -> bool {
+    !reauthorize
+        && (protocol == IpProtocol::Tcp
+            || (protocol == IpProtocol::Udp && matches!(packet_direction, Direction::Inbound)))
+}
+
 /// Initial outbound TCP has no NBL; all other ALE packet-bearing paths may clone it.
 pub(crate) fn should_capture_ale_packet(
     protocol: IpProtocol,
@@ -270,7 +284,7 @@ mod tests {
         inbound_udp_fallback_pid, is_local_loopback_multicast_udp,
         is_local_loopback_multicast_udp_with_interface, multicast_replay_matches,
         self_injected_endpoint_identifies_socket, self_injected_packet_needs_accept_authorization,
-        should_capture_ale_packet, should_permit_ale_tcp_reset,
+        should_capture_ale_packet, should_pend_ale_operation, should_permit_ale_tcp_reset,
         should_skip_cross_direction_ale_clone, should_skip_injected_outbound_flow,
         should_skip_raw_receive, AleInjectionAction, InjectionStatus, PacketInjectionAction,
     };
@@ -683,6 +697,40 @@ mod tests {
                     network_injected,
                     transport_injected
                 ));
+            }
+        }
+    }
+
+    #[test]
+    fn outbound_udp_never_pends_the_endpoint_operation() {
+        for reauthorize in [false, true] {
+            assert!(!should_pend_ale_operation(
+                IpProtocol::Udp,
+                Direction::Outbound,
+                reauthorize,
+            ));
+        }
+    }
+
+    #[test]
+    fn only_initial_tcp_and_inbound_udp_pend_the_operation() {
+        for reauthorize in [false, true] {
+            for packet_direction in [Direction::Inbound, Direction::Outbound] {
+                assert_eq!(
+                    should_pend_ale_operation(IpProtocol::Tcp, packet_direction, reauthorize),
+                    !reauthorize,
+                );
+                assert_eq!(
+                    should_pend_ale_operation(IpProtocol::Udp, packet_direction, reauthorize),
+                    !reauthorize && matches!(packet_direction, Direction::Inbound),
+                );
+                for protocol in [IpProtocol::Icmp, IpProtocol::Icmpv6] {
+                    assert!(!should_pend_ale_operation(
+                        protocol,
+                        packet_direction,
+                        reauthorize
+                    ));
+                }
             }
         }
     }

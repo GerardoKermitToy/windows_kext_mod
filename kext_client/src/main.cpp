@@ -71,6 +71,7 @@ struct Options {
     bool show_payload = false;     // --payload: dump packet bytes as hex
     bool memory_stats = false;     // --memory-stats: send PrintMemoryStats command
     bool inbound_udp_pid_fallback = true;
+    bool authorize_outbound_udp_at_ale = false;
     bool help = false;
 
     // Alternate verdict for connections matching alt_match_ip / alt_match_port.
@@ -271,6 +272,11 @@ void PrintUsage() {
         "                   Only new connections use the policy. IPv4 and IPv6 route\n"
         "                   policies are enabled automatically at startup.\n"
         "\n"
+        "  --authorize-outbound-udp-at-ale\n"
+        "                   experimentally authorize outbound UDP at ALE instead\n"
+        "                   of the IP packet layer (default: disabled).\n"
+        "                   Enabled via IOCTL after opening the device.\n"
+        "                   Not compatible with Registered I/O (RIO).\n"
         "  --no-inbound-udp-pid-fallback\n"
         "                   write EnableInboundUdpCacheMissPidFallback=0 before load.\n"
         "                   Default: 1; the driver reads it once at startup.\n"
@@ -417,6 +423,8 @@ bool ParseArgs(int argc, wchar_t** argv, Options& opt) {
         } else if (a == L"--no-conn") {
             opt.show_connections = false;
             opt.show_ends = false;
+        } else if (a == L"--authorize-outbound-udp-at-ale") {
+            opt.authorize_outbound_udp_at_ale = true;
         } else if (a == L"--no-inbound-udp-pid-fallback") {
             opt.inbound_udp_pid_fallback = false;
         } else if (a == L"--no-verdicts") {
@@ -819,6 +827,17 @@ int wmain(int argc, wchar_t** argv) {
         std::fprintf(opt.process_events_only ? stderr : stdout,
                      "\nERROR: open device failed: %s\n", error.c_str());
         return 1;
+    }
+
+    if (opt.authorize_outbound_udp_at_ale) {
+        if (!driver.SetAuthorizeOutboundUdpAtAle(true, error)) {
+            std::fprintf(opt.process_events_only ? stderr : stdout,
+                         "\nERROR: enable outbound UDP authorization at ALE failed: %s\n", error.c_str());
+            return 1;
+        }
+        if (!opt.process_events_only) {
+            std::printf("Outbound UDP authorization at ALE: enabled (experimental; RIO unsupported).\n");
+        }
     }
 
     if (!opt.app_path.empty()) {
