@@ -144,6 +144,9 @@ pub(crate) const FWPS_INJECTION_TYPE_FORWARD: u32 = 0x00000008;
 pub(crate) const FWPS_INJECTION_TYPE_L2: u32 = 0x00000010;
 pub(crate) const FWPS_INJECTION_TYPE_VSWITCH_TRANSPORT: u32 = 0x00000020;
 
+// fwpsk.h: supported starting with NTDDI_WIN11_ZN; this driver targets current Windows.
+pub(crate) const FWPS_CONSTRUCT_IPHEADER_FOR_SEND: u32 = 0x00000001;
+
 pub(crate) const NDIS_OBJECT_TYPE_DEFAULT: u8 = 0x80; // used when object type is implicit in the API call
 pub(crate) const NET_BUFFER_LIST_POOL_PARAMETERS_REVISION_1: u8 = 1;
 
@@ -526,6 +529,32 @@ extern "system" {
     /// Wraps WdfDeviceWdmGetDeviceObject and returns the WDM device object
     /// associated with the specified KMDF device.
     pub(crate) fn pm_GetDeviceObject(wdf_device: HANDLE) -> *mut c_void;
+
+    /// Builds a complete IP packet from an owned transport clone.
+    pub(crate) fn FwpsConstructIpHeaderForTransportPacket0(
+        netBufferList: *mut NET_BUFFER_LIST,
+        headerIncludeHeaderLength: u32,
+        addressFamily: ADDRESS_FAMILY,
+        sourceAddress: *const u8,
+        remoteAddress: *const u8,
+        nextProtocol: i32,
+        endpointHandle: u64,
+        controlData: *const c_void,
+        controlDataLength: u32,
+        flags: u32,
+        reserved: *mut c_void,
+        interfaceIndex: u32,
+        subInterfaceIndex: u32,
+    ) -> NTSTATUS;
+
+    pub(crate) fn FwpsAllocateDeepCloneNetBufferList0(
+        originalNetBufferList: *mut NET_BUFFER_LIST,
+        netBufferListPoolHandle: NDIS_HANDLE,
+        netBufferPoolHandle: NDIS_HANDLE,
+        netBufferList: *mut *mut NET_BUFFER_LIST,
+    ) -> NTSTATUS;
+
+    pub(crate) fn FwpsFreeCloneNetBufferList0(netBufferList: *mut NET_BUFFER_LIST, flags: u32);
 
     /// The FwpsInjectNetworkSendAsync0 function injects packet data into the send data path.
     pub(crate) fn FwpsInjectNetworkSendAsync0(

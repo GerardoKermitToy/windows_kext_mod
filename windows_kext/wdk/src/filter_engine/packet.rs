@@ -128,13 +128,14 @@ impl TransportProtocol {
         matches!(self, Self::Tcp)
     }
 
+    /// Both outbound UDP and inbound unicast loopback carry a captured IP header.
     fn uses_network_send_for_ale(
         self,
         inbound: bool,
         loopback: bool,
         multicast_replay: bool,
     ) -> bool {
-        matches!(self, Self::Tcp | Self::Udp) && inbound && loopback && !multicast_replay
+        (self == Self::Udp && !inbound) || (inbound && loopback && !multicast_replay)
     }
 }
 
@@ -233,6 +234,11 @@ pub struct TransportPacketList {
 }
 
 impl TransportPacketList {
+    /// Outbound UDP clones already contain their IP header and need no live socket.
+    pub fn is_endpoint_independent(&self) -> bool {
+        self.protocol == TransportProtocol::Udp && !self.inbound
+    }
+
     /// Targets a deferred multicast replay at the original connection generation.
     pub fn set_multicast_instance_id(&mut self, instance_id: u64) {
         self.multicast_instance_id = instance_id;
@@ -623,7 +629,9 @@ impl Injector {
     ///
     /// Ordinary inbound TCP/UDP loopback packets use network-send injection:
     /// transport-receive injection of unicast loopback can complete with
-    /// STATUS_DATA_NOT_ACCEPTED. Multicast UDP replays instead use transport
+    /// STATUS_DATA_NOT_ACCEPTED. Outbound UDP clones have a captured IP header
+    /// and also use network-send, so closing their original socket is harmless.
+    /// Multicast UDP replays instead use transport
     /// receive even for loopback: on the tested Windows system this delivers to
     /// the selected receivers without transmitting each replay on the network.
     /// Non-loopback TCP is transferred to a DPC for transport injection.
@@ -635,8 +643,8 @@ impl Injector {
         ) {
             let inject_info = InjectInfo {
                 ipv6: packet_list.ipv6,
-                inbound: true,
-                loopback: true,
+                inbound: packet_list.inbound,
+                loopback: packet_list.loopback,
                 compartment_id: packet_list.compartment_id,
                 interface_index: packet_list.interface_index,
                 sub_interface_index: packet_list.sub_interface_index,
@@ -1333,9 +1341,22 @@ mod tests {
     fn ale_loopback_multicast_uses_transport_not_network_send() {
         for protocol in [TransportProtocol::Tcp, TransportProtocol::Udp] {
             assert!(protocol.uses_network_send_for_ale(true, true, false));
-            assert!(!protocol.uses_network_send_for_ale(false, true, false));
+            assert_eq!(
+                protocol.uses_network_send_for_ale(false, true, false),
+                protocol == TransportProtocol::Udp,
+            );
             assert!(!protocol.uses_network_send_for_ale(true, false, false));
             assert!(!protocol.uses_network_send_for_ale(true, true, true));
+        }
+    }
+
+    #[test]
+    fn outbound_udp_ale_replay_never_uses_a_transport_endpoint() {
+        for loopback in [false, true] {
+            for multicast in [false, true] {
+                assert!(TransportProtocol::Udp.uses_network_send_for_ale(false, loopback, multicast));
+                assert!(!TransportProtocol::Tcp.uses_network_send_for_ale(false, loopback, multicast));
+            }
         }
     }
 

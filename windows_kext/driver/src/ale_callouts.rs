@@ -1262,9 +1262,36 @@ fn create_packet_list(
             &ipv6_bytes
         }
     };
-    let clone = nbl
-        .clone(&device.network_allocator)
-        .map_err(|err| alloc::format!("failed to clone ALE packet: {}", err))?;
+    let outbound_udp = ale_data.protocol == IpProtocol::Udp && !inbound;
+    let clone = if outbound_udp {
+        // Capture the IP header while the endpoint is live. Verdict replay then
+        // uses network-send, not a transport handle that may already be closed.
+        match ale_data.local_ip {
+            IpAddress::Ipv4(local) => nbl.clone_outbound_udp(
+                &device.network_allocator,
+                &local.octets(),
+                address,
+                callout_data,
+            ),
+            IpAddress::Ipv6(local) => nbl.clone_outbound_udp(
+                &device.network_allocator,
+                &local.octets(),
+                address,
+                callout_data,
+            ),
+        }
+    } else {
+        nbl.clone(&device.network_allocator)
+    }
+    .map_err(|err| alloc::format!("failed to clone ALE packet: {}", err))?;
+    if outbound_udp {
+        // Preserve the transport-layer event format despite the saved IP header.
+        event_data_offset = clone
+            .get_data_length()
+            .checked_sub(nbl.get_data_length())
+            .ok_or_else(|| String::from("constructed ALE UDP packet is shorter than transport data"))?
+            as usize;
+    }
     let transport_protocol = match ale_data.protocol {
         IpProtocol::Tcp => TransportProtocol::Tcp,
         IpProtocol::Udp => TransportProtocol::Udp,

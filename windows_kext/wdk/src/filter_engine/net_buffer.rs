@@ -351,6 +351,73 @@ impl NetBufferList {
         }
     }
 
+    /// Captures a complete outbound UDP packet while its socket options and
+    /// transport endpoint are still valid. The returned copy needs neither later.
+    pub fn clone_outbound_udp(
+        &self,
+        net_allocator: &NetworkAllocator,
+        source: &[u8],
+        destination: &[u8],
+        callout: &super::callout_data::CalloutData,
+    ) -> Result<NetBufferList, String> {
+        use crate::ffi::{
+            FwpsAllocateDeepCloneNetBufferList0, FwpsConstructIpHeaderForTransportPacket0,
+            FwpsFreeCloneNetBufferList0, FWPS_CONSTRUCT_IPHEADER_FOR_SEND,
+        };
+        use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6, IPPROTO_UDP};
+
+        let family = match (source.len(), destination.len()) {
+            (4, 4) => AF_INET,
+            (16, 16) => AF_INET6,
+            _ => return Err("invalid UDP IP address lengths".to_string()),
+        };
+        if self.nbl.is_null() {
+            return Err("net buffer list is null".to_string());
+        }
+        let mut native_clone = core::ptr::null_mut();
+        // SAFETY: self borrows the live classify NBL. A deep native clone keeps
+        // WFP's packet metadata without sharing writable transport bytes. WFP's
+        // clone free releases both its storage and the constructed IP header.
+        unsafe {
+            check_ntstatus(FwpsAllocateDeepCloneNetBufferList0(
+                self.nbl,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                &mut native_clone,
+            ))?;
+            if native_clone.is_null() {
+                return Err("WFP returned a null UDP clone".to_string());
+            }
+            let result = (|| {
+                let control = callout.get_control_data().unwrap_or(&[]);
+                check_ntstatus(FwpsConstructIpHeaderForTransportPacket0(
+                    native_clone,
+                    0,
+                    family,
+                    source.as_ptr(),
+                    destination.as_ptr(),
+                    IPPROTO_UDP,
+                    callout.get_transport_endpoint_handle().unwrap_or(0),
+                    if control.is_empty() {
+                        core::ptr::null()
+                    } else {
+                        control.as_ptr().cast()
+                    },
+                    control.len() as u32,
+                    FWPS_CONSTRUCT_IPHEADER_FOR_SEND,
+                    core::ptr::null_mut(),
+                    0,
+                    0,
+                ))?;
+                // Copy all constructed headers/checksums into our usual owned
+                // Vec/NBL pair; no native clone or classify pointer escapes.
+                NetBufferList::new(native_clone).clone(net_allocator)
+            })();
+            FwpsFreeCloneNetBufferList0(native_clone, 0);
+            result
+        }
+    }
+
     pub fn clone(&self, net_allocator: &NetworkAllocator) -> Result<NetBufferList, String> {
         unsafe {
             let Some(nbl) = self.nbl.as_ref() else {

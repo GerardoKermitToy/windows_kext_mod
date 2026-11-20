@@ -70,18 +70,17 @@ impl Packet {
     /// Returns whether this packet remains independently deliverable after its
     /// socket connection has ended.
     ///
-    /// Outbound UDP is absorbed only after the socket send has completed. Its
-    /// network-layer clone already contains the complete datagram and can be
-    /// injected without the endpoint that originated it. ALE packets and inbound
-    /// network packets still depend on their live connection lifecycle.
+    /// Outbound UDP network/ALE clones contain the complete IP datagram and
+    /// can be injected after their socket closes. Other ALE and inbound packets
+    /// still depend on their live connection lifecycle.
     pub(crate) fn survives_connection_end(&self, key: &Key) -> bool {
         key.protocol == IpProtocol::Udp
-            && matches!(
-                self,
-                Self::Network(_, inject_info)
-                    | Self::NetworkBatch(_, inject_info)
-                    if !inject_info.inbound
-            )
+            && match self {
+                Self::Network(_, info) | Self::NetworkBatch(_, info) => !info.inbound,
+                Self::AleLayer(defer) => defer
+                    .packet_list()
+                    .is_some_and(|packet| packet.is_endpoint_independent()),
+            }
     }
 }
 
@@ -612,7 +611,7 @@ impl Device {
                     // queued this packet. If endpoint/flow cleanup already ended it,
                     // never apply the decision to a tuple replacement. Packets that
                     // depend on the endpoint are completed as blocked; an outbound
-                    // UDP network clone remains independently deliverable and is
+                    // UDP IP clone remains independently deliverable and is
                     // handled below as a packet-only decision.
                     let packet_survives_connection_end = packet.survives_connection_end(&key);
                     if let Some(instance_id) = connection_instance_id {
@@ -623,11 +622,10 @@ impl Device {
                         ) {
                             Some(()) => {}
                             None if packet_survives_connection_end => {
-                                // Endpoint closure does not revoke an outbound UDP
-                                // datagram whose send already completed before this
-                                // packet-layer decision. Apply the verdict to this
-                                // clone only, without caching it against a tuple that
-                                // may already belong to a replacement socket.
+                                // Endpoint closure does not revoke a captured outbound
+                                // UDP datagram. Apply the verdict to this clone only,
+                                // without caching it against a tuple that may already
+                                // belong to a replacement socket.
                                 dbg!(
                                     "completing outbound UDP packet after connection instance {} ended: {}",
                                     instance_id,
@@ -1337,7 +1335,7 @@ impl Device {
     }
 
     /// Retires queued decisions for connection instances whose native lifetime
-    /// has ended. Outbound UDP network packets remain pending as packet-only
+    /// has ended. Self-contained outbound UDP packets remain pending as packet-only
     /// requests; every other packet is removed under the cache lock and any ALE
     /// operation is completed as blocked after the lock has been released.
     pub(crate) fn retire_pending_connection_instances(&self, instance_ids: &[u64]) {
