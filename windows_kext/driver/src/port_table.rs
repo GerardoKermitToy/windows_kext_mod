@@ -101,6 +101,7 @@ impl<V> PortTable<V> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn clear(&mut self) {
         self.directory.fill(0);
         self.slots = Vec::new();

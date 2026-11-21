@@ -827,14 +827,17 @@ impl ConnectionCache {
         instance_ids
     }
 
-    pub fn clear(&self) {
+    /// Invalidates live cached policy without changing connection identity or
+    /// lifecycle state. Ended history retains its final policy for late packets.
+    /// Outstanding userspace requests remain valid and may set a verdict again.
+    pub fn reset_verdicts(&self) {
         {
             let mut connections = self.connections_v4.write_lock();
-            connections.clear();
+            connections.for_each_live(|connection| connection.verdict = Verdict::Undecided);
         }
         {
             let mut connections = self.connections_v6.write_lock();
-            connections.clear();
+            connections.for_each_live(|connection| connection.verdict = Verdict::Undecided);
         }
     }
 
@@ -1459,6 +1462,321 @@ mod tests {
             cache.read_connection_v6(tuple, |conn| Some(conn.verdict))
         } else {
             cache.read_connection_v4(tuple, |conn| Some(conn.verdict))
+        }
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct LifecycleSnapshot {
+        key: Key,
+        instance_id: u64,
+        process_id: u64,
+        direction: u8,
+        last_accessed: u64,
+        end_time: u64,
+        native_lifecycle: bool,
+        idle_expiration: bool,
+        multicast_endpoint: u64,
+    }
+
+    fn lifecycle_snapshot<C: Connection>(connection: &C) -> LifecycleSnapshot {
+        LifecycleSnapshot {
+            key: connection.get_key(),
+            instance_id: connection.get_instance_id(),
+            process_id: connection.get_process_id(),
+            direction: connection.get_direction() as u8,
+            last_accessed: connection.get_last_accessed_time(),
+            end_time: connection.get_end_time(),
+            native_lifecycle: connection.has_native_lifecycle(),
+            idle_expiration: connection.allows_untracked_expiration(),
+            multicast_endpoint: connection.get_multicast_endpoint(),
+        }
+    }
+
+    fn live_lifecycle_snapshot(
+        cache: &ConnectionCache,
+        tuple: &Key,
+        instance_id: u64,
+    ) -> Option<LifecycleSnapshot> {
+        if tuple.is_ipv6() {
+            cache
+                .connections_v6
+                .read_lock()
+                .get_live_instance_matching(tuple, instance_id)
+                .map(lifecycle_snapshot)
+        } else {
+            cache
+                .connections_v4
+                .read_lock()
+                .get_live_instance_matching(tuple, instance_id)
+                .map(lifecycle_snapshot)
+        }
+    }
+
+    #[test]
+    fn reset_verdicts_preserves_live_identity_metadata_and_activity() {
+        let verdicts = [
+            Verdict::Undecided,
+            Verdict::Undeterminable,
+            Verdict::Accept,
+            Verdict::PermanentAccept,
+            Verdict::Block,
+            Verdict::PermanentBlock,
+            Verdict::Drop,
+            Verdict::PermanentDrop,
+            Verdict::Failed,
+        ];
+        for tuple in connect_thread_keys() {
+            for direction in [Direction::Inbound, Direction::Outbound] {
+                let cache = ConnectionCache::new();
+                let registration = cache
+                    .register_ale_connection(&tuple, 123, 456, direction)
+                    .unwrap();
+                if matches!(direction, Direction::Inbound) {
+                    assert!(
+                        cache.mark_connection_instance_tracked(&tuple, registration.instance_id)
+                    );
+                }
+                for verdict in verdicts {
+                    assert!(cache
+                        .update_connection_instance(tuple, registration.instance_id, verdict)
+                        .is_some());
+                    // A reset must not look like activity to idle-expirable state.
+                    if tuple.is_ipv6() {
+                        cache
+                            .connections_v6
+                            .read_lock()
+                            .get_live_instance_matching(&tuple, registration.instance_id)
+                            .unwrap()
+                            .set_last_accessed_time(1234);
+                    } else {
+                        cache
+                            .connections_v4
+                            .read_lock()
+                            .get_live_instance_matching(&tuple, registration.instance_id)
+                            .unwrap()
+                            .set_last_accessed_time(1234);
+                    }
+                    let before = live_lifecycle_snapshot(&cache, &tuple, registration.instance_id);
+                    assert!(before.is_some());
+                    let counts = cache.get_entries_counts();
+                    let untracked = cache.get_untracked_entries_counts();
+
+                    cache.reset_verdicts();
+
+                    assert_eq!(
+                        live_lifecycle_snapshot(&cache, &tuple, registration.instance_id),
+                        before
+                    );
+                    assert_eq!(cache.get_entries_counts(), counts);
+                    assert_eq!(cache.get_untracked_entries_counts(), untracked);
+                    assert_eq!(saved_identity(&cache, &tuple), Some((123, 456)));
+                    assert!(matches!(
+                        saved_verdict(&cache, &tuple),
+                        Some(Verdict::Undecided)
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reset_verdicts_keeps_ended_history_with_and_without_live_replacements() {
+        for tuple in connect_thread_keys() {
+            let cache = ConnectionCache::new();
+            let ended = cache
+                .register_ale_connection(&tuple, 123, 456, Direction::Outbound)
+                .unwrap();
+            cache
+                .update_connection_instance(tuple, ended.instance_id, Verdict::PermanentBlock)
+                .unwrap();
+            let history = if tuple.is_ipv6() {
+                cache
+                    .end_connection_instance_v6(tuple, ended.instance_id)
+                    .map(|c| lifecycle_snapshot(&c))
+            } else {
+                cache
+                    .end_connection_instance_v4(tuple, ended.instance_id)
+                    .map(|c| lifecycle_snapshot(&c))
+            };
+            assert!(history.is_some());
+            let replacement = cache
+                .register_ale_connection(&tuple, 789, 987, Direction::Outbound)
+                .unwrap();
+            cache
+                .update_connection_instance(
+                    tuple,
+                    replacement.instance_id,
+                    Verdict::PermanentAccept,
+                )
+                .unwrap();
+            let ended_only = Key {
+                remote_port: tuple.remote_port + 1,
+                ..tuple
+            };
+            let other = cache
+                .register_ale_connection(&ended_only, 321, 654, Direction::Inbound)
+                .unwrap();
+            cache
+                .update_connection_instance(ended_only, other.instance_id, Verdict::PermanentDrop)
+                .unwrap();
+            if tuple.is_ipv6() {
+                cache
+                    .end_connection_instance_v6(ended_only, other.instance_id)
+                    .unwrap();
+            } else {
+                cache
+                    .end_connection_instance_v4(ended_only, other.instance_id)
+                    .unwrap();
+            }
+            let counts = cache.get_entries_counts();
+
+            cache.reset_verdicts();
+
+            assert_eq!(cache.get_entries_counts(), counts);
+            assert!(matches!(
+                saved_verdict(&cache, &tuple),
+                Some(Verdict::Undecided)
+            ));
+            assert_eq!(
+                cache.get_connection_instance_id(&tuple),
+                Some(replacement.instance_id)
+            );
+            assert_eq!(saved_identity(&cache, &tuple), Some((789, 987)));
+            assert_eq!(cache.get_connection_instance_id(&ended_only), None);
+            if tuple.is_ipv6() {
+                assert_eq!(
+                    cache.read_ended_connection_v6(&tuple, |c| Some(lifecycle_snapshot(c))),
+                    history
+                );
+                assert!(matches!(
+                    cache.read_ended_connection_v6(&tuple, |c| Some(c.verdict)),
+                    Some(Verdict::PermanentBlock)
+                ));
+                assert!(matches!(
+                    cache.read_ended_connection_v6(&ended_only, |c| Some(c.verdict)),
+                    Some(Verdict::PermanentDrop)
+                ));
+            } else {
+                assert_eq!(
+                    cache.read_ended_connection_v4(&tuple, |c| Some(lifecycle_snapshot(c))),
+                    history
+                );
+                assert!(matches!(
+                    cache.read_ended_connection_v4(&tuple, |c| Some(c.verdict)),
+                    Some(Verdict::PermanentBlock)
+                ));
+                assert!(matches!(
+                    cache.read_ended_connection_v4(&ended_only, |c| Some(c.verdict)),
+                    Some(Verdict::PermanentDrop)
+                ));
+            }
+            assert!(cache
+                .update_connection_instance(tuple, ended.instance_id, Verdict::PermanentAccept)
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn reset_verdicts_visits_every_live_multicast_receiver_only() {
+        let v4 = Key {
+            protocol: IpProtocol::Udp,
+            local_address: IpAddress::Ipv4(Ipv4Address::new(239, 255, 42, 101)),
+            local_port: 5353,
+            remote_address: IpAddress::Ipv4(Ipv4Address::new(192, 0, 2, 1)),
+            remote_port: 40_000,
+        };
+        let v6 = Key {
+            local_address: IpAddress::Ipv6(Ipv6Address::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb)),
+            remote_address: IpAddress::Ipv6(Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)),
+            ..v4
+        };
+        for tuple in [v4, v6] {
+            let cache = ConnectionCache::new();
+            let mut receivers = Vec::new();
+            for (endpoint, verdict) in [
+                (10, Verdict::PermanentBlock),
+                (20, Verdict::PermanentAccept),
+                (30, Verdict::PermanentDrop),
+            ] {
+                let registration = cache
+                    .register_multicast_receiver(&tuple, endpoint, endpoint * 10, endpoint * 100)
+                    .unwrap();
+                assert!(cache.mark_connection_instance_tracked(&tuple, registration.instance_id));
+                cache
+                    .update_connection_instance(tuple, registration.instance_id, verdict)
+                    .unwrap();
+                receivers.push((endpoint, registration.instance_id));
+            }
+            let ended_instance = receivers.remove(0).1;
+            if tuple.is_ipv6() {
+                cache
+                    .end_connection_instance_v6(tuple, ended_instance)
+                    .unwrap();
+            } else {
+                cache
+                    .end_connection_instance_v4(tuple, ended_instance)
+                    .unwrap();
+            }
+            let before: Vec<_> = receivers
+                .iter()
+                .map(|(_, id)| live_lifecycle_snapshot(&cache, &tuple, *id))
+                .collect();
+            let counts = cache.get_entries_counts();
+
+            cache.reset_verdicts();
+
+            assert_eq!(cache.get_entries_counts(), counts);
+            assert!(cache.read_multicast_receiver(&tuple, 10).is_none());
+            for ((endpoint, instance_id), state) in receivers.into_iter().zip(before) {
+                assert_eq!(live_lifecycle_snapshot(&cache, &tuple, instance_id), state);
+                assert!(
+                    matches!(cache.read_multicast_receiver(&tuple, endpoint), Some((Verdict::Undecided, id, true)) if id == instance_id)
+                );
+            }
+            let history = if tuple.is_ipv6() {
+                cache.read_ended_connection_v6(&tuple, |c| Some(c.verdict))
+            } else {
+                cache.read_ended_connection_v4(&tuple, |c| Some(c.verdict))
+            };
+            assert!(matches!(history, Some(Verdict::PermanentBlock)));
+        }
+    }
+
+    #[test]
+    fn reset_verdicts_allows_outstanding_replies_and_repeated_empty_resets() {
+        let cache = ConnectionCache::new();
+        cache.reset_verdicts();
+        cache.reset_verdicts();
+        assert_eq!(cache.get_entries_counts(), (0, 0));
+        for tuple in connect_thread_keys() {
+            let registration = cache
+                .register_ale_connection(&tuple, 123, 456, Direction::Outbound)
+                .unwrap();
+            cache
+                .update_connection_instance(
+                    tuple,
+                    registration.instance_id,
+                    Verdict::PermanentBlock,
+                )
+                .unwrap();
+            cache.reset_verdicts();
+            cache.reset_verdicts();
+            // ClearCache does not revoke a request already sent to userspace.
+            assert!(cache
+                .update_connection_instance(
+                    tuple,
+                    registration.instance_id,
+                    Verdict::PermanentAccept
+                )
+                .is_some());
+            assert_eq!(
+                cache.get_connection_instance_id(&tuple),
+                Some(registration.instance_id)
+            );
+            assert!(matches!(
+                saved_verdict(&cache, &tuple),
+                Some(Verdict::PermanentAccept)
+            ));
         }
     }
 

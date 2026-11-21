@@ -675,6 +675,17 @@ impl<T: Connection + Clone> ConnectionMap<T> {
         read_connection(connection)
     }
 
+    /// Updates live entries without refreshing activity or mutating ended history.
+    pub fn for_each_live(&mut self, mut update: impl FnMut(&mut T)) {
+        for connections in self.0.values_mut() {
+            for connection in connections.values_mut().flat_map(ConnectionBucket::iter_mut) {
+                if !connection.has_ended() {
+                    update(connection);
+                }
+            }
+        }
+    }
+
     /// Updates all live generations of a tuple. Control-plane UpdateV4/V6 has
     /// no endpoint field, so a tuple-scoped update must not target an arbitrary
     /// one of several multicast receivers.
@@ -959,6 +970,7 @@ impl<T: Connection + Clone> ConnectionMap<T> {
         ended
     }
 
+    #[cfg(test)]
     pub fn clear(&mut self) {
         self.0.clear();
     }

@@ -793,16 +793,9 @@ impl Device {
             }
             CommandType::ClearCache => {
                 wdk::dbg!("ClearCache command");
-                self.connection_cache.clear();
-                {
-                    let mut endpoint_cache = self.tcp_endpoint_cache.write_lock();
-                    endpoint_cache.clear();
-                }
-                {
-                    let mut endpoint_cache = self.udp_endpoint_cache.write_lock();
-                    endpoint_cache.clear();
-                }
-                self.clean_udp_lifecycle_state();
+                // Invalidate policy only. Pending requests and native endpoint/flow
+                // identities still belong to these same connection generations.
+                self.connection_cache.reset_verdicts();
                 if let Err(err) = self.reset_filters() {
                     err!("failed to reset filters: {}", err);
                 }
