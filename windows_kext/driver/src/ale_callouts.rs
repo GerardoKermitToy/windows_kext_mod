@@ -1419,6 +1419,7 @@ fn associate_udp_flow_context(
         data.get_layer_id(),
         data.get_callout_id(),
         connection_instance_id,
+        key,
     );
     let flow_context = Box::into_raw(Box::new(UdpFlowContext {
         key,

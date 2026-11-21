@@ -9,6 +9,15 @@
 #include <cwchar>
 #include <string>
 
+namespace pmkext {
+struct DriverTestAccess {
+    static bool DeviceControl(Driver& driver, uint32_t code, std::string& error,
+                              const uint8_t* input, uint32_t input_len) {
+        return driver.DeviceControl(code, nullptr, 0, error, input, input_len);
+    }
+};
+} // namespace pmkext
+
 int wmain(int argc, wchar_t** argv) {
     if (argc != 4 || std::wcscmp(argv[1], L"--duration") != 0 ||
         std::wcscmp(argv[2], L"8") != 0) {
@@ -20,6 +29,35 @@ int wmain(int argc, wchar_t** argv) {
     std::string error;
     if (!driver.Install(argv[3], error) || !driver.Open(error)) {
         std::fprintf(stderr, "FAIL: %s\n", error.c_str());
+        return 1;
+    }
+
+    const uint8_t local_v4[] = {192, 0, 2, 10};
+    const uint8_t remote_v4[] = {198, 51, 100, 20};
+    const uint8_t local_v6[] = {
+        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+    };
+    const uint8_t remote_v6[] = {
+        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+    };
+    const uint8_t malformed_v4[11] = {};
+    const uint8_t malformed_v6[35] = {};
+    std::string malformed_error;
+    if (pmkext::DriverTestAccess::DeviceControl(
+            driver, 0x9c40e01c, malformed_error, malformed_v4, sizeof(malformed_v4)) ||
+        pmkext::DriverTestAccess::DeviceControl(
+            driver, 0x9c40e020, malformed_error, malformed_v6, sizeof(malformed_v6))) {
+        std::fprintf(stderr, "FAIL: malformed UDP flow-abort IOCTL succeeded\n");
+        driver.Cleanup();
+        return 1;
+    }
+
+    if (!driver.AbortUdpFlowV4(local_v4, 12'345, remote_v4, 443, error) ||
+        !driver.AbortUdpFlowV4(local_v4, 12'345, remote_v4, 443, error, true) ||
+        !driver.AbortUdpFlowV6(local_v6, 39'554, remote_v6, 53, error) ||
+        !driver.AbortUdpFlowV6(local_v6, 39'554, remote_v6, 53, error, true)) {
+        std::fprintf(stderr, "FAIL: UDP flow-abort command failed: %s\n", error.c_str());
+        driver.Cleanup();
         return 1;
     }
 

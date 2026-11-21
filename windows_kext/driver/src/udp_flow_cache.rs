@@ -6,6 +6,7 @@
 //! explicitly remove outstanding contexts without terminating their underlying
 //! network flows.
 
+use crate::connection_map::Key;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
@@ -34,18 +35,26 @@ pub struct UdpFlowRegistration {
     pub layer_id: u16,
     pub callout_id: u32,
     pub connection_instance_id: u64,
+    pub key: Key,
     associated: bool,
     removal_requested: bool,
 }
 
 impl UdpFlowRegistration {
-    pub fn new(flow_id: u64, layer_id: u16, callout_id: u32, connection_instance_id: u64) -> Self {
+    pub fn new(
+        flow_id: u64,
+        layer_id: u16,
+        callout_id: u32,
+        connection_instance_id: u64,
+        key: Key,
+    ) -> Self {
         Self {
             flow_context: 0,
             flow_id,
             layer_id,
             callout_id,
             connection_instance_id,
+            key,
             associated: false,
             removal_requested: false,
         }
@@ -120,6 +129,26 @@ impl UdpFlowCache {
         }
         registration.associated = true;
         true
+    }
+
+    /// Returns the active WFP flow for one exact UDP tuple.
+    ///
+    /// The lookup is deliberately limited to associations that WFP owns and that
+    /// cleanup has not already claimed. The lock is released before the caller
+    /// invokes `FwpsFlowAbort0`, because abort can synchronously enter flowDeleteFn.
+    pub fn find_active_flow_id(&self, key: &Key) -> Option<u64> {
+        let _guard = self.lock.read_lock();
+        let state = unsafe { &*self.state.get() };
+        state
+            .registrations
+            .values()
+            .find(|registration| {
+                registration.associated
+                    && !registration.removal_requested
+                    && registration.flow_id != 0
+                    && registration.key == *key
+            })
+            .map(|registration| registration.flow_id)
     }
 
     /// Removes a matching registration so the caller can reclaim its context after
@@ -288,9 +317,38 @@ impl UdpFlowCache {
 #[cfg(test)]
 mod tests {
     use super::{UdpFlowCache, UdpFlowRegistration};
+    use crate::connection_map::Key;
+    use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Address};
+
+    fn key(remote_port: u16) -> Key {
+        Key {
+            protocol: IpProtocol::Udp,
+            local_address: IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 1)),
+            local_port: 40_000,
+            remote_address: IpAddress::Ipv4(Ipv4Address::new(192, 0, 2, 1)),
+            remote_port,
+        }
+    }
 
     fn registration(flow_id: u64) -> UdpFlowRegistration {
-        UdpFlowRegistration::new(flow_id, 48, 7, flow_id + 1_000)
+        UdpFlowRegistration::new(flow_id, 48, 7, flow_id + 1_000, key(1_000))
+    }
+
+    #[test]
+    fn exact_lookup_returns_only_associated_unclaimed_flow() {
+        let cache = UdpFlowCache::new();
+        let target = key(2_000);
+        let registration = UdpFlowRegistration::new(22, 48, 7, 1_022, target);
+        assert!(cache.register(100, registration));
+        assert_eq!(cache.find_active_flow_id(&target), None);
+
+        assert!(cache.mark_associated(100, 1_022));
+        assert_eq!(cache.find_active_flow_id(&target), Some(22));
+        assert_eq!(cache.find_active_flow_id(&key(2_001)), None);
+
+        let claimed = cache.claim_removal(100, 1_022).expect("flow removal claim");
+        assert_eq!(claimed.flow_id, 22);
+        assert_eq!(cache.find_active_flow_id(&target), None);
     }
 
     #[test]
@@ -313,7 +371,7 @@ mod tests {
     #[test]
     fn rejects_registration_without_connection_instance() {
         let cache = UdpFlowCache::new();
-        assert!(!cache.register(100, UdpFlowRegistration::new(1, 48, 7, 0)));
+        assert!(!cache.register(100, UdpFlowRegistration::new(1, 48, 7, 0, key(1_000))));
         assert!(cache.is_drained());
     }
 

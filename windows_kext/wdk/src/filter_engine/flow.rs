@@ -1,7 +1,10 @@
 use alloc::string::String;
 use ntstatus::ntstatus::NtStatus;
 
-use crate::{ffi::FwpsFlowRemoveContext0, utils::check_ntstatus};
+use crate::{
+    ffi::{FwpsFlowAbort0, FwpsFlowRemoveContext0},
+    utils::check_ntstatus,
+};
 
 /// Outcome of removing a context from a WFP flow.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -12,6 +15,13 @@ pub enum RemoveContextResult {
     Pending,
     /// The flow/context was already gone, so no callback will reclaim it.
     AlreadyGone,
+}
+
+/// Terminates a WFP data flow. The caller intentionally ignores the native
+/// status when this is used by the user-facing UDP abort command: the command
+/// is best-effort and must complete successfully even when the flow ended first.
+pub fn abort(flow_id: u64) {
+    let _status = unsafe { FwpsFlowAbort0(flow_id) };
 }
 
 /// Requests removal of one context previously associated with a WFP flow.

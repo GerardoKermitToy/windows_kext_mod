@@ -368,6 +368,42 @@ impl Device {
         }
     }
 
+    /// Aborts the one active WFP UDP flow tracked for an exact five-tuple.
+    ///
+    /// The cache lock is released before entering WFP. `FwpsFlowAbort0` may
+    /// synchronously invoke our flow-delete callback, which needs that same lock.
+    /// The native status and a missing/raced flow are deliberately ignored: this
+    /// is a best-effort control command whose public operation always succeeds.
+    fn abort_udp_flow(&self, key: Key) {
+        if key.protocol != IpProtocol::Udp {
+            return;
+        }
+        let Some(flow_id) = self.udp_flow_cache.find_active_flow_id(&key) else {
+            return;
+        };
+        wdk::filter_engine::flow::abort(flow_id);
+    }
+
+    pub(crate) fn abort_udp_flow_v4(&self, command: protocol::command::AbortUdpFlowV4) {
+        self.abort_udp_flow(Key {
+            protocol: IpProtocol::Udp,
+            local_address: IpAddress::Ipv4(Ipv4Address::from_octets(command.local_address)),
+            local_port: command.local_port,
+            remote_address: IpAddress::Ipv4(Ipv4Address::from_octets(command.remote_address)),
+            remote_port: command.remote_port,
+        });
+    }
+
+    pub(crate) fn abort_udp_flow_v6(&self, command: protocol::command::AbortUdpFlowV6) {
+        self.abort_udp_flow(Key {
+            protocol: IpProtocol::Udp,
+            local_address: IpAddress::Ipv6(Ipv6Address::from_octets(command.local_address)),
+            local_port: command.local_port,
+            remote_address: IpAddress::Ipv6(Ipv6Address::from_octets(command.remote_address)),
+            remote_port: command.remote_port,
+        });
+    }
+
     /// Applies a user-space verdict to a saved packet.
     ///
     /// A reauthorization marker is created only for an ALE indication that could
@@ -544,6 +580,16 @@ impl Device {
                 let enabled = protocol::command::parse_boolean(payload)
                     .ok_or(STATUS_INVALID_PARAMETER)?;
                 crate::registry_settings::set_inbound_udp_pid_fallback_enabled(enabled);
+            }
+            CommandType::AbortUdpFlowV4 => {
+                let command = protocol::command::parse_abort_udp_flow_v4(payload)
+                    .ok_or(STATUS_INVALID_PARAMETER)?;
+                self.abort_udp_flow_v4(command);
+            }
+            CommandType::AbortUdpFlowV6 => {
+                let command = protocol::command::parse_abort_udp_flow_v6(payload)
+                    .ok_or(STATUS_INVALID_PARAMETER)?;
+                self.abort_udp_flow_v6(command);
             }
             CommandType::Shutdown => {
                 wdk::dbg!("Shutdown command");

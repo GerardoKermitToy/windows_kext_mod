@@ -452,6 +452,9 @@ extern "system" {
     /// context. A successful or pending removal invokes the callout's flowDeleteFn.
     pub(crate) fn FwpsFlowRemoveContext0(flowId: u64, layerId: u16, calloutId: u32) -> NTSTATUS;
 
+    /// The FwpsFlowAbort0 function terminates a WFP data flow.
+    pub(crate) fn FwpsFlowAbort0(flowId: u64) -> NTSTATUS;
+
     /// The FwpsPendOperation0 function is called by a callout to suspend packet processing pending completion of another operation.
     pub(crate) fn FwpsPendOperation0(
         completionHandle: HANDLE,

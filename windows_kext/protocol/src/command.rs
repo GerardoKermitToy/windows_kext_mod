@@ -21,6 +21,8 @@ pub enum CommandType {
     SetAppInterface        = 10,
     SetAuthorizeOutboundUdpAtAle = 11,
     SetInboundUdpPidFallback = 12,
+    AbortUdpFlowV4        = 13,
+    AbortUdpFlowV6        = 14,
 }
 
 // These are private wire-layout markers. They must not be exposed as borrowed
@@ -52,6 +54,22 @@ struct UpdateV6Wire {
     verdict: u8,
 }
 
+#[repr(C, packed)]
+struct AbortUdpFlowV4Wire {
+    local_address: [u8; 4],
+    local_port: u16,
+    remote_address: [u8; 4],
+    remote_port: u16,
+}
+
+#[repr(C, packed)]
+struct AbortUdpFlowV6Wire {
+    local_address: [u8; 16],
+    local_port: u16,
+    remote_address: [u8; 16],
+    remote_port: u16,
+}
+
 // Decoded command values use ordinary aligned Rust layout. The wire sizes are
 // kept separately above because the Go and C++ clients serialize fields in
 // packed logical order rather than using this in-memory representation.
@@ -81,6 +99,22 @@ pub struct UpdateV6 {
     pub verdict: u8,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AbortUdpFlowV4 {
+    pub local_address: [u8; 4],
+    pub local_port: u16,
+    pub remote_address: [u8; 4],
+    pub remote_port: u16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AbortUdpFlowV6 {
+    pub local_address: [u8; 16],
+    pub local_port: u16,
+    pub remote_address: [u8; 16],
+    pub remote_port: u16,
+}
+
 /// Canonical NUL-terminated UTF-16LE native path from FwpmGetAppIdFromFileName0.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SetAppInterface<'a> {
@@ -96,11 +130,15 @@ pub const MAX_APP_ID_SIZE: usize = 65534;
 pub const VERDICT_PAYLOAD_SIZE: usize = size_of::<VerdictWire>();
 pub const UPDATE_V4_PAYLOAD_SIZE: usize = size_of::<UpdateV4Wire>();
 pub const UPDATE_V6_PAYLOAD_SIZE: usize = size_of::<UpdateV6Wire>();
+pub const ABORT_UDP_FLOW_V4_PAYLOAD_SIZE: usize = size_of::<AbortUdpFlowV4Wire>();
+pub const ABORT_UDP_FLOW_V6_PAYLOAD_SIZE: usize = size_of::<AbortUdpFlowV6Wire>();
 
 const _: () = {
     assert!(VERDICT_PAYLOAD_SIZE == 9);
     assert!(UPDATE_V4_PAYLOAD_SIZE == 14);
     assert!(UPDATE_V6_PAYLOAD_SIZE == 38);
+    assert!(ABORT_UDP_FLOW_V4_PAYLOAD_SIZE == 12);
+    assert!(ABORT_UDP_FLOW_V6_PAYLOAD_SIZE == 36);
 };
 
 impl CommandType {
@@ -117,6 +155,8 @@ impl CommandType {
             Self::Verdict => VERDICT_PAYLOAD_SIZE,
             Self::UpdateV4 => UPDATE_V4_PAYLOAD_SIZE,
             Self::UpdateV6 => UPDATE_V6_PAYLOAD_SIZE,
+            Self::AbortUdpFlowV4 => ABORT_UDP_FLOW_V4_PAYLOAD_SIZE,
+            Self::AbortUdpFlowV6 => ABORT_UDP_FLOW_V6_PAYLOAD_SIZE,
             Self::SetAppInterface => SET_APP_INTERFACE_HEADER_SIZE,
             Self::SetAuthorizeOutboundUdpAtAle | Self::SetInboundUdpPidFallback => 1,
         }
@@ -278,6 +318,26 @@ pub fn parse_update_v6(bytes: &[u8]) -> Option<UpdateV6> {
     })
 }
 
+pub fn parse_abort_udp_flow_v4(bytes: &[u8]) -> Option<AbortUdpFlowV4> {
+    let bytes = exact_payload(bytes, ABORT_UDP_FLOW_V4_PAYLOAD_SIZE)?;
+    Some(AbortUdpFlowV4 {
+        local_address: read_array(bytes, 0)?,
+        local_port: read_u16_le(bytes, 4)?,
+        remote_address: read_array(bytes, 6)?,
+        remote_port: read_u16_le(bytes, 10)?,
+    })
+}
+
+pub fn parse_abort_udp_flow_v6(bytes: &[u8]) -> Option<AbortUdpFlowV6> {
+    let bytes = exact_payload(bytes, ABORT_UDP_FLOW_V6_PAYLOAD_SIZE)?;
+    Some(AbortUdpFlowV6 {
+        local_address: read_array(bytes, 0)?,
+        local_port: read_u16_le(bytes, 16)?,
+        remote_address: read_array(bytes, 18)?,
+        remote_port: read_u16_le(bytes, 34)?,
+    })
+}
+
 #[cfg(test)]
 use std::fs::File;
 #[cfg(test)]
@@ -358,6 +418,16 @@ fn test_go_command_file() {
                     file.read_exact(&mut payload).unwrap();
                     assert!(parse_boolean(&payload).is_some());
                 }
+                CommandType::AbortUdpFlowV4 => {
+                    let mut payload = [0; ABORT_UDP_FLOW_V4_PAYLOAD_SIZE];
+                    file.read_exact(&mut payload).unwrap();
+                    assert!(parse_abort_udp_flow_v4(&payload).is_some());
+                }
+                CommandType::AbortUdpFlowV6 => {
+                    let mut payload = [0; ABORT_UDP_FLOW_V6_PAYLOAD_SIZE];
+                    file.read_exact(&mut payload).unwrap();
+                    assert!(parse_abort_udp_flow_v6(&payload).is_some());
+                }
                 CommandType::SetAppInterface => {
                     let mut header = [0; SET_APP_INTERFACE_HEADER_SIZE];
                     file.read_exact(&mut header).unwrap();
@@ -382,6 +452,8 @@ fn rejects_empty_and_wrong_sized_payloads() {
     assert!(parse_verdict(&[0; VERDICT_PAYLOAD_SIZE + 1]).is_none());
     assert!(parse_update_v4(&[0; UPDATE_V4_PAYLOAD_SIZE - 1]).is_none());
     assert!(parse_update_v6(&[0; UPDATE_V6_PAYLOAD_SIZE - 1]).is_none());
+    assert!(parse_abort_udp_flow_v4(&[0; ABORT_UDP_FLOW_V4_PAYLOAD_SIZE - 1]).is_none());
+    assert!(parse_abort_udp_flow_v6(&[0; ABORT_UDP_FLOW_V6_PAYLOAD_SIZE - 1]).is_none());
     assert!(!has_valid_payload_length(CommandType::Shutdown, &[0]));
     assert!(has_valid_payload_length(CommandType::Shutdown, &[]));
 }
@@ -432,6 +504,54 @@ fn udp_setting_commands_have_stable_ids_and_one_byte_payloads() {
                 actual: 0,
             })
         );
+    }
+}
+
+#[test]
+fn udp_flow_abort_commands_decode_exact_little_endian_tuples() {
+    assert_eq!(CommandType::AbortUdpFlowV4 as u8, 13);
+    assert_eq!(CommandType::AbortUdpFlowV6 as u8, 14);
+
+    let v4 = [
+        192, 0, 2, 10, 0x39, 0x30, 198, 51, 100, 20, 0x01, 0xbb,
+    ];
+    assert_eq!(
+        parse_abort_udp_flow_v4(&v4),
+        Some(AbortUdpFlowV4 {
+            local_address: [192, 0, 2, 10],
+            local_port: 12_345,
+            remote_address: [198, 51, 100, 20],
+            remote_port: 443,
+        })
+    );
+
+    let v6 = [
+        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+        0x82, 0x9a,
+        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+        0x35, 0x00,
+    ];
+    assert_eq!(
+        parse_abort_udp_flow_v6(&v6),
+        Some(AbortUdpFlowV6 {
+            local_address: [
+                0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+            ],
+            local_port: 39_554,
+            remote_address: [
+                0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+            ],
+            remote_port: 53,
+        })
+    );
+
+    for (command, payload_size) in [
+        (CommandType::AbortUdpFlowV4, ABORT_UDP_FLOW_V4_PAYLOAD_SIZE),
+        (CommandType::AbortUdpFlowV6, ABORT_UDP_FLOW_V6_PAYLOAD_SIZE),
+    ] {
+        assert_eq!(command.payload_size(), payload_size);
+        assert!(has_valid_payload_length(command, &vec![0; payload_size]));
+        assert!(!has_valid_payload_length(command, &vec![0; payload_size - 1]));
     }
 }
 

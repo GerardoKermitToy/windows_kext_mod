@@ -874,6 +874,22 @@ unsafe extern "system" fn device_control(
             };
             crate::registry_settings::set_inbound_udp_pid_fallback_enabled(enabled);
         }
+        ControlCode::AbortUdpFlowV4 => {
+            let Some(command) = protocol::command::parse_abort_udp_flow_v4(
+                control_request.get_input_buffer(),
+            ) else {
+                return control_request.fail(STATUS_INVALID_PARAMETER);
+            };
+            device.abort_udp_flow_v4(command);
+        }
+        ControlCode::AbortUdpFlowV6 => {
+            let Some(command) = protocol::command::parse_abort_udp_flow_v6(
+                control_request.get_input_buffer(),
+            ) else {
+                return control_request.fail(STATUS_INVALID_PARAMETER);
+            };
+            device.abort_udp_flow_v6(command);
+        }
         ControlCode::Version => {
             wdk::info!("IOCTL: {}", control_code);
             if !control_request.write_exact(&VERSION) {

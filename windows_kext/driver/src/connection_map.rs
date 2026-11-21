@@ -17,7 +17,7 @@ use likely_stable::unlikely;
 use rustc_hash::FxHasher;
 use smoltcp::wire::{IpAddress, IpProtocol};
 
-#[derive(Clone, Copy, PartialEq, PartialOrd, Eq, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd, Eq, Ord)]
 pub struct Key {
     pub(crate) protocol: IpProtocol,
     pub(crate) local_address: IpAddress,

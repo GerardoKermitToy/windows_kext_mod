@@ -31,8 +31,12 @@ constexpr uint32_t kIoctlStartProcessMonitoring = MakeCtlCode(0x803);
 constexpr uint32_t kIoctlSetAppInterface = MakeCtlCode(0x804);
 constexpr uint32_t kIoctlSetAuthorizeOutboundUdpAtAle = MakeCtlCode(0x805);
 constexpr uint32_t kIoctlSetInboundUdpPidFallback = MakeCtlCode(0x806);
+constexpr uint32_t kIoctlAbortUdpFlowV4 = MakeCtlCode(0x807);
+constexpr uint32_t kIoctlAbortUdpFlowV6 = MakeCtlCode(0x808);
 static_assert(kIoctlSetAuthorizeOutboundUdpAtAle == 0x9c40e014);
 static_assert(kIoctlSetInboundUdpPidFallback == 0x9c40e018);
+static_assert(kIoctlAbortUdpFlowV4 == 0x9c40e01c);
+static_assert(kIoctlAbortUdpFlowV6 == 0x9c40e020);
 static_assert(kIoctlSetAppInterface == 0x9c40e010);
 static_assert(kIoctlStartProcessMonitoring == 0x9c40e00c);
 
@@ -479,6 +483,38 @@ bool Driver::SetInboundUdpPidFallback(bool enabled, std::string& error, bool via
         return SendCommand(command, sizeof(command), error);
     }
     return DeviceControl(kIoctlSetInboundUdpPidFallback, nullptr, 0, error, command + 1, 1);
+}
+
+bool Driver::AbortUdpFlowV4(const uint8_t local_ip[4], uint16_t local_port,
+                            const uint8_t remote_ip[4], uint16_t remote_port,
+                            std::string& error, bool via_write) {
+    uint8_t command[1 + 12] = {static_cast<uint8_t>(CommandType::AbortUdpFlowV4)};
+    std::memcpy(command + 1, local_ip, 4);
+    command[5] = static_cast<uint8_t>(local_port);
+    command[6] = static_cast<uint8_t>(local_port >> 8);
+    std::memcpy(command + 7, remote_ip, 4);
+    command[11] = static_cast<uint8_t>(remote_port);
+    command[12] = static_cast<uint8_t>(remote_port >> 8);
+    if (via_write) {
+        return SendCommand(command, sizeof(command), error);
+    }
+    return DeviceControl(kIoctlAbortUdpFlowV4, nullptr, 0, error, command + 1, 12);
+}
+
+bool Driver::AbortUdpFlowV6(const uint8_t local_ip[16], uint16_t local_port,
+                            const uint8_t remote_ip[16], uint16_t remote_port,
+                            std::string& error, bool via_write) {
+    uint8_t command[1 + 36] = {static_cast<uint8_t>(CommandType::AbortUdpFlowV6)};
+    std::memcpy(command + 1, local_ip, 16);
+    command[17] = static_cast<uint8_t>(local_port);
+    command[18] = static_cast<uint8_t>(local_port >> 8);
+    std::memcpy(command + 19, remote_ip, 16);
+    command[35] = static_cast<uint8_t>(remote_port);
+    command[36] = static_cast<uint8_t>(remote_port >> 8);
+    if (via_write) {
+        return SendCommand(command, sizeof(command), error);
+    }
+    return DeviceControl(kIoctlAbortUdpFlowV6, nullptr, 0, error, command + 1, 36);
 }
 
 bool Driver::SendCommand(const uint8_t* data, size_t len, std::string& error) {

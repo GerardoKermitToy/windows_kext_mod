@@ -46,6 +46,8 @@ enum class CommandType : uint8_t {
     SetAppInterface       = 10,
     SetAuthorizeOutboundUdpAtAle = 11,
     SetInboundUdpPidFallback = 12,
+    AbortUdpFlowV4        = 13,
+    AbortUdpFlowV6        = 14,
 };
 
 // Verdict, from driver/src/connection.rs:22
@@ -267,6 +269,20 @@ public:
     bool SetAuthorizeOutboundUdpAtAle(bool enabled, std::string& error, bool via_write = false);
     // IOCTL 0x9c40e018 / WriteFile command 12. Initial value comes from the registry.
     bool SetInboundUdpPidFallback(bool enabled, std::string& error, bool via_write = false);
+
+    // Best-effort UDP flow termination by exact local/remote tuple. The driver
+    // always completes these IOCTLs successfully, even when no active flow is
+    // found or WFP has already ended it. Neither form returns a flow ID or an
+    // output payload to user space. Ports are host-order uint16 values; addresses
+    // are the raw network-order bytes used by the wire protocol.
+    // IOCTL 0x9c40e01c / WriteFile command 13.
+    bool AbortUdpFlowV4(const uint8_t local_ip[4], uint16_t local_port,
+                        const uint8_t remote_ip[4], uint16_t remote_port,
+                        std::string& error, bool via_write = false);
+    // IOCTL 0x9c40e020 / WriteFile command 14.
+    bool AbortUdpFlowV6(const uint8_t local_ip[16], uint16_t local_port,
+                        const uint8_t remote_ip[16], uint16_t remote_port,
+                        std::string& error, bool via_write = false);
 
     // Commands written to the device (protocol/src/command.rs).
     bool SendVerdict(uint64_t id, Verdict verdict, std::string& error);
