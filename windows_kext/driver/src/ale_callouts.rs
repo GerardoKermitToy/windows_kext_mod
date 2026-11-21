@@ -925,13 +925,7 @@ fn ale_layer_auth(mut data: CalloutData, ale_data: AleLayerData) {
                 data.block_and_absorb();
             }
             Verdict::Block => {
-                if let Direction::Outbound = ale_data.packet_direction {
-                    // Handled by packet layer.
-                    data.action_permit();
-                } else {
-                    // Inbound authorization is enforced here.
-                    data.action_block_hard();
-                }
+                data.action_block_hard();
             }
             Verdict::Drop => {
                 if let Direction::Outbound = ale_data.packet_direction {

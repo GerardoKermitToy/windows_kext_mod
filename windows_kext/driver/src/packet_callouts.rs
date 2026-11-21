@@ -570,12 +570,12 @@ fn ip_packet_layer(
                 connection_instance_id = Some(conn_info.instance_id);
                 // Check if there is action for this connection.
                 match conn_info.verdict {
-                    Verdict::Undecided | Verdict::Accept | Verdict::Block | Verdict::Drop => {}
+                    Verdict::Undecided | Verdict::Accept | Verdict::Drop => {}
                     Verdict::PermanentAccept => {
                         data.action_permit();
                         continue;
                     }
-                    Verdict::PermanentBlock => {
+                    Verdict::Block | Verdict::PermanentBlock => {
                         data.action_block_hard();
                         continue;
                     }

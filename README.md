@@ -378,11 +378,13 @@ Payload:
 | `1` | `Undeterminable` | Fail closed without new requests while the cache instance remains alive |
 | `2` | `Accept` | Admit only the current retained packet; later packets require another decision |
 | `3` | `PermanentAccept` | Admit the current and later packets for this cache instance |
-| `4` | `Block` | Block the current packet; the decision is temporary and a later packet can create another request |
+| `4` | `Block` | Discard the retained packet; hard-block cached ALE and IP packet indications in both directions without new packet verdict requests |
 | `5` | `PermanentBlock` | Hard-block the current and later packets for this cache instance |
 | `6` | `Drop` | Silently absorb the current packet; the decision is temporary |
 | `7` | `PermanentDrop` | Silently absorb later packets for this cache instance |
 | `10` | `Failed` | Fail closed, representing a persistent policy-decision failure |
+
+When ALE consumes cached `Block`, it returns a hard `FWP_ACTION_BLOCK` without `ABSORB` for both outbound and inbound authorization. The IP packet layer applies cached `Block` the same way in both directions, without another packet verdict request. The packet already retained for a userspace verdict is discarded through the existing completion path. Outbound UDP still defaults to packet-layer authorization; this change does not move it to ALE. No additional reauthorization, filter reset, TCP RST or ICMP generation is added. `Drop` retains its existing silent behavior.
 
 Values `8`, `9`, and `11` are reserved and rejected with `STATUS_INVALID_PARAMETER`
 by `Verdict`, `UpdateV4`, and `UpdateV6`. Remaining verdict values are unchanged,
